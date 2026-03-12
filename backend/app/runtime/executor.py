@@ -64,6 +64,20 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "textarea[name='formName']",
         "textarea[name='name']",
     ],
+    "form_list_first_row": [
+        "table tbody tr:first-child",
+        "[role='table'] [role='row']:nth-child(2)",
+        "div[role='rowgroup'] div[role='row']:first-child",
+        "[data-testid*='forms'] tr:first-child",
+        "main tr:first-child",
+    ],
+    "form_list_first_name": [
+        "table tbody tr:first-child a",
+        "table tbody tr:first-child td a",
+        "[role='table'] [role='row']:nth-child(2) a",
+        "[data-testid*='forms'] tr:first-child a",
+        "main tr:first-child a",
+    ],
     "save_form": [
         "div[role='dialog'] button:has-text('Save')",
         "div[role='dialog'] [role='button']:has-text('Save')",
@@ -72,6 +86,16 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "button.save-form",
         "button:has-text('Save')",
         "[role='button']:has-text('Save')",
+    ],
+    "back_button": [
+        "button:has([data-lucide='chevron-left'])",
+        "button:has([data-lucide='arrow-left'])",
+        "button:has(svg[class*='chevron-left'])",
+        "button:has(svg[class*='arrow-left'])",
+        "button[aria-label*='Back']",
+        "[role='button'][aria-label*='Back']",
+        "button:has-text('Back')",
+        "text=Back",
     ],
     "short_answer_source": [
         "[data-testid='field-short-answer']",
@@ -158,6 +182,46 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "label:has-text('Required')",
         "label:has-text('Required') input[type='checkbox']",
         "text=Required",
+    ],
+    "dropdown_option_type_trigger": [
+        "div[role='dialog'] [role='combobox']:has-text('Select an option')",
+        "div[role='dialog'] [role='combobox']",
+        "div[role='dialog'] [aria-haspopup='listbox']",
+        "div[role='dialog'] button:has-text('Select an option')",
+        "text=Select an option",
+    ],
+    "dropdown_option_enter_manual": [
+        "div[role='listbox'] [role='option']:text-is('Enter options manually')",
+        "div[role='dialog'] [role='option']:text-is('Enter options manually')",
+        "[role='option']:text-is('Enter options manually')",
+        "div[role='listbox'] :text-is('Enter options manually')",
+        "[role='option']:has-text('Enter options manually')",
+        "div[role='dialog'] :text-is('Enter options manually')",
+        "text=Enter options manually",
+    ],
+    "dropdown_options_section": [
+        "div[role='dialog'] :has-text('Options')",
+        "div[role='dialog'] input[placeholder='Label']",
+        "div[role='dialog'] input[placeholder='Value']",
+    ],
+    "dropdown_option_label": [
+        "div[role='dialog'] input[placeholder='Label']",
+        "div[role='dialog'] input[name='label']",
+    ],
+    "dropdown_option_value": [
+        "div[role='dialog'] input[placeholder='Value']",
+        "div[role='dialog'] input[name='value']",
+    ],
+    "dropdown_option_add_button": [
+        "div[role='dialog'] button:has(svg[class*='plus'])",
+        "div[role='dialog'] button:has(i[class*='plus'])",
+        "div[role='dialog'] [data-testid*='add-option']",
+        "div[role='dialog'] [aria-label*='Add option']",
+        "div[role='dialog'] [title*='Add option']",
+        "div[role='dialog'] div:has(input[placeholder='Value']) button",
+        "div[role='dialog'] button:has-text('+')",
+        "div[role='dialog'] [role='button']:has-text('+')",
+        "text=+",
     ],
     "amazon_search_box": [
         "#twotabsearchtextbox",
@@ -610,6 +674,10 @@ class AgentExecutor:
                 keys.insert(0, "form_name")
             if "label" in selector_lower:
                 keys.insert(0, "form_label")
+            if "dropdown_option_label" in selector_lower:
+                keys.insert(0, "dropdown_option_label")
+            if "dropdown_option_value" in selector_lower:
+                keys.insert(0, "dropdown_option_value")
             if any(token in selector_lower for token in ("twotabsearchtextbox", "field-keywords")):
                 keys.insert(0, "amazon_search_box")
         if step_type == "click":
@@ -617,10 +685,20 @@ class AgentExecutor:
                 keys.insert(0, "login_button")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if "form_list_first_name" in selector_lower:
+                keys.insert(0, "form_list_first_name")
+            if "back button" in selector_lower or "selector.back_button" in selector_lower or selector_lower.strip() == "back":
+                keys.insert(0, "back_button")
             if "save form" in selector_lower or "save_form" in selector_lower or "saveform" in selector_lower:
                 keys.insert(0, "save_form")
             if any(token in selector_lower for token in ("required", "checkbox")):
                 keys.insert(0, "required_checkbox")
+            if "dropdown_option_type_trigger" in selector_lower:
+                keys.insert(0, "dropdown_option_type_trigger")
+            if "dropdown_option_enter_manual" in selector_lower:
+                keys.insert(0, "dropdown_option_enter_manual")
+            if "dropdown_option_add_button" in selector_lower:
+                keys.insert(0, "dropdown_option_add_button")
             if any(token in selector_lower for token in ("nav-search-submit", "search-submit", "search button")):
                 keys.insert(0, "amazon_search_submit")
             if any(
@@ -657,16 +735,32 @@ class AgentExecutor:
                 keys.insert(0, "save_form")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if "form_list_first_row" in selector_lower:
+                keys.insert(0, "form_list_first_row")
+        if step_type == "wait":
+            if "dropdown_options_section" in selector_lower:
+                keys.insert(0, "dropdown_options_section")
 
         ordered_keys = self._dedupe(keys)
         candidates: list[str] = []
+        strict_dropdown_keys = {
+            "dropdown_option_type_trigger",
+            "dropdown_option_enter_manual",
+            "dropdown_options_section",
+            "dropdown_option_label",
+            "dropdown_option_value",
+            "dropdown_option_add_button",
+        }
         for key in ordered_keys:
-            candidates.extend(self._memory_candidates(run_domain, step_type, key))
             profile_candidates = self._merge_profile_candidates(key, selector_profile)
             for candidate in profile_candidates:
                 normalized = self._apply_template(candidate, test_data).strip()
                 if normalized:
                     candidates.append(normalized)
+            # For brittle dropdown modal actions, do not let stale selector-memory
+            # candidates override exact profile selectors.
+            if key not in strict_dropdown_keys:
+                candidates.extend(self._memory_candidates(run_domain, step_type, key))
 
         if not alias_key:
             candidates.extend(self._memory_candidates(run_domain, step_type, selector))
@@ -676,8 +770,18 @@ class AgentExecutor:
         deduped = self._dedupe(candidates)
         if step_type == "drag":
             deduped = self._prioritize_drag_candidates(deduped, alias_key=alias_key)
-        if alias_key:
-            deduped = self._filter_alias_candidates(alias_key, deduped)
+        effective_filter_key = alias_key
+        if not effective_filter_key and step_type == "type":
+            if "email" in selector_lower:
+                effective_filter_key = "email"
+            elif "password" in selector_lower:
+                effective_filter_key = "password"
+            elif "dropdown_option_label" in selector_lower:
+                effective_filter_key = "dropdown_option_label"
+            elif "dropdown_option_value" in selector_lower:
+                effective_filter_key = "dropdown_option_value"
+        if effective_filter_key:
+            deduped = self._filter_alias_candidates(effective_filter_key, deduped)
         return deduped
 
     @staticmethod
@@ -742,6 +846,48 @@ class AgentExecutor:
 
     def _filter_alias_candidates(self, alias_key: str, candidates: list[str]) -> list[str]:
         key = alias_key.strip().lower()
+        if key == "dropdown_option_enter_manual":
+            filtered = [
+                c for c in candidates
+                if "enter options manually" in c.lower() and "use a saved list" not in c.lower()
+            ]
+            return filtered or candidates
+
+        if key == "dropdown_option_label":
+            filtered = [
+                c for c in candidates
+                if ("placeholder='label'" in c.lower() or 'placeholder="label"' in c.lower() or "name='label'" in c.lower() or 'name="label"' in c.lower())
+                and "enter a label" not in c.lower()
+            ]
+            return filtered or candidates
+
+        if key == "dropdown_option_value":
+            filtered = [
+                c for c in candidates
+                if "placeholder='value'" in c.lower() or 'placeholder="value"' in c.lower() or "name='value'" in c.lower() or 'name="value"' in c.lower()
+            ]
+            return filtered or candidates
+
+        if key == "dropdown_option_type_trigger":
+            filtered = [
+                c for c in candidates
+                if "select an option" in c.lower() or "option type" in c.lower() or "[role='combobox']" in c.lower()
+            ]
+            return filtered or candidates
+
+        if key == "dropdown_option_add_button":
+            preferred_markers = (
+                "add-option",
+                "aria-label*='add option'",
+                "title*='add option'",
+                "svg[class*='plus']",
+                "input[placeholder='value']) button",
+                ":has-text('+')",
+                "text=+",
+            )
+            filtered = [c for c in candidates if any(m in c.lower() for m in preferred_markers)]
+            return filtered or candidates
+
         if key == "form_label":
             blocked_tokens = (
                 "#formname",
@@ -1370,6 +1516,8 @@ class AgentExecutor:
                 keys.append("create_form")
             if any(token in selector_lower for token in ("save form", "save_form", "saveform")):
                 keys.append("save_form")
+            if any(token in selector_lower for token in ("back button", "selector.back_button")):
+                keys.append("back_button")
             if any(token in selector_lower for token in ("required", "checkbox")):
                 keys.append("required_checkbox")
             if any(token in selector_lower for token in ("login", "sign in", "signin", "log in")):

@@ -33,10 +33,18 @@ def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any
 
     steps: list[dict[str, Any]] = []
     last_drag_source_selector: str | None = None
+    dropdown_options_mode = False
+    pending_option_type_choice: str | None = None
     for line in instruction_lines:
         lower = line.lower()
         normalized_lower = re.sub(r"[^a-z0-9\s]", " ", lower)
         normalized_lower = re.sub(r"\s+", " ", normalized_lower).strip()
+        if "option type" in normalized_lower and (
+            "enter options manually" in normalized_lower or "options manually" in normalized_lower
+        ):
+            pending_option_type_choice = "enter options manually"
+            dropdown_options_mode = True
+
         drag_field = _extract_drag_field_label(line)
         if drag_field:
             last_drag_source_selector = _drag_source_selector_from_label(drag_field)
@@ -64,7 +72,18 @@ def parse_structured_task_steps(task: str, max_steps: int) -> list[dict[str, Any
             }
         if parsed is None:
             continue
+        if (
+            dropdown_options_mode
+            and parsed.get("type") == "type"
+            and parsed.get("selector") == "{{selector.form_label}}"
+        ):
+            parsed["selector"] = "{{selector.dropdown_option_label}}"
         steps.append(parsed)
+        if pending_option_type_choice and len(steps) < max_steps:
+            steps.append({"type": "click", "selector": "{{selector.dropdown_option_enter_manual}}"})
+            pending_option_type_choice = None
+        if dropdown_options_mode and parsed.get("type") == "click" and parsed.get("selector") == "{{selector.save_form}}":
+            dropdown_options_mode = False
         if len(steps) >= max_steps:
             break
     steps = _enforce_login_sequence(steps, max_steps=max_steps)
@@ -148,6 +167,36 @@ def _parse_line(line: str) -> dict[str, Any] | None:
         value = _extract_form_name_value(line)
         return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
 
+    if "verify" in lower and "form" in lower and "top" in lower and "list" in lower:
+        return {
+            "type": "verify_text",
+            "selector": "{{selector.form_list_first_row}}",
+            "match": "contains",
+            "value": "QA_Form_",
+        }
+
+    if "click" in lower and "form name" in lower and "open" in lower and "editor" in lower:
+        return {"type": "click", "selector": "{{selector.form_list_first_name}}"}
+
+    if "verify" in lower and "form editor" in lower and "fields" in lower:
+        return {
+            "type": "verify_text",
+            "selector": "body",
+            "match": "contains",
+            "value": "First Name",
+        }
+
+    if "option type" in lower and any(token in lower for token in ("select", "choose", "value")):
+        return {"type": "click", "selector": "{{selector.dropdown_option_type_trigger}}"}
+
+    if any(token in lower for token in ("wait for options", "options label to display", "options to display")):
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.dropdown_options_section}}",
+            "ms": 5000,
+        }
+
     verify_contains = _parse_verify_contains_on_selector(line)
     if verify_contains is not None:
         return verify_contains
@@ -179,11 +228,24 @@ def _parse_line(line: str) -> dict[str, Any] | None:
             "target_selector": "{{selector.form_canvas_target}}",
         }
 
-    if any(token in lower for token in ("label", "first name")) and any(
-        token in lower for token in ("enter", "type")
+    if (
+        any(token in lower for token in ("label", "lable", "first name"))
+        and any(token in lower for token in ("enter", "type"))
+        and not ("value as" in lower and "option" in lower)
     ):
         value = quoted or "First Name"
+        if "option" in lower:
+            return {"type": "type", "selector": "{{selector.dropdown_option_label}}", "text": value, "clear_first": True}
         return {"type": "type", "selector": "{{selector.form_label}}", "text": value, "clear_first": True}
+
+    if any(token in lower for token in ("value as", "enter value", "type value")) and any(
+        token in lower for token in ("enter", "type", "value")
+    ):
+        value = quoted or _after_delimiter(line) or "A"
+        return {"type": "type", "selector": "{{selector.dropdown_option_value}}", "text": value, "clear_first": True}
+
+    if any(token in lower for token in ("+ icon", "plus icon", "click +", "click plus")):
+        return {"type": "click", "selector": "{{selector.dropdown_option_add_button}}"}
 
     if any(token in lower for token in ("required checkbox", "required check box", "required")) and any(
         token in lower for token in ("check", "select", "tick", "click")
@@ -195,7 +257,7 @@ def _parse_line(line: str) -> dict[str, Any] | None:
 
     if "wait" in lower:
         wait_ms = _extract_wait_ms(line)
-        return {"type": "wait", "until": "timeout", "ms": wait_ms or 1000}
+        return {"type": "wait", "until": "timeout", "ms": wait_ms or 450}
 
     return None
 
@@ -262,6 +324,8 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     if not _looks_like_explicit_selector(normalized_target):
         if "create form" in lowered_target:
             return {"type": "click", "selector": "{{selector.create_form}}"}
+        if "back button" in lowered_target or lowered_target == "back":
+            return {"type": "click", "selector": "{{selector.back_button}}"}
         if "save" in lowered_target:
             return {"type": "click", "selector": "{{selector.save_form}}"}
         if "required" in lowered_target:
@@ -397,7 +461,7 @@ def _enforce_login_sequence(steps: list[dict[str, Any]], max_steps: int) -> list
 
     login_sequence = [
         {"type": "click", "selector": "{{selector.login_button}}"},
-        {"type": "wait", "until": "timeout", "ms": 1200},
+        {"type": "wait", "until": "timeout", "ms": 500},
     ]
     merged = steps[: password_index + 1] + login_sequence + steps[password_index + 1 :]
     return merged[:max_steps]
@@ -441,7 +505,7 @@ def _enforce_form_create_sequence(steps: list[dict[str, Any]], max_steps: int) -
 
     create_sequence = [
         {"type": "click", "selector": "{{selector.create_form_confirm}}"},
-        {"type": "wait", "until": "timeout", "ms": 1000},
+        {"type": "wait", "until": "timeout", "ms": 450},
     ]
     merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
     return merged[:max_steps]

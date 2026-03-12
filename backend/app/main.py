@@ -201,7 +201,7 @@ def _expand_drag_steps(
             expanded.append(dict(step))
 
         if len(expanded) < max_steps:
-            expanded.append({"type": "wait", "until": "timeout", "ms": 220})
+            expanded.append({"type": "wait", "until": "timeout", "ms": 120})
 
     return expanded[:max_steps]
 

@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     drag_target_x_offset: int = 260
     drag_target_y_offset: int = 180
     drag_retry_radius_px: int = 40
-    drag_validation_wait_ms: int = 300
+    drag_validation_wait_ms: int = 180
     drag_mouse_steps: int = 24
     drag_debug_log_enabled: bool = True
     drag_debug_log_path: Path = Path("data/drag_debug.jsonl")

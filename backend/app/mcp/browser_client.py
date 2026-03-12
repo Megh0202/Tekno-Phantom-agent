@@ -265,12 +265,47 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def click(self, selector: str) -> str:
         context = self._active_context()
+        selector_lower = selector.lower()
+        is_add_option_click = (
+            "add-option" in selector_lower
+            or "text=+" in selector_lower
+            or ":has-text('+')" in selector_lower
+            or "placeholder='value']) button" in selector_lower
+            or 'placeholder="value"]) button' in selector_lower
+        )
+        if is_add_option_click:
+            dialog = context.page.locator("div[role='dialog']").first
+            before_count = await dialog.locator("input[placeholder='Value']").count()
+            candidate_selectors = [
+                selector,
+                "div[role='dialog'] button:has(svg[class*='plus'])",
+                "div[role='dialog'] button:has(i[class*='plus'])",
+                "div[role='dialog'] [data-testid*='add-option']",
+                "div[role='dialog'] [aria-label*='Add option']",
+                "div[role='dialog'] div:has(input[placeholder='Value']) button",
+                "div[role='dialog'] button:has-text('+')",
+            ]
+            for candidate in candidate_selectors:
+                try:
+                    await context.page.locator(candidate).first.click(timeout=1400)
+                    await context.page.wait_for_timeout(180)
+                    after_count = await dialog.locator("input[placeholder='Value']").count()
+                    if after_count > before_count:
+                        return f"Clicked {candidate}"
+                except Exception:
+                    continue
         await context.page.locator(selector).first.click()
         return f"Clicked {selector}"
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         context = self._active_context()
-        locator = context.page.locator(selector).first
+        selector_lower = selector.lower()
+        if "div[role='dialog'] input[placeholder='label']" in selector_lower and "enter a label" not in selector_lower:
+            locator = context.page.locator("div[role='dialog'] input[placeholder='Label']").last
+        elif "div[role='dialog'] input[placeholder='value']" in selector_lower:
+            locator = context.page.locator("div[role='dialog'] input[placeholder='Value']").last
+        else:
+            locator = context.page.locator(selector).first
         if clear_first:
             await locator.fill(text)
             mode = "after clear"
@@ -1125,6 +1160,46 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def click(self, selector: str) -> str:
         message = f"Clicked {selector}"
+        selector_lower = selector.lower()
+        is_add_option_click = (
+            "add-option" in selector_lower
+            or "text=+" in selector_lower
+            or ":has-text('+')" in selector_lower
+            or "placeholder='value']) button" in selector_lower
+            or 'placeholder="value"]) button' in selector_lower
+        )
+        if is_add_option_click:
+            add_option_candidates = [
+                selector,
+                "div[role='dialog'] button:has(svg[class*='plus'])",
+                "div[role='dialog'] button:has(i[class*='plus'])",
+                "div[role='dialog'] [data-testid*='add-option']",
+                "div[role='dialog'] [aria-label*='Add option']",
+                "div[role='dialog'] div:has(input[placeholder='Value']) button",
+                "div[role='dialog'] button:has-text('+')",
+            ]
+            code = (
+                "async (page) => {"
+                "  const dialog = page.locator(\"div[role='dialog']\").first();"
+                "  const values = dialog.locator(\"input[placeholder='Value']\");"
+                "  const before = await values.count();"
+                f"  const candidates = {json.dumps(add_option_candidates)};"
+                "  for (const c of candidates) {"
+                "    try {"
+                "      await page.locator(c).first().click({ timeout: 1400 });"
+                "      await page.waitForTimeout(180);"
+                "      const after = await values.count();"
+                "      if (after > before) {"
+                "        return `Clicked ${c}`;"
+                "      }"
+                "    } catch (e) {}"
+                "  }"
+                f"  await page.locator({json.dumps(selector)}).first().click();"
+                f"  return {json.dumps(message)};"
+                "}"
+            )
+            result = await self._run_code(code)
+            return str(result) if result else message
         code = (
             "async (page) => {"
             f"  await page.locator({json.dumps(selector)}).first().click();"
@@ -1137,6 +1212,30 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         mode = "after clear" if clear_first else "append"
         message = f"Typed into {selector} ({mode})"
+        selector_lower = selector.lower()
+        use_last_label = "div[role='dialog'] input[placeholder='label']" in selector_lower and "enter a label" not in selector_lower
+        use_last_value = "div[role='dialog'] input[placeholder='value']" in selector_lower
+        if use_last_label or use_last_value:
+            specific = "div[role='dialog'] input[placeholder='Label']" if use_last_label else "div[role='dialog'] input[placeholder='Value']"
+            if clear_first:
+                code = (
+                    "async (page) => {"
+                    f"  const locator = page.locator({json.dumps(specific)}).last();"
+                    f"  await locator.fill({json.dumps(text)});"
+                    f"  return {json.dumps(message)};"
+                    "}"
+                )
+            else:
+                code = (
+                    "async (page) => {"
+                    f"  const locator = page.locator({json.dumps(specific)}).last();"
+                    "  await locator.click();"
+                    f"  await locator.type({json.dumps(text)});"
+                    f"  return {json.dumps(message)};"
+                    "}"
+                )
+            await self._run_code(code)
+            return message
         if clear_first:
             code = (
                 "async (page) => {"
