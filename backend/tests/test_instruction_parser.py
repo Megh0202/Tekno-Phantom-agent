@@ -164,3 +164,86 @@ def test_required_optional_form_editor_verification_expands_to_stable_wait_steps
             "ms": 6000,
         },
     ]
+
+
+def test_structured_prompt_supports_workflow_module_and_create_workflow_sequence() -> None:
+    task = """
+1) Launch the application - https://test.vitaone.io
+2) Enter email - balasubramanian.r@teknotrait.com
+3) Enter password - PasswordVitaone1@
+4) Verify that admin is logged in successfully and 'Create Form' button is visible
+5) Change the Module from Forms to Workflows
+6) Verify 'Create Workflow' button should be available
+7) Click on 'Create Workflow' button
+8) Enter Workflow Name in the following format - "QA_Auto_Workflow_<timestamp>" where timestamp is the current date time stamp
+9) Enter description as - "This is Automation testing workflow with test data"
+10) Click on Save button to save the Workflow
+"""
+    steps = parse_structured_task_steps(task, max_steps=30)
+
+    assert steps[0] == {"type": "navigate", "url": "https://test.vitaone.io"}
+    assert steps[1] == {
+        "type": "type",
+        "selector": "{{selector.email}}",
+        "text": "balasubramanian.r@teknotrait.com",
+        "clear_first": True,
+    }
+    assert steps[2] == {
+        "type": "type",
+        "selector": "{{selector.password}}",
+        "text": "PasswordVitaone1@",
+        "clear_first": True,
+    }
+    assert steps[3] == {"type": "click", "selector": "{{selector.login_button}}"}
+    assert {"type": "wait", "until": "timeout", "ms": 500} in steps
+    assert {"type": "wait", "until": "selector_visible", "selector": "{{selector.create_form}}", "ms": 6000} in steps
+    assert {"type": "click", "selector": "{{selector.module_launcher}}"} in steps
+    assert {"type": "click", "selector": "{{selector.module_workflows}}"} in steps
+    assert {"type": "wait", "until": "selector_visible", "selector": "{{selector.create_workflow}}", "ms": 6000} in steps
+    assert {"type": "click", "selector": "{{selector.create_workflow}}"} in steps
+    assert {
+        "type": "type",
+        "selector": "{{selector.workflow_name}}",
+        "text": "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    } in steps
+    assert {
+        "type": "type",
+        "selector": "{{selector.workflow_description}}",
+        "text": "This is Automation testing workflow with test data",
+        "clear_first": True,
+    } in steps
+    assert {"type": "click", "selector": "{{selector.save_workflow}}"} in steps
+
+
+def test_structured_prompt_matches_video_style_workflow_creation_after_login() -> None:
+    task = """
+1) Launch the application - https://test.vitaone.io
+2) Enter email - balasubramanian.r@teknotrait.com
+3) Enter password - PasswordVitaone1@
+4) Verify admin login success and 'Create Form' button is visible
+5) Change the Module from Forms to Workflows
+6) Verify 'Create Workflow' button should be available
+7) Click on 'Create Workflow' button
+8) Enter Workflow Name in the following format - "QA_WORKFLOW_<timestamp>"
+9) Click on Save button to save the Workflow
+10) Verify 'Save Changes' button should be visible
+"""
+    steps = parse_structured_task_steps(task, max_steps=30)
+
+    assert {"type": "click", "selector": "{{selector.module_workflows}}"} in steps
+    assert {"type": "click", "selector": "{{selector.module_launcher}}"} in steps
+    assert {"type": "click", "selector": "{{selector.create_workflow}}"} in steps
+    assert {
+        "type": "type",
+        "selector": "{{selector.workflow_name}}",
+        "text": "QA_WORKFLOW_{{NOW_YYYYMMDD_HHMMSS}}",
+        "clear_first": True,
+    } in steps
+    assert {"type": "click", "selector": "{{selector.save_workflow}}"} in steps
+    assert {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": "{{selector.workflow_save_changes}}",
+        "ms": 6000,
+    } in steps

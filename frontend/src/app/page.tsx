@@ -1,6 +1,7 @@
 ﻿"use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 
 import styles from "./page.module.css";
 
@@ -17,6 +18,7 @@ type RuntimeStep = {
   step_id: string;
   index: number;
   type: string;
+  input?: Record<string, unknown>;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   message?: string | null;
   error?: string | null;
@@ -36,6 +38,7 @@ type TestCaseState = {
   name: string;
   description?: string;
   prompt?: string;
+  parent_folder_id?: string | null;
   start_url?: string | null;
   steps: Record<string, unknown>[];
   test_data?: JsonObject;
@@ -49,8 +52,17 @@ type TestCaseSummary = {
   name: string;
   description?: string;
   prompt?: string;
+  parent_folder_id?: string | null;
   start_url?: string | null;
   step_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type FolderState = {
+  folder_id: string;
+  name: string;
+  parent_folder_id?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -70,6 +82,20 @@ type StepImportResponse = {
 };
 
 type JsonObject = Record<string, unknown>;
+
+type SuiteRunState = {
+  suite_run_id: string;
+  suite_name: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  tests: Array<{
+    test_case_id: string;
+    name: string;
+    status: "pending" | "running" | "completed" | "failed" | "cancelled";
+    run_id?: string | null;
+  }>;
+  summary?: string | null;
+  report_artifact?: string | null;
+};
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
@@ -153,6 +179,18 @@ function buildPromptFallbackFromSteps(steps: Record<string, unknown>[]): string 
     .join("\n");
 }
 
+function extractUserStepLinesFromPrompt(prompt: string): string[] {
+  return prompt
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => Boolean(line))
+    .map((line) => line.replace(/^\d+[\).\s-]+/, "").trim());
+}
+
+function normalizeParentFolderId(value: string | null | undefined): string {
+  return (value ?? "").trim();
+}
+
 function parseJsonObject(raw: string, label: string): JsonObject {
   const text = raw
     .replace(/\u2018|\u2019|\u2032/g, "'")
@@ -182,6 +220,7 @@ function buildPlanSignature(prompt: string, testDataInput: string, selectorProfi
 }
 
 export default function Home() {
+  const router = useRouter();
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
 
@@ -197,6 +236,9 @@ export default function Home() {
   const [isImporting, setIsImporting] = useState(false);
   const [isRefreshingCases, setIsRefreshingCases] = useState(false);
   const [runningCaseId, setRunningCaseId] = useState<string | null>(null);
+  const [currentRunSourceTestCaseId, setCurrentRunSourceTestCaseId] = useState<string | null>(null);
+  const [selectorFixInputs, setSelectorFixInputs] = useState<Record<string, string>>({});
+  const [selectorFixBusyByStepId, setSelectorFixBusyByStepId] = useState<Record<string, boolean>>({});
   const [requestError, setRequestError] = useState<string | null>(null);
   const [requestInfo, setRequestInfo] = useState<string | null>(null);
   const [planPreview, setPlanPreview] = useState<PlanGenerateResponse | null>(null);
@@ -206,6 +248,16 @@ export default function Home() {
   const [testCaseName, setTestCaseName] = useState("");
   const [testCaseDescription, setTestCaseDescription] = useState("");
   const [savedCases, setSavedCases] = useState<TestCaseSummary[]>([]);
+  const [folders, setFolders] = useState<FolderState[]>([]);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  const [expandedFolderIds, setExpandedFolderIds] = useState<Record<string, boolean>>({});
+  const [expandedTestIds, setExpandedTestIds] = useState<Record<string, boolean>>({});
+  const [folderNameInput, setFolderNameInput] = useState("");
+  const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  const testCaseNameInputRef = useRef<HTMLInputElement | null>(null);
+  const [selectedTestCaseIds, setSelectedTestCaseIds] = useState<string[]>([]);
+  const [isStartingSuite, setIsStartingSuite] = useState(false);
+  const [currentSuiteRun, setCurrentSuiteRun] = useState<SuiteRunState | null>(null);
 
   const [currentRun, setCurrentRun] = useState<RunState | null>(null);
 
@@ -217,6 +269,17 @@ export default function Home() {
     if (!currentRun?.run_id || !currentRun?.report_artifact) return null;
     return `${API_BASE_URL}/api/runs/${currentRun.run_id}/artifacts/report.html`;
   }, [currentRun]);
+  const suiteReportUrl = useMemo(() => {
+    if (!currentSuiteRun?.suite_run_id) return null;
+    return `${API_BASE_URL}/api/suite-runs/${currentSuiteRun.suite_run_id}/artifacts/suite-report.html`;
+  }, [currentSuiteRun]);
+  const suiteIsActive = useMemo(() => {
+    if (!currentSuiteRun) return false;
+    return (
+      currentSuiteRun.status === "pending" ||
+      currentSuiteRun.status === "running"
+    );
+  }, [currentSuiteRun]);
   const planIsFresh = useMemo(() => {
     if (!planPreview) return false;
     const currentSignature = buildPlanSignature(prompt, testDataInput, selectorProfileInput);
@@ -232,6 +295,73 @@ export default function Home() {
     }
     return SHOW_ADVANCED_INPUTS ? planPreview : null;
   }, [importedPlan, planPreview]);
+  const selectedFolderName = useMemo(() => {
+    if (!selectedFolderId) return "Root";
+    const selected = folders.find((folder) => folder.folder_id === selectedFolderId);
+    return selected?.name ?? "Root";
+  }, [folders, selectedFolderId]);
+  const folderChildrenMap = useMemo(() => {
+    const map = new Map<string, FolderState[]>();
+    for (const folder of folders) {
+      const parentKey = normalizeParentFolderId(folder.parent_folder_id);
+      const current = map.get(parentKey) ?? [];
+      current.push(folder);
+      map.set(parentKey, current);
+    }
+    for (const value of map.values()) {
+      value.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return map;
+  }, [folders]);
+  const testsByFolderMap = useMemo(() => {
+    const map = new Map<string, TestCaseSummary[]>();
+    for (const testCase of savedCases) {
+      const parentKey = normalizeParentFolderId(testCase.parent_folder_id);
+      const current = map.get(parentKey) ?? [];
+      current.push(testCase);
+      map.set(parentKey, current);
+    }
+    for (const value of map.values()) {
+      value.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return map;
+  }, [savedCases]);
+  const folderTestCountMap = useMemo(() => {
+    const counts = new Map<string, number>();
+    const visiting = new Set<string>();
+
+    const countForFolder = (folderId: string): number => {
+      if (counts.has(folderId)) return counts.get(folderId) ?? 0;
+      if (visiting.has(folderId)) return 0;
+      visiting.add(folderId);
+      let total = (testsByFolderMap.get(folderId) ?? []).length;
+      for (const child of folderChildrenMap.get(folderId) ?? []) {
+        total += countForFolder(child.folder_id);
+      }
+      visiting.delete(folderId);
+      counts.set(folderId, total);
+      return total;
+    };
+
+    for (const folder of folders) {
+      countForFolder(folder.folder_id);
+    }
+    return counts;
+  }, [folderChildrenMap, folders, testsByFolderMap]);
+
+  useEffect(() => {
+    setExpandedFolderIds((previous) => {
+      let changed = false;
+      const next = { ...previous };
+      for (const folder of folders) {
+        if (next[folder.folder_id] === undefined) {
+          next[folder.folder_id] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [folders]);
 
   useEffect(() => {
     let disposed = false;
@@ -287,9 +417,37 @@ export default function Home() {
     }
   }, []);
 
+  const loadFolders = useCallback(async (options?: { silent?: boolean }): Promise<void> => {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setIsRefreshingCases(true);
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/test-folders`, {
+        cache: "no-store",
+        headers: buildApiHeaders(),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const payload = (await response.json()) as { items: FolderState[] };
+      setFolders(payload.items ?? []);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to load folders");
+    } finally {
+      if (!silent) {
+        setIsRefreshingCases(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     void loadTestCases({ silent: true });
   }, [loadTestCases]);
+
+  useEffect(() => {
+    void loadFolders({ silent: true });
+  }, [loadFolders]);
 
   useEffect(() => {
     if (!currentRun) return;
@@ -312,6 +470,31 @@ export default function Home() {
 
     return () => clearInterval(interval);
   }, [currentRun]);
+
+  useEffect(() => {
+    if (!currentSuiteRun) return;
+    const terminal =
+      currentSuiteRun.status === "completed" ||
+      currentSuiteRun.status === "failed" ||
+      currentSuiteRun.status === "cancelled";
+    if (terminal) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/suite-runs/${currentSuiteRun.suite_run_id}`, {
+          cache: "no-store",
+          headers: buildApiHeaders(),
+        });
+        if (!response.ok) return;
+        const payload = (await response.json()) as SuiteRunState;
+        setCurrentSuiteRun(payload);
+      } catch {
+        // Poll errors are ignored while suite run is active.
+      }
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [currentSuiteRun]);
 
   async function requestPlan(
     task: string,
@@ -431,6 +614,166 @@ export default function Home() {
     setRequestInfo("Imported steps cleared. Prompt planning mode is active.");
   }
 
+  async function createFolder(): Promise<void> {
+    setRequestError(null);
+    setRequestInfo(null);
+
+    const normalizedName = folderNameInput.trim();
+    if (!normalizedName) {
+      setRequestError("Enter folder name before creating.");
+      return;
+    }
+
+    try {
+      setIsCreatingFolder(true);
+      const response = await fetch(`${API_BASE_URL}/api/test-folders`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true }),
+        body: JSON.stringify({
+          name: normalizedName,
+          parent_folder_id: selectedFolderId,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const created = (await response.json()) as FolderState;
+      setFolderNameInput("");
+      setSelectedFolderId(created.folder_id);
+      setRequestInfo(`Created folder: ${created.name}`);
+      await loadFolders({ silent: true });
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to create folder");
+    } finally {
+      setIsCreatingFolder(false);
+    }
+  }
+
+  async function deleteFolder(folderId: string, folderName: string): Promise<void> {
+    const confirmed = window.confirm(
+      `Delete folder "${folderName}" and all nested subfolders and test cases?`,
+    );
+    if (!confirmed) return;
+
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/test-folders/${folderId}`, {
+        method: "DELETE",
+        headers: buildApiHeaders(),
+      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error("Delete API not available on backend. Please restart backend server.");
+        }
+        throw new Error(await parseError(response));
+      }
+      if (selectedFolderId === folderId) {
+        setSelectedFolderId(null);
+      }
+      setRequestInfo(`Deleted folder: ${folderName}`);
+      await loadFolders({ silent: true });
+      await loadTestCases({ silent: true });
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to delete folder");
+    }
+  }
+
+  async function deleteTestCase(testCaseId: string, testCaseNameValue: string): Promise<void> {
+    const confirmed = window.confirm(`Delete test case "${testCaseNameValue}"?`);
+    if (!confirmed) return;
+
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}`, {
+        method: "DELETE",
+        headers: buildApiHeaders(),
+      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error("Delete API not available on backend. Please restart backend server.");
+        }
+        throw new Error(await parseError(response));
+      }
+      setRequestInfo(`Deleted test case: ${testCaseNameValue}`);
+      await loadTestCases({ silent: true });
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to delete test case");
+    }
+  }
+
+  function toggleTestCaseSelection(testCaseId: string): void {
+    setSelectedTestCaseIds((previous) => {
+      if (previous.includes(testCaseId)) {
+        return previous.filter((item) => item !== testCaseId);
+      }
+      return [...previous, testCaseId];
+    });
+  }
+
+  async function runSelectedTestsInParallel(): Promise<void> {
+    if (selectedTestCaseIds.length < 2) {
+      setRequestError("Select at least two tests to run in parallel.");
+      return;
+    }
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      setIsStartingSuite(true);
+      const response = await fetch(`${API_BASE_URL}/api/suite-runs`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true }),
+        body: JSON.stringify({
+          suite_name: "selected-tests-suite",
+          test_case_ids: selectedTestCaseIds,
+          max_parallel: Math.min(selectedTestCaseIds.length, 4),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const suite = (await response.json()) as SuiteRunState;
+      setCurrentSuiteRun(suite);
+      setRequestInfo(`Parallel suite started: ${suite.suite_run_id}`);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to start parallel suite");
+    } finally {
+      setIsStartingSuite(false);
+    }
+  }
+
+  async function runCurrentFolderInParallel(): Promise<void> {
+    if (!selectedFolderId) {
+      setRequestError("Select a folder first to run folder tests in parallel.");
+      return;
+    }
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      setIsStartingSuite(true);
+      const response = await fetch(`${API_BASE_URL}/api/suite-runs`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true }),
+        body: JSON.stringify({
+          suite_name: "folder-suite-run",
+          folder_id: selectedFolderId,
+          max_parallel: 4,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const suite = (await response.json()) as SuiteRunState;
+      setCurrentSuiteRun(suite);
+      setRequestInfo(`Folder parallel suite started: ${suite.suite_run_id}`);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to start folder suite");
+    } finally {
+      setIsStartingSuite(false);
+    }
+  }
+
   async function runFromPrompt(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     setRequestError(null);
@@ -492,6 +835,7 @@ export default function Home() {
 
       const run = (await runResponse.json()) as RunState;
       setCurrentRun(run);
+      setCurrentRunSourceTestCaseId(null);
       setRequestInfo(`Run started: ${run.run_id}`);
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : "Failed to execute prompt";
@@ -557,6 +901,7 @@ export default function Home() {
           name: normalizedName,
           description: testCaseDescription.trim(),
           prompt: task || buildPromptFallbackFromSteps(plan.steps),
+          parent_folder_id: selectedFolderId,
           start_url: plan.start_url ?? null,
           steps: plan.steps,
           test_data: testData,
@@ -590,9 +935,14 @@ export default function Home() {
         const detail = (await detailResponse.json()) as TestCaseState;
         const savedPrompt = (detail.prompt ?? "").trim();
         const fallbackPrompt = buildPromptFallbackFromSteps(detail.steps ?? []);
+        const promptStepLines = extractUserStepLinesFromPrompt(savedPrompt);
         setPrompt(savedPrompt || fallbackPrompt);
         setTestCaseName(detail.name ?? "");
         setTestCaseDescription(detail.description ?? "");
+        if (!savedPrompt && promptStepLines.length > 0) {
+          setPrompt(promptStepLines.join("\n"));
+        }
+        setSelectedFolderId(detail.parent_folder_id ?? null);
       }
 
       const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}/run`, {
@@ -604,6 +954,7 @@ export default function Home() {
       }
       const run = (await response.json()) as RunState;
       setCurrentRun(run);
+      setCurrentRunSourceTestCaseId(testCaseId);
       setRequestInfo(`Run started from saved test case: ${run.run_name}`);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "Failed to run saved test case");
@@ -638,6 +989,284 @@ export default function Home() {
     } finally {
       setIsCancelling(false);
     }
+  }
+
+  function editableSelectorField(step: RuntimeStep): "selector" | "source_selector" | "target_selector" | null {
+    const payload = step.input ?? {};
+    if (typeof payload.selector === "string" && payload.selector.trim()) return "selector";
+    if (typeof payload.source_selector === "string" && payload.source_selector.trim()) return "source_selector";
+    if (typeof payload.target_selector === "string" && payload.target_selector.trim()) return "target_selector";
+    return null;
+  }
+
+  function defaultSelectorForStep(step: RuntimeStep): string {
+    const field = editableSelectorField(step);
+    if (!field) return "";
+    const payload = step.input ?? {};
+    const value = payload[field];
+    return typeof value === "string" ? value : "";
+  }
+
+  async function applySelectorFixAndRerun(step: RuntimeStep): Promise<void> {
+    if (!currentRun) {
+      setRequestError("No active run context found for selector recovery.");
+      return;
+    }
+
+    const stepField = editableSelectorField(step);
+    if (!stepField) {
+      setRequestError("This failed step does not expose an editable selector field.");
+      return;
+    }
+
+    const selectorValue = (selectorFixInputs[step.step_id] ?? defaultSelectorForStep(step)).trim();
+    if (!selectorValue) {
+      setRequestError("Paste a valid selector before applying recovery.");
+      return;
+    }
+
+    setRequestError(null);
+    setRequestInfo(null);
+    setSelectorFixBusyByStepId((previous) => ({ ...previous, [step.step_id]: true }));
+    try {
+      if (currentRunSourceTestCaseId) {
+        const detailResponse = await fetch(`${API_BASE_URL}/api/test-cases/${currentRunSourceTestCaseId}`, {
+          cache: "no-store",
+          headers: buildApiHeaders(),
+        });
+        if (!detailResponse.ok) {
+          throw new Error(await parseError(detailResponse));
+        }
+        const detail = (await detailResponse.json()) as TestCaseState;
+        const steps = [...(detail.steps ?? [])];
+
+        const directCandidate = steps[step.index] as Record<string, unknown> | undefined;
+        let stepIndexToPatch = -1;
+        if (directCandidate && directCandidate.type === step.type) {
+          stepIndexToPatch = step.index;
+        } else {
+          const failedSelector = defaultSelectorForStep(step);
+          stepIndexToPatch = steps.findIndex((candidate) => {
+            const row = candidate as Record<string, unknown>;
+            if (row.type !== step.type) return false;
+            const candidateValue = row[stepField];
+            return typeof candidateValue === "string" && candidateValue === failedSelector;
+          });
+        }
+
+        if (stepIndexToPatch < 0 || stepIndexToPatch >= steps.length) {
+          throw new Error("Could not map failed runtime step to its saved test step.");
+        }
+
+        const updatedStep = { ...(steps[stepIndexToPatch] as Record<string, unknown>) };
+        updatedStep[stepField] = selectorValue;
+        steps[stepIndexToPatch] = updatedStep;
+
+        const updateResponse = await fetch(`${API_BASE_URL}/api/test-cases/${currentRunSourceTestCaseId}`, {
+          method: "PUT",
+          headers: buildApiHeaders({ json: true }),
+          body: JSON.stringify({
+            name: detail.name,
+            description: detail.description ?? "",
+            prompt: detail.prompt ?? "",
+            parent_folder_id: detail.parent_folder_id ?? null,
+            start_url: detail.start_url ?? null,
+            steps,
+            test_data: detail.test_data ?? {},
+            selector_profile: detail.selector_profile ?? {},
+          }),
+        });
+        if (!updateResponse.ok) {
+          throw new Error(await parseError(updateResponse));
+        }
+
+        const rerunResponse = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
+          method: "POST",
+          headers: buildApiHeaders({ json: true }),
+          body: JSON.stringify({
+            step_index: step.index,
+            field: stepField,
+            selector: selectorValue,
+            run_name: `${currentRun.run_name} [resume-step-${step.index + 1}]`,
+          }),
+        });
+        if (!rerunResponse.ok) {
+          throw new Error(await parseError(rerunResponse));
+        }
+        const run = (await rerunResponse.json()) as RunState;
+        setCurrentRun(run);
+        setRequestInfo(
+          `Selector updated in saved test case. Resumed from step #${step.index + 1}: ${run.run_id}`,
+        );
+        await loadTestCases({ silent: true });
+      } else {
+        const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
+          method: "POST",
+          headers: buildApiHeaders({ json: true }),
+          body: JSON.stringify({
+            step_index: step.index,
+            field: stepField,
+            selector: selectorValue,
+            run_name: `${currentRun.run_name} [selector-fix]`,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(await parseError(response));
+        }
+        const run = (await response.json()) as RunState;
+        setCurrentRun(run);
+        setCurrentRunSourceTestCaseId(null);
+        setRequestInfo(
+          `Selector updated. Resumed from step #${step.index + 1}: ${run.run_id}`,
+        );
+      }
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to apply selector fix");
+    } finally {
+      setSelectorFixBusyByStepId((previous) => ({ ...previous, [step.step_id]: false }));
+    }
+  }
+
+  function toggleFolderExpanded(folderId: string): void {
+    setExpandedFolderIds((previous) => ({
+      ...previous,
+      [folderId]: !previous[folderId],
+    }));
+  }
+
+  function startCreateTestCaseInFolder(folderId: string | null, folderName: string): void {
+    setSelectedFolderId(folderId);
+    setRequestError(null);
+    setRequestInfo(`Creating new test case in "${folderName}". Enter details above and click Save Test Case.`);
+    testCaseNameInputRef.current?.focus();
+    testCaseNameInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function toggleTestExpanded(testCaseId: string): void {
+    setExpandedTestIds((previous) => ({
+      ...previous,
+      [testCaseId]: !previous[testCaseId],
+    }));
+  }
+
+  function renderLibraryNodes(parentFolderId: string | null, depth: number): ReactNode {
+    const parentKey = normalizeParentFolderId(parentFolderId);
+    const childFolders = folderChildrenMap.get(parentKey) ?? [];
+    const childTests = testsByFolderMap.get(parentKey) ?? [];
+
+    return (
+      <>
+        {childFolders.map((folder) => {
+          const isSelected = selectedFolderId === folder.folder_id;
+          const isExpanded = expandedFolderIds[folder.folder_id] ?? true;
+          const hasChildren =
+            (folderChildrenMap.get(folder.folder_id)?.length ?? 0) > 0 ||
+            (testsByFolderMap.get(folder.folder_id)?.length ?? 0) > 0;
+          const folderCount = folderTestCountMap.get(folder.folder_id) ?? 0;
+          return (
+            <div key={folder.folder_id} className={styles.treeRow} style={{ marginLeft: `${depth * 16}px` }}>
+              <div className={styles.treeNodeRow}>
+                <button
+                  type="button"
+                  className={styles.expandButton}
+                  onClick={() => toggleFolderExpanded(folder.folder_id)}
+                  disabled={!hasChildren}
+                  aria-label={isExpanded ? "Collapse folder" : "Expand folder"}
+                >
+                  {hasChildren ? (isExpanded ? "▾" : "▸") : "·"}
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.folderRowButton} ${isSelected ? styles.folderRowButtonActive : ""}`}
+                  onClick={() => setSelectedFolderId(folder.folder_id)}
+                >
+                  {folder.name}
+                </button>
+                <span className={styles.treeCount}>{folderCount} tests</span>
+                <button
+                  type="button"
+                  className={styles.addIconButton}
+                  onClick={() => startCreateTestCaseInFolder(folder.folder_id, folder.name)}
+                  title="Create test case in this folder"
+                  aria-label={`Create test case in folder ${folder.name}`}
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  className={styles.deleteIconButton}
+                  onClick={() => void deleteFolder(folder.folder_id, folder.name)}
+                  title="Delete folder"
+                  aria-label={`Delete folder ${folder.name}`}
+                >
+                  Del
+                </button>
+              </div>
+              {isExpanded ? renderLibraryNodes(folder.folder_id, depth + 1) : null}
+            </div>
+          );
+        })}
+        {childTests.map((testCase) => (
+          <article key={testCase.test_case_id} className={styles.testNode} style={{ marginLeft: `${depth * 16}px` }}>
+            <div className={styles.treeNodeRowTest}>
+              <input
+                type="checkbox"
+                checked={selectedTestCaseIds.includes(testCase.test_case_id)}
+                onChange={() => toggleTestCaseSelection(testCase.test_case_id)}
+              />
+              <button
+                type="button"
+                className={styles.expandButton}
+                onClick={() => toggleTestExpanded(testCase.test_case_id)}
+                aria-label={expandedTestIds[testCase.test_case_id] ? "Collapse test steps" : "Expand test steps"}
+              >
+                {expandedTestIds[testCase.test_case_id] ? "▾" : "▸"}
+              </button>
+              <button
+                type="button"
+                className={styles.testRowButton}
+                onClick={() => router.push(`/test-cases/${testCase.test_case_id}`)}
+              >
+                {testCase.name}
+              </button>
+              <span className={styles.treeCount}>{testCase.step_count} steps</span>
+              <button
+                type="button"
+                className={styles.secondaryButton}
+                onClick={() => void runSavedTestCase(testCase.test_case_id)}
+                disabled={Boolean(runningCaseId)}
+              >
+                {runningCaseId === testCase.test_case_id ? "Starting..." : "Run"}
+              </button>
+              <button
+                type="button"
+                className={styles.deleteIconButton}
+                onClick={() => void deleteTestCase(testCase.test_case_id, testCase.name)}
+                title="Delete test case"
+                aria-label={`Delete test case ${testCase.name}`}
+              >
+                Del
+              </button>
+            </div>
+            {expandedTestIds[testCase.test_case_id] ? (
+              <div className={styles.testStepsBox}>
+                {extractUserStepLinesFromPrompt((testCase.prompt ?? "").trim()).length > 0 ? (
+                  <ol className={styles.testStepList}>
+                    {extractUserStepLinesFromPrompt((testCase.prompt ?? "").trim()).map((line, index) => (
+                      <li key={`${testCase.test_case_id}-line-${index}`} className={styles.testStepItem}>
+                        {line}
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className={styles.metaLine}>No user-entered steps found for this test case.</p>
+                )}
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </>
+    );
   }
 
   return (
@@ -688,6 +1317,7 @@ export default function Home() {
                 <label className={styles.fieldLabel}>
                   <span>Test Case Name</span>
                   <input
+                    ref={testCaseNameInputRef}
                     value={testCaseName}
                     onChange={(event) => setTestCaseName(event.target.value)}
                     placeholder="Create_Form_01"
@@ -831,52 +1461,118 @@ export default function Home() {
           <section className={styles.panel}>
             <div className={styles.savedHeader}>
               <h2>Saved Test Cases</h2>
+              <div className={styles.savedActions}>
+                <button
+                  type="button"
+                  className={styles.secondaryButton}
+                  onClick={() => {
+                    void loadFolders();
+                    void loadTestCases();
+                  }}
+                  disabled={isRefreshingCases}
+                >
+                  {isRefreshingCases ? "Refreshing..." : "Refresh"}
+                </button>
+                <button
+                  type="button"
+                  className={styles.secondaryButton}
+                  onClick={() => void runSelectedTestsInParallel()}
+                  disabled={isStartingSuite || selectedTestCaseIds.length < 2}
+                >
+                  {isStartingSuite ? "Starting..." : "Run Selected Parallel"}
+                </button>
+                <button
+                  type="button"
+                  className={styles.secondaryButton}
+                  onClick={() => void runCurrentFolderInParallel()}
+                  disabled={isStartingSuite || !selectedFolderId}
+                >
+                  {isStartingSuite ? "Starting..." : "Run Folder Parallel"}
+                </button>
+              </div>
+            </div>
+
+            <div className={styles.folderCreateRow}>
+              <input
+                value={folderNameInput}
+                onChange={(event) => setFolderNameInput(event.target.value)}
+                placeholder="Folder name"
+              />
               <button
                 type="button"
                 className={styles.secondaryButton}
-                onClick={() => void loadTestCases()}
-                disabled={isRefreshingCases}
+                onClick={() => void createFolder()}
+                disabled={isCreatingFolder}
               >
-                {isRefreshingCases ? "Refreshing..." : "Refresh"}
+                {isCreatingFolder ? "Creating..." : "+ Folder"}
+              </button>
+              <button
+                type="button"
+                className={`${styles.secondaryButton} ${!selectedFolderId ? styles.folderScopeActive : ""}`}
+                onClick={() => startCreateTestCaseInFolder(selectedFolderId, selectedFolderName)}
+              >
+                + Test Case
               </button>
             </div>
+            <p className={styles.metaLine}>Current folder: {selectedFolderName}</p>
 
-            {savedCases.length === 0 ? (
-              <p className={styles.emptyState}>No saved test cases yet.</p>
+            {savedCases.length === 0 && folders.length === 0 ? (
+              <p className={styles.emptyState}>No folders or test cases yet.</p>
             ) : (
-              <div className={styles.savedList}>
-                {savedCases.map((testCase) => (
-                  <article key={testCase.test_case_id} className={styles.savedItem}>
-                    <div className={styles.savedItemTop}>
-                      <div>
-                        <p className={styles.savedName}>{testCase.name}</p>
-                        {testCase.description ? <p className={styles.savedDesc}>{testCase.description}</p> : null}
-                        <p className={styles.metaLine}>
-                          Steps: {testCase.step_count}
-                          {testCase.start_url ? ` · Start URL: ${testCase.start_url}` : ""}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        className={styles.primaryButton}
-                        onClick={() => void runSavedTestCase(testCase.test_case_id)}
-                        disabled={Boolean(runningCaseId)}
-                      >
-                        {runningCaseId === testCase.test_case_id ? "Starting..." : "Run"}
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
+              <div className={styles.savedList}>{renderLibraryNodes(null, 0)}</div>
             )}
+
           </section>
         </div>
 
         <section className={`${styles.panel} ${styles.resultPanel}`}>
           <h2>Result</h2>
-          {!currentRun ? (
+          {!currentRun && !currentSuiteRun ? (
             <p className={styles.emptyState}>No result yet. Submit a prompt to run automation.</p>
-          ) : (
+          ) : null}
+          {currentSuiteRun ? (
+            <div className={styles.planPreview}>
+              <div className={styles.runHeader}>
+                <div>
+                  <p className={styles.runName}>{currentSuiteRun.suite_name}</p>
+                  <p className={styles.metaLine}>Suite ID: {currentSuiteRun.suite_run_id}</p>
+                </div>
+                <p className={`${styles.statusPill} ${statusClass(currentSuiteRun.status)}`}>
+                  {currentSuiteRun.status}
+                </p>
+              </div>
+              <p className={styles.metaLine}>
+                Tests: {currentSuiteRun.tests.length}
+                {suiteIsActive ? " · Running in parallel..." : ""}
+              </p>
+              {suiteReportUrl ? (
+                <a className={styles.secondaryButton} href={suiteReportUrl} target="_blank" rel="noopener noreferrer">
+                  Open Suite Report
+                </a>
+              ) : null}
+              <div className={styles.timeline}>
+                {currentSuiteRun.tests.map((suiteTest) => (
+                  <article key={`suite-test-${suiteTest.test_case_id}`} className={styles.timelineItem}>
+                    <div className={styles.timelineTop}>
+                      <p>{suiteTest.name}</p>
+                      <p className={`${styles.statusPill} ${statusClass(suiteTest.status)}`}>{suiteTest.status}</p>
+                    </div>
+                    {suiteTest.run_id ? (
+                      <a
+                        className={styles.secondaryButton}
+                        href={`${API_BASE_URL}/api/runs/${suiteTest.run_id}/artifacts/report.html`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open Test Report
+                      </a>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {currentRun ? (
             <>
               <div className={styles.runHeader}>
                 <div>
@@ -923,11 +1619,41 @@ export default function Home() {
                         {currentRun.run_id}
                       </p>
                     ) : null}
+                    {step.status === "failed" && editableSelectorField(step) ? (
+                      <div className={styles.selectorFixBox}>
+                        <p className={styles.selectorFixTitle}>Selector Recovery</p>
+                        <p className={styles.selectorFixHint}>
+                          Paste a corrected selector from your inspector tool and rerun directly.
+                          {!currentRunSourceTestCaseId ? " This applies to the new rerun." : ""}
+                        </p>
+                        <div className={styles.selectorFixRow}>
+                          <input
+                            className={styles.selectorFixInput}
+                            value={selectorFixInputs[step.step_id] ?? defaultSelectorForStep(step)}
+                            onChange={(event) =>
+                              setSelectorFixInputs((previous) => ({
+                                ...previous,
+                                [step.step_id]: event.target.value,
+                              }))
+                            }
+                            placeholder="Paste corrected selector"
+                          />
+                          <button
+                            type="button"
+                            className={styles.secondaryButton}
+                            onClick={() => void applySelectorFixAndRerun(step)}
+                            disabled={Boolean(selectorFixBusyByStepId[step.step_id])}
+                          >
+                            {selectorFixBusyByStepId[step.step_id] ? "Applying..." : "Apply & Rerun"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                   </article>
                 ))}
               </div>
             </>
-          )}
+          ) : null}
         </section>
       </main>
     </div>

@@ -51,17 +51,24 @@ def test_run_creation_and_completion() -> None:
     assert all(step["status"] == "completed" for step in run["steps"])
 
 
-def test_run_rejects_when_step_count_exceeds_limit() -> None:
-    payload = {
-        "run_name": "too-many-steps",
-        "steps": [{"type": "click", "selector": "button.x"}] * 21,
-    }
-
+def test_run_truncates_when_step_count_exceeds_limit() -> None:
     with TestClient(app) as client:
+        health = client.get("/health")
+        assert health.status_code == 200, health.text
+        max_steps = int(health.json()["max_steps_per_run"])
+        payload = {
+            "run_name": "too-many-steps",
+            "steps": [{"type": "click", "selector": f"button.x-{index}"} for index in range(max_steps + 1)],
+        }
         response = client.post("/api/runs", json=payload)
+        assert response.status_code == 200, response.text
+        run_id = response.json()["run_id"]
 
-    assert response.status_code == 400
-    assert "max_steps_per_run" in response.json()["detail"]
+        fetched = client.get(f"/api/runs/{run_id}")
+        assert fetched.status_code == 200, fetched.text
+        run = fetched.json()
+
+    assert len(run["steps"]) == max_steps
 
 
 def test_run_accepts_test_data_and_selector_profile() -> None:
@@ -190,3 +197,96 @@ def test_run_artifact_endpoint_serves_report_html() -> None:
         assert report.status_code == 200, report.text
         assert "text/html" in report.headers.get("content-type", "")
         assert "Test Execution Report" in report.text
+
+
+def test_recover_selector_creates_new_run_with_patched_step() -> None:
+    payload = {
+        "run_name": "selector-recovery-source",
+        "steps": [{"type": "click", "selector": "button.old-selector"}],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        source_run = created.json()
+        source_run_id = source_run["run_id"]
+
+        recovered = client.post(
+            f"/api/runs/{source_run_id}/recover-selector",
+            json={
+                "step_index": 0,
+                "field": "selector",
+                "selector": "button.new-selector",
+            },
+        )
+        assert recovered.status_code == 200, recovered.text
+        recovered_run = recovered.json()
+        assert recovered_run["run_id"] != source_run_id
+
+        fetched = client.get(f"/api/runs/{recovered_run['run_id']}")
+        assert fetched.status_code == 200, fetched.text
+        latest = fetched.json()
+
+    assert latest["run_name"].endswith("[resume-step-1]")
+    assert latest["steps"][0]["input"]["selector"] == "button.new-selector"
+    assert "Clicked button.new-selector" in (latest["steps"][0]["message"] or "")
+
+
+def test_recover_selector_rejects_invalid_step_index() -> None:
+    payload = {
+        "run_name": "selector-recovery-invalid-index",
+        "steps": [{"type": "click", "selector": "button.old-selector"}],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        source_run_id = created.json()["run_id"]
+
+        recovered = client.post(
+            f"/api/runs/{source_run_id}/recover-selector",
+            json={
+                "step_index": 5,
+                "field": "selector",
+                "selector": "button.new-selector",
+            },
+        )
+
+    assert recovered.status_code == 400
+    assert "step_index is out of range" in recovered.json()["detail"]
+
+
+def test_recover_selector_resumes_from_selected_step_index() -> None:
+    payload = {
+        "run_name": "selector-recovery-resume-index",
+        "steps": [
+            {"type": "wait", "until": "timeout", "ms": 1},
+            {"type": "click", "selector": "button.old-selector"},
+            {"type": "wait", "until": "timeout", "ms": 2},
+        ],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        source_run_id = created.json()["run_id"]
+
+        recovered = client.post(
+            f"/api/runs/{source_run_id}/recover-selector",
+            json={
+                "step_index": 1,
+                "field": "selector",
+                "selector": "button.new-selector",
+            },
+        )
+        assert recovered.status_code == 200, recovered.text
+        recovered_run_id = recovered.json()["run_id"]
+
+        fetched = client.get(f"/api/runs/{recovered_run_id}")
+        assert fetched.status_code == 200, fetched.text
+        latest = fetched.json()
+
+    assert latest["run_name"].endswith("[resume-step-2]")
+    assert len(latest["steps"]) == 2
+    assert latest["steps"][0]["type"] == "click"
+    assert latest["steps"][0]["input"]["selector"] == "button.new-selector"

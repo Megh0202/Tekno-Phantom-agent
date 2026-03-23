@@ -22,6 +22,11 @@
   --focus: rgba(15, 118, 110, 0.2);
 }
 
+.shell,
+.shell * {
+  box-sizing: border-box;
+}
+
 .hero {
   border: 1px solid var(--line-strong);
   border-radius: 14px;
@@ -278,28 +283,212 @@
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 10px;
+  min-width: 0;
+}
+
+.savedActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.folderToolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  min-width: 0;
+}
+
+.folderScopeActive {
+  border-color: rgba(15, 118, 110, 0.5);
+  box-shadow: 0 0 0 2px var(--focus);
+}
+
+.folderCreateRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  margin-bottom: 10px;
+  min-width: 0;
+}
+
+.folderCreateRow input {
+  width: 100%;
+  border: 1px solid rgba(116, 136, 160, 0.35);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  color: #0f172a;
+  padding: 9px 12px;
+  min-width: 0;
+}
+
+.folderCreateRow input:focus {
+  outline: none;
+  border-color: rgba(15, 118, 110, 0.55);
+  box-shadow: 0 0 0 3px var(--focus);
 }
 
 .savedList {
   display: grid;
   gap: 8px;
-  max-height: 280px;
-  overflow: auto;
+  max-height: clamp(240px, 38vh, 360px);
+  overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 4px;
+  min-width: 0;
 }
 
-.savedItem {
+.treeRow {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.treeNodeRow {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto auto auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.treeNodeRowTest {
+  display: grid;
+  grid-template-columns: 20px 22px minmax(0, 1fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.expandButton {
+  border: none;
+  background: transparent;
+  color: var(--ink-700);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.expandButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.expandSpacer {
+  color: var(--ink-500);
+  font-size: 15px;
+  text-align: center;
+}
+
+.folderRowButton {
+  text-align: left;
   border: 1px solid rgba(116, 136, 160, 0.35);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.55);
-  padding: 10px;
+  color: var(--ink-700);
+  padding: 7px 10px;
+  cursor: pointer;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.savedItemTop {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 10px;
+.folderRowButtonActive {
+  border-color: rgba(15, 118, 110, 0.5);
+  box-shadow: 0 0 0 2px var(--focus);
+  color: #134e4a;
+}
+
+.treeCount {
+  color: var(--ink-500);
+  font-size: 12px;
+  font-family: var(--font-ibm-plex-mono), Consolas, monospace;
+  white-space: nowrap;
+  justify-self: end;
+}
+
+.addIconButton {
+  border: 1px solid rgba(116, 136, 160, 0.35);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--ink-700);
+  width: 30px;
+  height: 30px;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.addIconButton:hover {
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.deleteIconButton {
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  border-radius: 8px;
+  background: rgba(254, 226, 226, 0.55);
+  color: #991b1b;
+  min-width: 40px;
+  height: 30px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 8px;
+  flex: 0 0 auto;
+}
+
+.deleteIconButton:hover {
+  background: rgba(254, 202, 202, 0.75);
+}
+
+.testNode {
+  border: 1px solid rgba(116, 136, 160, 0.35);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.55);
+  padding: 6px 8px;
+  min-width: 0;
+}
+
+.testRowButton {
+  border: none;
+  background: transparent;
+  text-align: left;
+  color: var(--ink-900);
+  cursor: pointer;
+  padding: 2px 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.testRowButton:hover {
+  color: var(--accent-dark);
+}
+
+.testStepsBox {
+  margin-top: 8px;
+  border-top: 1px dashed rgba(116, 136, 160, 0.35);
+  padding-top: 8px;
+}
+
+.testStepList {
+  margin: 0 0 0 22px;
+  display: grid;
+  gap: 6px;
+}
+
+.testStepItem {
+  color: var(--ink-700);
+  line-height: 1.35;
+  font-size: 13px;
 }
 
 .savedName {
@@ -307,10 +496,63 @@
   font-weight: 700;
 }
 
-.savedDesc {
-  margin-top: 3px;
-  color: var(--ink-700);
-  font-size: 14px;
+.testWorkbench {
+  margin-top: 12px;
+  border: 1px solid rgba(116, 136, 160, 0.35);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.5);
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.testWorkbenchHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.testTabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgba(116, 136, 160, 0.25);
+  padding-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.testTabButton {
+  border: none;
+  background: transparent;
+  color: var(--ink-500);
+  padding: 4px 2px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.testTabActive {
+  color: var(--accent-dark);
+  border-bottom: 2px solid var(--accent);
+}
+
+.testWorkbenchBody {
+  display: grid;
+  gap: 8px;
+}
+
+.newStepRow {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 8px;
+}
+
+.newStepRow input {
+  border: 1px solid rgba(116, 136, 160, 0.35);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  color: #0f172a;
+  padding: 9px 12px;
 }
 
 .runHeader {
@@ -410,6 +652,42 @@
   font-size: 14px;
 }
 
+.selectorFixBox {
+  margin-top: 4px;
+  border: 1px dashed rgba(15, 118, 110, 0.42);
+  border-radius: 10px;
+  background: rgba(240, 253, 250, 0.55);
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.selectorFixTitle {
+  color: #134e4a;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.selectorFixHint {
+  color: #0f4f45;
+  font-size: 12px;
+}
+
+.selectorFixRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.selectorFixInput {
+  width: 100%;
+  border: 1px solid rgba(15, 118, 110, 0.35);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0f172a;
+  padding: 8px 10px;
+}
+
 .stepError,
 .errorText {
   color: #991b1b;
@@ -470,5 +748,43 @@
 
   .importActions button {
     width: 100%;
+  }
+
+  .folderCreateRow {
+    grid-template-columns: 1fr;
+  }
+
+  .newStepRow {
+    grid-template-columns: 1fr;
+  }
+
+  .selectorFixRow {
+    grid-template-columns: 1fr;
+  }
+
+  .savedHeader {
+    align-items: flex-start;
+  }
+
+  .folderToolbar {
+    align-items: flex-start;
+  }
+
+  .treeNodeRow,
+  .treeNodeRowTest {
+    grid-template-columns: 22px minmax(0, 1fr);
+    row-gap: 6px;
+  }
+
+  .treeCount,
+  .addIconButton,
+  .deleteIconButton,
+  .secondaryButton {
+    justify-self: start;
+  }
+
+  .folderRowButton,
+  .testRowButton {
+    white-space: normal;
   }
 }

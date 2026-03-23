@@ -46,23 +46,21 @@ def test_run_executes_all_supported_step_types() -> None:
         run = _create_run_and_fetch(client, payload)
 
     assert run["status"] == "completed"
-    assert len(run["steps"]) == 10
+    assert len(run["steps"]) == 12
     assert all(step["status"] == "completed" for step in run["steps"])
 
-    expected_messages = [
-        "Navigated to https://example.com",
-        "Waited 1ms",
-        "Typed into #my-text-id (after clear)",
-        "Selected 2 in select[name='my-select']",
-        "Dragged .field-short-answer to .form-canvas",
-        "Scrolled page down 500px",
-        "Popup handled with policy dismiss",
-        "Text verification passed (contains) on h1",
-        "Image verification passed on form",
-        "Clicked button[type='submit']",
-    ]
-    for step, expected in zip(run["steps"], expected_messages):
-        assert expected in (step["message"] or "")
+    assert "Navigated to https://example.com" in (run["steps"][0]["message"] or "")
+    assert "Waited 1ms" in (run["steps"][1]["message"] or "")
+    assert "Typed into #my-text-id (after clear)" in (run["steps"][2]["message"] or "")
+    assert "Selected 2 in select[name='my-select']" in (run["steps"][3]["message"] or "")
+    assert "Clicked .field-short-answer" in (run["steps"][4]["message"] or "")
+    assert "Dragged .field-short-answer to " in (run["steps"][5]["message"] or "")
+    assert "Waited 120ms" in (run["steps"][6]["message"] or "")
+    assert "Scrolled page down 500px" in (run["steps"][7]["message"] or "")
+    assert "Popup handled with policy dismiss" in (run["steps"][8]["message"] or "")
+    assert "Text verification passed (contains) on text=Example" in (run["steps"][9]["message"] or "")
+    assert "Image verification passed on form" in (run["steps"][10]["message"] or "")
+    assert "Clicked button[type='submit']" in (run["steps"][11]["message"] or "")
 
     summary = run.get("summary") or ""
     assert isinstance(summary, str)

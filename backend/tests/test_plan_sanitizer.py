@@ -26,7 +26,11 @@ def test_sanitize_keeps_example_assertion_for_example_site() -> None:
     ]
 
     sanitized = _sanitize_plan_steps(steps, start_url="https://example.com")
-    assert sanitized == steps
+    assert len(sanitized) == 1
+    assert sanitized[0]["type"] == "verify_text"
+    assert sanitized[0]["match"] == "contains"
+    assert sanitized[0]["value"] == "Example Domain"
+    assert sanitized[0]["selector"] == "text=Example Domain"
 
 
 def test_ensure_drag_step_inserts_when_prompt_mentions_drag_drop() -> None:

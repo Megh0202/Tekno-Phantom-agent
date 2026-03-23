@@ -50,6 +50,66 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "button:has-text('Create Form')",
         "[role='button']:has-text('Create Form')",
     ],
+    "module_workflows": [
+        "a[href*='/workflows/definitions']",
+        "a[href*='/workflows']",
+        "button[href*='/workflows/definitions']",
+        "a:has-text('Workflows')",
+        "button:has-text('Workflows')",
+        "[role='tab']:has-text('Workflows')",
+        "[data-testid*='workflow']:has-text('Workflows')",
+        "text=Workflows",
+    ],
+    "module_launcher": [
+        "button[aria-label*='module']",
+        "button[aria-label*='app']",
+        "button[aria-label*='switch']",
+        "[role='button'][aria-label*='module']",
+        "[role='button'][aria-label*='app']",
+        "button:has(svg[data-lucide='layout-grid'])",
+        "button:has(svg[class*='grid'])",
+        "button:has(i[class*='grid'])",
+        "button:has([class*='ri-apps'])",
+        "header button:first-child",
+        "[class*='app-switcher']",
+        "[class*='module-switcher']",
+    ],
+    "create_workflow": [
+        "button#createWorkflow",
+        "button#create_workflow",
+        "button:has-text('Create Workflow')",
+        "[role='button']:has-text('Create Workflow')",
+    ],
+    "workflow_name": [
+        "input[name='workflowName']",
+        "input[name='name']",
+        "input#workflowName",
+        "input#workflow-name",
+        "input[placeholder*='Workflow Name']",
+        "input[placeholder*='Name']",
+        "textarea[name='workflowName']",
+    ],
+    "workflow_description": [
+        "textarea[name='description']",
+        "textarea#description",
+        "textarea[placeholder*='Description']",
+        "textarea[aria-label*='Description']",
+        "input[name='description']",
+    ],
+    "save_workflow": [
+        "div[role='dialog'] button:has-text('Save')",
+        "div[role='dialog'] [role='button']:has-text('Save')",
+        "button#saveWorkflow",
+        "button.save-workflow",
+        "button:has-text('Save')",
+        "[role='button']:has-text('Save')",
+    ],
+    "workflow_save_changes": [
+        "button:has-text('Save Changes')",
+        "[role='button']:has-text('Save Changes')",
+        "button#saveChanges",
+        "text=Save Changes",
+    ],
     "create_form_confirm": [
         "[role='dialog'] button:has-text('Create')",
         "div[role='dialog'] button:has-text('Create')",
@@ -352,6 +412,16 @@ class AgentExecutor:
                 f"{step.type}: {message}",
             )
         except Exception as exc:
+            recovered_message = await self._attempt_step_recovery(run, step, exc)
+            if recovered_message is not None:
+                step.status = StepStatus.completed
+                step.message = recovered_message
+                await self._files.write_text_artifact(
+                    run.run_id,
+                    f"step-{step.index:03d}.log",
+                    f"{step.type}: {recovered_message}",
+                )
+                return
             step.status = StepStatus.failed
             compact = self._compact_error(exc)
             if isinstance(exc, TimeoutError):
@@ -362,6 +432,34 @@ class AgentExecutor:
             await self._capture_failure_screenshot(run.run_id, step)
         finally:
             step.ended_at = utc_now()
+
+    async def _attempt_step_recovery(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        error: Exception,
+    ) -> str | None:
+        if not self._should_retry_step(step.type, error):
+            return None
+        try:
+            # Brief settle window for route/render transitions.
+            await self._browser.wait_for(until="timeout", ms=350)
+        except Exception:
+            pass
+        try:
+            message = await asyncio.wait_for(
+                self._dispatch_step(run, step.input),
+                timeout=max(float(self._settings.step_timeout_seconds), 1.0),
+            )
+            return f"{message} (recovered after retry)"
+        except Exception:
+            return None
+
+    def _should_retry_step(self, step_type: str, error: Exception) -> bool:
+        retryable_step_types = {"click", "type", "select", "wait", "verify_text", "drag"}
+        if (step_type or "").lower() not in retryable_step_types:
+            return False
+        return self._should_retry_selector_error(error)
 
     async def _capture_failure_screenshot(self, run_id: str, step: StepRuntimeState) -> None:
         try:
@@ -607,7 +705,7 @@ class AgentExecutor:
             text_hint,
         )
         last_error: Exception | None = None
-        candidate_timeout_s = self._candidate_timeout_seconds(len(candidates))
+        candidate_timeout_s = self._candidate_timeout_seconds(len(candidates), step_type=step_type)
         attempts: list[str] = []
         recovery_attempts = self._selector_recovery_attempts()
 
@@ -623,6 +721,14 @@ class AgentExecutor:
                         text_hint=text_hint,
                     )
                     return result
+                except asyncio.TimeoutError:
+                    timeout_error = TimeoutError(
+                        f"Candidate timed out after {candidate_timeout_s:.1f}s (selector={selector})"
+                    )
+                    last_error = timeout_error
+                    attempts.append(
+                        f"pass {cycle + 1}: {selector} -> {self._compact_error(timeout_error)}"
+                    )
                 except Exception as exc:
                     last_error = exc
                     attempts.append(f"pass {cycle + 1}: {selector} -> {self._compact_error(exc)}")
@@ -640,13 +746,24 @@ class AgentExecutor:
             raise last_error
         raise ValueError(f"No valid selector candidates for: {raw_selector}")
 
-    def _candidate_timeout_seconds(self, candidate_count: int) -> float:
+    def _candidate_timeout_seconds(self, candidate_count: int, *, step_type: str) -> float:
         step_timeout = max(float(self._settings.step_timeout_seconds), 1.0)
         if candidate_count <= 1:
             return step_timeout
-        budget = max(step_timeout - 0.5, 1.0)
-        per_candidate = budget / candidate_count
-        return max(min(per_candidate, step_timeout), 1.0)
+
+        # Generic apps often need extra stabilization for click/verify actions.
+        # If we split timeout too aggressively across many candidates, we get
+        # flaky "TimeoutError()" failures before UI elements are actually ready.
+        if step_type in {"click", "verify_text"}:
+            effective_count = max(min(candidate_count, 12), 1)
+            min_per_candidate = 3.0
+        else:
+            effective_count = max(min(candidate_count, 20), 1)
+            min_per_candidate = 1.5
+
+        budget = max(step_timeout - 0.5, min_per_candidate)
+        per_candidate = budget / effective_count
+        return max(min(per_candidate, step_timeout), min_per_candidate)
 
     def _selector_candidates(
         self,
@@ -685,6 +802,8 @@ class AgentExecutor:
                 keys.insert(0, "password")
             if "qa_form" in hint_lower or "form" in hint_lower and "name" in hint_lower:
                 keys.insert(0, "form_name")
+            if "qa_auto_workflow" in hint_lower or "workflow" in hint_lower and "name" in hint_lower:
+                keys.insert(0, "workflow_name")
             if "first name" in hint_lower or "label" in hint_lower:
                 keys.insert(0, "form_label")
 
@@ -699,6 +818,10 @@ class AgentExecutor:
                 keys.insert(0, "username")
             if "formname" in selector_lower or "form_name" in selector_lower or "form name" in selector_lower:
                 keys.insert(0, "form_name")
+            if "workflowname" in selector_lower or "workflow_name" in selector_lower or "workflow name" in selector_lower:
+                keys.insert(0, "workflow_name")
+            if "description" in selector_lower:
+                keys.insert(0, "workflow_description")
             if "label" in selector_lower:
                 keys.insert(0, "form_label")
             if "dropdown_option_label" in selector_lower:
@@ -712,12 +835,25 @@ class AgentExecutor:
                 keys.insert(0, "login_button")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if any(
+                token in selector_lower
+                for token in ("create workflow", "create_workflow", "createworkflow")
+            ):
+                keys.insert(0, "create_workflow")
+            if "module_launcher" in selector_lower or "app switcher" in selector_lower:
+                keys.insert(0, "module_launcher")
+            if "module_workflows" in selector_lower or selector_lower.strip() == "workflows":
+                keys.insert(0, "module_workflows")
             if "form_list_first_name" in selector_lower:
                 keys.insert(0, "form_list_first_name")
             if "back button" in selector_lower or "selector.back_button" in selector_lower or selector_lower.strip() == "back":
                 keys.insert(0, "back_button")
             if "save form" in selector_lower or "save_form" in selector_lower or "saveform" in selector_lower:
                 keys.insert(0, "save_form")
+            if any(token in selector_lower for token in ("save workflow", "save_workflow", "saveworkflow")):
+                keys.insert(0, "save_workflow")
+            if "save changes" in selector_lower or "workflow_save_changes" in selector_lower:
+                keys.insert(0, "workflow_save_changes")
             if any(token in selector_lower for token in ("required", "checkbox")):
                 keys.insert(0, "required_checkbox")
             if "dropdown_option_type_trigger" in selector_lower:
@@ -756,17 +892,35 @@ class AgentExecutor:
             hint_lower = (text_hint or "").lower()
             if any(token in hint_lower for token in ("create form", "create_form", "createform")):
                 keys.insert(0, "create_form")
+            if any(token in hint_lower for token in ("create workflow", "create_workflow", "createworkflow")):
+                keys.insert(0, "create_workflow")
             if any(token in hint_lower for token in ("login", "sign in", "signin", "log in")):
                 keys.insert(0, "login_button")
+            if any(token in hint_lower for token in ("save workflow", "save_workflow", "saveworkflow")):
+                keys.insert(0, "save_workflow")
+            if "save changes" in hint_lower:
+                keys.insert(0, "workflow_save_changes")
             if any(token in hint_lower for token in ("save", "save form", "save_form")):
                 keys.insert(0, "save_form")
             if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
                 keys.insert(0, "create_form")
+            if any(
+                token in selector_lower
+                for token in ("create workflow", "create_workflow", "createworkflow")
+            ):
+                keys.insert(0, "create_workflow")
+            if "save changes" in selector_lower or "workflow_save_changes" in selector_lower:
+                keys.insert(0, "workflow_save_changes")
             if "form_list_first_row" in selector_lower:
                 keys.insert(0, "form_list_first_row")
         if step_type == "wait":
             if "dropdown_options_section" in selector_lower:
                 keys.insert(0, "dropdown_options_section")
+            if any(
+                token in selector_lower
+                for token in ("create workflow", "create_workflow", "createworkflow")
+            ):
+                keys.insert(0, "create_workflow")
 
         ordered_keys = self._dedupe(keys)
         candidates: list[str] = []
@@ -911,6 +1065,20 @@ class AgentExecutor:
                 "input[placeholder='value']) button",
                 ":has-text('+')",
                 "text=+",
+            )
+            filtered = [c for c in candidates if any(m in c.lower() for m in preferred_markers)]
+            return filtered or candidates
+
+        if key == "module_launcher":
+            preferred_markers = (
+                "aria-label*='module'",
+                "aria-label*='app'",
+                "aria-label*='switch'",
+                "layout-grid",
+                "class*='grid'",
+                "ri-apps",
+                "app-switcher",
+                "module-switcher",
             )
             filtered = [c for c in candidates if any(m in c.lower() for m in preferred_markers)]
             return filtered or candidates
@@ -1309,6 +1477,36 @@ class AgentExecutor:
                 ]
             )
 
+        text_selector_match = re.match(r"^\s*text\s*=\s*(.+?)\s*$", selector, flags=re.IGNORECASE)
+        if text_selector_match and step_type in {"click", "verify_text"}:
+            raw_text = text_selector_match.group(1).strip()
+            if raw_text:
+                label = raw_text.strip("'\"").strip()
+                if label:
+                    escaped = self._escape_playwright_text(label)
+                    exact_targets = [
+                        f":text-is(\"{escaped}\")",
+                        f"button:text-is(\"{escaped}\")",
+                        f"[role='button']:text-is(\"{escaped}\")",
+                        f"[role='tab']:text-is(\"{escaped}\")",
+                        f"[role='option']:text-is(\"{escaped}\")",
+                        f"[role='menuitem']:text-is(\"{escaped}\")",
+                    ]
+                    fuzzy_targets = [
+                        f"button:has-text(\"{escaped}\")",
+                        f"[role='button']:has-text(\"{escaped}\")",
+                        f"[role='tab']:has-text(\"{escaped}\")",
+                        f"[role='option']:has-text(\"{escaped}\")",
+                        f"[role='menuitem']:has-text(\"{escaped}\")",
+                        f"a:has-text(\"{escaped}\")",
+                        f"[aria-label='{escaped}']",
+                        f"[aria-label*='{escaped}']",
+                    ]
+                    short_upper_token = bool(re.fullmatch(r"[A-Z]{2,4}", label))
+                    variants.extend(exact_targets if short_upper_token else (exact_targets + fuzzy_targets))
+                    if short_upper_token:
+                        variants.extend(fuzzy_targets)
+
         return self._dedupe(variants)
 
     def _id_case_variants(self, selector: str) -> list[str]:
@@ -1534,6 +1732,14 @@ class AgentExecutor:
                 keys.append("password")
             if "formname" in selector_lower or "form name" in selector_lower or "qa_form" in (text_hint or "").lower():
                 keys.append("form_name")
+            if (
+                "workflowname" in selector_lower
+                or "workflow name" in selector_lower
+                or "qa_auto_workflow" in (text_hint or "").lower()
+            ):
+                keys.append("workflow_name")
+            if "description" in selector_lower:
+                keys.append("workflow_description")
             if "label" in selector_lower or "first name" in (text_hint or "").lower():
                 keys.append("form_label")
             if any(token in selector_lower for token in ("twotabsearchtextbox", "field-keywords")):
@@ -1541,8 +1747,18 @@ class AgentExecutor:
         if step_type in {"click", "verify_text"}:
             if any(token in selector_lower for token in ("create form", "create_form", "createform")):
                 keys.append("create_form")
+            if any(token in selector_lower for token in ("create workflow", "create_workflow", "createworkflow")):
+                keys.append("create_workflow")
+            if "module_launcher" in selector_lower or "app switcher" in selector_lower:
+                keys.append("module_launcher")
+            if any(token in selector_lower for token in ("module_workflows", "workflows")):
+                keys.append("module_workflows")
             if any(token in selector_lower for token in ("save form", "save_form", "saveform")):
                 keys.append("save_form")
+            if any(token in selector_lower for token in ("save workflow", "save_workflow", "saveworkflow")):
+                keys.append("save_workflow")
+            if "save changes" in selector_lower or "workflow_save_changes" in selector_lower:
+                keys.append("workflow_save_changes")
             if any(token in selector_lower for token in ("back button", "selector.back_button")):
                 keys.append("back_button")
             if any(token in selector_lower for token in ("required", "checkbox")):
@@ -1950,7 +2166,14 @@ class AgentExecutor:
         completed = sum(1 for step in run.steps if step.status == StepStatus.completed)
         failed = sum(1 for step in run.steps if step.status == StepStatus.failed)
         cancelled = sum(1 for step in run.steps if step.status == StepStatus.cancelled)
-        return (
+        summary = (
             f"Run '{run.run_name}' ended with status {run.status}. "
             f"Completed={completed}, Failed={failed}, Cancelled={cancelled}."
         )
+        first_failed = next((step for step in run.steps if step.status == StepStatus.failed), None)
+        if first_failed:
+            failure_hint = first_failed.error or "unknown error"
+            summary += (
+                f" First failed step: #{first_failed.index} ({first_failed.type}) - {failure_hint}."
+            )
+        return summary
