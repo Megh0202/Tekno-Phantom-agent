@@ -179,6 +179,28 @@ def test_selector_candidates_include_create_form_defaults() -> None:
     assert "button:has-text('Create Form')" in candidates
 
 
+def test_selector_candidates_include_module_switch_defaults() -> None:
+    executor = _executor()
+    launcher_candidates = executor._selector_candidates(
+        raw_selector="{{selector.module_launcher}}",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+    )
+    workflow_candidates = executor._selector_candidates(
+        raw_selector="{{selector.module_workflows}}",
+        step_type="click",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+    )
+
+    assert "button[aria-label*='module']" in launcher_candidates
+    assert "a[href*='/workflows/definitions']" in workflow_candidates
+    assert "text=Workflows" in workflow_candidates
+
+
 def test_verify_text_hint_promotes_create_form_candidates() -> None:
     executor = _executor()
     candidates = executor._selector_candidates(

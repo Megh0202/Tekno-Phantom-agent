@@ -19,20 +19,31 @@ from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
 from app.runtime.selector_memory import build_selector_memory_store
+from app.runtime.suite_executor import SuiteExecutor
+from app.runtime.suite_store import build_suite_store
 from app.runtime.step_importer import StepImportError, parse_step_rows_from_upload
 from app.runtime.store import build_run_store
 from app.runtime.test_case_store import build_test_case_store
 from app.schemas import (
+    CancelSuiteRunResponse,
     CancelRunResponse,
+    FolderCreateRequest,
+    FolderListResponse,
+    FolderState,
     PlanGenerateRequest,
     PlanGenerateResponse,
     RunCreateRequest,
     RunListResponse,
     RunState,
+    SuiteRunCreateRequest,
+    SuiteRunListResponse,
+    SuiteRunState,
     StepImportResponse,
+    SelectorRecoveryRequest,
     TestCaseCreateRequest,
     TestCaseListResponse,
     TestCaseState,
+    TestCaseUpdateRequest,
 )
 
 LOGGER = logging.getLogger("tekno.phantom.api")
@@ -61,18 +72,148 @@ def _sanitize_plan_steps(
     start_url: str | None,
 ) -> list[dict[str, object]]:
     """
-    Drop clearly generic placeholder assertions that are unrelated to the target site.
+    Harden and sanitize generated/parsed steps so they are more runnable across
+    diverse applications and less likely to be brittle.
     """
     normalized_url = (start_url or "").lower()
+    has_explicit_start_url = bool((start_url or "").strip())
     is_example_site = "example.com" in normalized_url
 
+    def _clean_text(value: object) -> str:
+        return str(value or "").strip()
+
+    def _normalize_selector(raw: object) -> str:
+        selector = _clean_text(raw).strip().rstrip(".,;")
+        if not selector:
+            return ""
+        if len(selector) >= 2 and selector[0] == selector[-1] and selector[0] in {"'", '"', "`"}:
+            selector = selector[1:-1].strip()
+        return selector
+
+    def _looks_like_explicit_selector(value: str) -> bool:
+        lowered = value.lower()
+        if lowered.startswith(("text=", "xpath=", "css=", "id=", "role=", "label=", "placeholder=")):
+            return True
+        if lowered in {
+            "html",
+            "body",
+            "main",
+            "form",
+            "button",
+            "input",
+            "select",
+            "textarea",
+            "label",
+            "a",
+            "div",
+            "span",
+            "p",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+        }:
+            return True
+        if value.startswith("//"):
+            return True
+        return any(token in value for token in ("#", ".", "[", "]", ">", "=", ":", "/"))
+
+    def _to_click_selector(raw: object) -> str:
+        selector = _normalize_selector(raw)
+        if not selector:
+            return ""
+        if _looks_like_explicit_selector(selector) or selector.startswith("{{"):
+            return selector
+        return f"text={selector}"
+
+    def _to_text_wait_selector(raw: object) -> str:
+        selector = _normalize_selector(raw)
+        if not selector:
+            return ""
+        if _looks_like_explicit_selector(selector) or selector.startswith("{{"):
+            return selector
+        return f"text={selector}"
+
+    generic_click_targets = {"body", "html", "main", "h1", "h2", "h3"}
+
     sanitized: list[dict[str, object]] = []
+    seen_step_tokens: set[str] = set()
     for step in steps:
-        if step.get("type") == "verify_text":
-            raw_value = str(step.get("value", "")).strip().lower()
-            if raw_value in {"example", "example domain"} and not is_example_site:
+        step_type = _clean_text(step.get("type")).lower()
+        if not step_type:
+            continue
+
+        normalized_step = dict(step)
+        normalized_step["type"] = step_type
+
+        if step_type in {"click", "type", "select", "verify_text", "wait", "handle_popup"}:
+            if "selector" in normalized_step:
+                normalized_step["selector"] = _normalize_selector(normalized_step.get("selector"))
+
+        if step_type == "click":
+            selector = _to_click_selector(normalized_step.get("selector"))
+            if not selector:
                 continue
-        sanitized.append(step)
+            if selector.lower() in generic_click_targets:
+                continue
+            normalized_step["selector"] = selector
+
+        if step_type == "type":
+            selector = _to_text_wait_selector(normalized_step.get("selector"))
+            text_value = _clean_text(normalized_step.get("text"))
+            if not selector or not text_value:
+                continue
+            normalized_step["selector"] = selector
+            normalized_step["text"] = text_value
+            normalized_step["clear_first"] = bool(normalized_step.get("clear_first", True))
+
+        if step_type == "select":
+            selector = _to_text_wait_selector(normalized_step.get("selector"))
+            value = _clean_text(normalized_step.get("value"))
+            if not selector or not value:
+                continue
+            normalized_step["selector"] = selector
+            normalized_step["value"] = value
+
+        if step_type == "verify_text":
+            raw_value = _clean_text(normalized_step.get("value")).lower()
+            if raw_value in {"example", "example domain"} and has_explicit_start_url and not is_example_site:
+                continue
+            selector = _to_text_wait_selector(normalized_step.get("selector"))
+            if selector.lower() in {"body", "html", "main", "h1", "h2", "h3"}:
+                value_text = _clean_text(normalized_step.get("value"))
+                if value_text:
+                    selector = f"text={value_text}"
+            if not selector:
+                continue
+            normalized_step["selector"] = selector
+
+        if step_type == "wait":
+            until = _clean_text(normalized_step.get("until")).lower() or "timeout"
+            if until not in {"timeout", "selector_visible", "selector_hidden", "load_state"}:
+                until = "timeout"
+            normalized_step["until"] = until
+            if until in {"selector_visible", "selector_hidden"}:
+                selector = _to_text_wait_selector(normalized_step.get("selector"))
+                if not selector:
+                    continue
+                normalized_step["selector"] = selector
+
+        if step_type == "drag":
+            source_selector = _to_text_wait_selector(normalized_step.get("source_selector"))
+            target_selector = _to_text_wait_selector(normalized_step.get("target_selector"))
+            if not source_selector or not target_selector:
+                continue
+            normalized_step["source_selector"] = source_selector
+            normalized_step["target_selector"] = target_selector
+
+        token = json.dumps(normalized_step, sort_keys=True, ensure_ascii=False)
+        if token in seen_step_tokens:
+            continue
+        seen_step_tokens.add(token)
+        sanitized.append(normalized_step)
 
     return sanitized
 
@@ -239,6 +380,7 @@ def build_app() -> FastAPI:
     )
 
     run_store = build_run_store(settings)
+    suite_store = build_suite_store(settings)
     test_case_store = build_test_case_store(settings)
     selector_memory = build_selector_memory_store(settings)
     brain_client = HttpBrainClient(settings)
@@ -251,6 +393,14 @@ def build_app() -> FastAPI:
         browser_client,
         file_client,
         selector_memory_store=selector_memory,
+    )
+    suite_executor = SuiteExecutor(
+        settings,
+        run_store,
+        suite_store,
+        test_case_store,
+        executor,
+        file_client,
     )
     require_admin_auth = build_admin_auth_dependency(settings)
 
@@ -291,6 +441,7 @@ def build_app() -> FastAPI:
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
+        raw_steps = _sanitize_plan_steps(raw_steps, start_url=request.start_url)
         expanded_steps = _expand_drag_steps(
             raw_steps,
             max_steps=settings.max_steps_per_run,
@@ -323,13 +474,85 @@ def build_app() -> FastAPI:
         request: TestCaseCreateRequest,
         _: None = Depends(require_admin_auth),
     ) -> TestCaseState:
+        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
+            raise HTTPException(status_code=404, detail="Parent folder not found")
         if len(request.steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
                 detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
             )
-        test_case = test_case_store.create(request)
+        sanitized_steps = _sanitize_plan_steps(
+            [step.model_dump(exclude_none=True) for step in request.steps],
+            start_url=request.start_url,
+        )
+        validated_request = TestCaseCreateRequest.model_validate(
+            {
+                "name": request.name,
+                "description": request.description,
+                "prompt": request.prompt,
+                "parent_folder_id": request.parent_folder_id,
+                "start_url": request.start_url,
+                "steps": sanitized_steps,
+                "test_data": request.test_data,
+                "selector_profile": request.selector_profile,
+            }
+        )
+        test_case = test_case_store.create(validated_request)
         return test_case
+
+    @app.post("/api/test-folders", response_model=FolderState)
+    async def create_test_folder(
+        request: FolderCreateRequest,
+        _: None = Depends(require_admin_auth),
+    ) -> FolderState:
+        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
+            raise HTTPException(status_code=404, detail="Parent folder not found")
+        folder = test_case_store.create_folder(request)
+        return folder
+
+    @app.get("/api/test-folders", response_model=FolderListResponse)
+    async def list_test_folders() -> FolderListResponse:
+        return FolderListResponse(items=test_case_store.list_folders())
+
+    @app.delete("/api/test-folders/{folder_id}", status_code=204)
+    async def delete_test_folder(
+        folder_id: str,
+        _: None = Depends(require_admin_auth),
+    ) -> None:
+        folders = test_case_store.list_folders()
+        folder_by_id = {folder.folder_id: folder for folder in folders}
+        if folder_id not in folder_by_id:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        child_map: dict[str, list[str]] = {}
+        for folder in folders:
+            parent_id = (folder.parent_folder_id or "").strip()
+            if not parent_id:
+                continue
+            current = child_map.get(parent_id) or []
+            current.append(folder.folder_id)
+            child_map[parent_id] = current
+
+        folder_ids_to_delete: list[str] = []
+        stack = [folder_id]
+        seen: set[str] = set()
+        while stack:
+            current_id = stack.pop()
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            folder_ids_to_delete.append(current_id)
+            for child_id in child_map.get(current_id, []):
+                stack.append(child_id)
+
+        test_cases = test_case_store.list()
+        for test_case in test_cases:
+            parent_id = (test_case.parent_folder_id or "").strip()
+            if parent_id in seen:
+                test_case_store.delete(test_case.test_case_id)
+
+        for target_id in reversed(folder_ids_to_delete):
+            test_case_store.delete_folder(target_id)
 
     @app.post("/api/test-cases/import", response_model=StepImportResponse)
     async def import_test_case_steps(
@@ -352,6 +575,7 @@ def build_app() -> FastAPI:
             max_steps=max(len(raw_steps), settings.max_steps_per_run, 1),
             default_wait_ms=settings.planner_default_wait_ms,
         )
+        normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=start_url)
         normalized_steps = _expand_drag_steps(
             normalized_steps,
             max_steps=settings.max_steps_per_run,
@@ -412,6 +636,60 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Test case not found")
         return test_case
 
+    @app.put("/api/test-cases/{test_case_id}", response_model=TestCaseState)
+    async def update_test_case(
+        test_case_id: str,
+        request: TestCaseUpdateRequest,
+        _: None = Depends(require_admin_auth),
+    ) -> TestCaseState:
+        current = test_case_store.get(test_case_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Test case not found")
+        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
+            raise HTTPException(status_code=404, detail="Parent folder not found")
+        if len(request.steps) > settings.max_steps_per_run:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
+            )
+
+        sanitized_steps = _sanitize_plan_steps(
+            [step.model_dump(exclude_none=True) for step in request.steps],
+            start_url=request.start_url,
+        )
+        validated_request = TestCaseUpdateRequest.model_validate(
+            {
+                "name": request.name,
+                "description": request.description,
+                "prompt": request.prompt,
+                "parent_folder_id": request.parent_folder_id,
+                "start_url": request.start_url,
+                "steps": sanitized_steps,
+                "test_data": request.test_data,
+                "selector_profile": request.selector_profile,
+            }
+        )
+
+        current.name = validated_request.name
+        current.description = validated_request.description
+        current.prompt = validated_request.prompt
+        current.parent_folder_id = validated_request.parent_folder_id
+        current.start_url = validated_request.start_url
+        current.steps = validated_request.steps
+        current.test_data = validated_request.test_data
+        current.selector_profile = validated_request.selector_profile
+        test_case_store.persist(current)
+        return current
+
+    @app.delete("/api/test-cases/{test_case_id}", status_code=204)
+    async def delete_test_case(
+        test_case_id: str,
+        _: None = Depends(require_admin_auth),
+    ) -> None:
+        deleted = test_case_store.delete(test_case_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Test case not found")
+
     @app.post("/api/test-cases/{test_case_id}/run", response_model=RunState)
     async def run_test_case(
         test_case_id: str,
@@ -431,8 +709,12 @@ def build_app() -> FastAPI:
                 "selector_profile": test_case.selector_profile,
             }
         )
-        expanded_steps = _expand_drag_steps(
+        sanitized_steps = _sanitize_plan_steps(
             [step.model_dump(exclude_none=True) for step in run_request.steps],
+            start_url=run_request.start_url,
+        )
+        expanded_steps = _expand_drag_steps(
+            sanitized_steps,
             max_steps=settings.max_steps_per_run,
             auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
             auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
@@ -468,6 +750,7 @@ def build_app() -> FastAPI:
             structured_options_wait_ms=settings.structured_options_wait_ms,
         )
         if parsed_steps:
+            parsed_steps = _sanitize_plan_steps(parsed_steps, start_url=None)
             validated = RunCreateRequest.model_validate(
                 {
                     "run_name": "prompt-steps-run",
@@ -573,6 +856,116 @@ def build_app() -> FastAPI:
             steps=trimmed_steps,
         )
 
+    @app.post("/api/suite-runs", response_model=SuiteRunState)
+    async def create_suite_run(
+        request: SuiteRunCreateRequest,
+        background_tasks: BackgroundTasks,
+        _: None = Depends(require_admin_auth),
+    ) -> SuiteRunState:
+        all_test_cases = test_case_store.list()
+        test_by_id = {item.test_case_id: item for item in all_test_cases}
+
+        target_ids: list[str] = list(request.test_case_ids)
+        if request.folder_id:
+            all_folders = test_case_store.list_folders()
+            folder_by_id = {item.folder_id: item for item in all_folders}
+            if request.folder_id not in folder_by_id:
+                raise HTTPException(status_code=404, detail="Folder not found")
+
+            child_map: dict[str, list[str]] = {}
+            for folder in all_folders:
+                parent = (folder.parent_folder_id or "").strip()
+                if not parent:
+                    continue
+                current = child_map.get(parent) or []
+                current.append(folder.folder_id)
+                child_map[parent] = current
+
+            stack = [request.folder_id]
+            folder_scope: set[str] = set()
+            while stack:
+                current = stack.pop()
+                if current in folder_scope:
+                    continue
+                folder_scope.add(current)
+                for child_id in child_map.get(current, []):
+                    stack.append(child_id)
+
+            folder_test_ids = [
+                item.test_case_id
+                for item in all_test_cases
+                if (item.parent_folder_id or "").strip() in folder_scope
+            ]
+            for case_id in folder_test_ids:
+                if case_id not in target_ids:
+                    target_ids.append(case_id)
+
+        if not target_ids:
+            raise HTTPException(status_code=422, detail="No test cases selected for suite run")
+
+        selected_test_cases: list[TestCaseState] = []
+        missing_ids: list[str] = []
+        for case_id in target_ids:
+            detail = test_case_store.get(case_id)
+            if not detail:
+                missing_ids.append(case_id)
+                continue
+            selected_test_cases.append(detail)
+
+        if missing_ids:
+            raise HTTPException(status_code=404, detail=f"Test case(s) not found: {', '.join(missing_ids)}")
+        if not selected_test_cases:
+            raise HTTPException(status_code=422, detail="No test cases resolved for suite run")
+
+        suite_run = suite_store.create(
+            SuiteRunCreateRequest.model_validate(
+                {
+                    "suite_name": request.suite_name,
+                    "folder_id": request.folder_id,
+                    "test_case_ids": [item.test_case_id for item in selected_test_cases],
+                    "max_parallel": request.max_parallel,
+                }
+            ),
+            selected_test_cases,
+        )
+        background_tasks.add_task(suite_executor.execute, suite_run.suite_run_id)
+        LOGGER.info("Suite run created: %s", suite_run.suite_run_id)
+        return suite_run
+
+    @app.get("/api/suite-runs", response_model=SuiteRunListResponse)
+    async def list_suite_runs() -> SuiteRunListResponse:
+        return SuiteRunListResponse(items=suite_store.list())
+
+    @app.get("/api/suite-runs/{suite_run_id}", response_model=SuiteRunState)
+    async def get_suite_run(suite_run_id: str) -> SuiteRunState:
+        suite_run = suite_store.get(suite_run_id)
+        if not suite_run:
+            raise HTTPException(status_code=404, detail="Suite run not found")
+        return suite_run
+
+    @app.get("/api/suite-runs/{suite_run_id}/artifacts/{artifact_name:path}")
+    async def get_suite_artifact(suite_run_id: str, artifact_name: str) -> FileResponse:
+        suite_run = suite_store.get(suite_run_id)
+        if not suite_run:
+            raise HTTPException(status_code=404, detail="Suite run not found")
+        run_dir = (settings.artifact_root / suite_run_id).resolve()
+        artifact_path = (run_dir / artifact_name).resolve()
+        if not artifact_path.is_relative_to(run_dir):
+            raise HTTPException(status_code=400, detail="Invalid artifact path")
+        if not artifact_path.exists() or not artifact_path.is_file():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return FileResponse(artifact_path)
+
+    @app.post("/api/suite-runs/{suite_run_id}/cancel", response_model=CancelSuiteRunResponse)
+    async def cancel_suite_run(
+        suite_run_id: str,
+        _: None = Depends(require_admin_auth),
+    ) -> CancelSuiteRunResponse:
+        suite_run = suite_store.mark_cancelled(suite_run_id)
+        if not suite_run:
+            raise HTTPException(status_code=404, detail="Suite run not found")
+        return CancelSuiteRunResponse(suite_run_id=suite_run_id, status=suite_run.status)
+
     @app.get("/api/runs", response_model=RunListResponse)
     async def list_runs() -> RunListResponse:
         return RunListResponse(items=run_store.list())
@@ -583,6 +976,59 @@ def build_app() -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return run
+
+    @app.post("/api/runs/{run_id}/recover-selector", response_model=RunState)
+    async def recover_run_selector(
+        run_id: str,
+        request: SelectorRecoveryRequest,
+        background_tasks: BackgroundTasks,
+        _: None = Depends(require_admin_auth),
+    ) -> RunState:
+        run = run_store.get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if request.step_index >= len(run.steps):
+            raise HTTPException(status_code=400, detail="step_index is out of range")
+
+        raw_steps = [dict(step.input or {}) for step in run.steps]
+        target_step = dict(raw_steps[request.step_index] or {})
+        if not target_step:
+            raise HTTPException(status_code=400, detail="Target step has no editable input payload")
+
+        target_step["type"] = str(target_step.get("type") or run.steps[request.step_index].type)
+        target_step[request.field] = request.selector
+        raw_steps[request.step_index] = target_step
+
+        resume_steps = raw_steps[request.step_index:]
+        run_name = request.run_name or f"{run.run_name} [resume-step-{request.step_index + 1}]"
+        sanitized_steps = _sanitize_plan_steps(resume_steps, start_url=run.start_url)
+        expanded_steps = _expand_drag_steps(
+            sanitized_steps,
+            max_steps=settings.max_steps_per_run,
+            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+        )
+        run_request = RunCreateRequest.model_validate(
+            {
+                "run_name": run_name,
+                "start_url": run.start_url,
+                "steps": expanded_steps,
+                "test_data": run.test_data,
+                "selector_profile": run.selector_profile,
+            }
+        )
+
+        recovered = run_store.create(run_request)
+        background_tasks.add_task(executor.execute, recovered.run_id)
+        LOGGER.info(
+            "Run selector recovery started (resume): new_run_id=%s source_run_id=%s step_index=%s field=%s",
+            recovered.run_id,
+            run_id,
+            request.step_index,
+            request.field,
+        )
+        return recovered
 
     @app.get("/api/runs/{run_id}/artifacts/{artifact_name:path}")
     async def get_run_artifact(run_id: str, artifact_name: str) -> FileResponse:

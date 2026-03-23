@@ -273,6 +273,50 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     async def click(self, selector: str) -> str:
         context = self._active_context()
         selector_lower = selector.lower()
+        is_module_launcher_click = any(
+            token in selector_lower
+            for token in (
+                "selector.module_launcher",
+                "module_launcher",
+                "app switcher",
+                "module switcher",
+                "launchpad",
+                "workflows launcher",
+            )
+        )
+        if is_module_launcher_click:
+            candidate_selectors = [
+                selector,
+                "button[aria-label*='module']",
+                "button[aria-label*='app']",
+                "button[aria-label*='switch']",
+                "[role='button'][aria-label*='module']",
+                "[role='button'][aria-label*='app']",
+                "button:has(svg[data-lucide='layout-grid'])",
+                "button:has(svg[class*='grid'])",
+                "button:has(i[class*='grid'])",
+                "[class*='app-switcher']",
+                "[class*='module-switcher']",
+                "header svg:first-of-type",
+                "header [class*='grid']:first-of-type",
+            ]
+            for candidate in candidate_selectors:
+                try:
+                    locator = context.page.locator(candidate).first
+                    if await locator.count() == 0:
+                        continue
+                    await locator.click(timeout=1200)
+                    await context.page.wait_for_timeout(220)
+                    return f"Clicked {candidate}"
+                except Exception:
+                    continue
+            # Final fallback for UIs where launcher is an icon without stable attributes.
+            try:
+                await context.page.mouse.click(34, 30)
+                await context.page.wait_for_timeout(260)
+                return "Clicked module launcher (coordinate fallback)"
+            except Exception:
+                pass
         is_add_option_click = (
             "add-option" in selector_lower
             or "text=+" in selector_lower
@@ -301,8 +345,14 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                         return f"Clicked {candidate}"
                 except Exception:
                     continue
-        await context.page.locator(selector).first.click()
-        return f"Clicked {selector}"
+        try:
+            await context.page.locator(selector).first.click()
+            return f"Clicked {selector}"
+        except Exception:
+            fallback_message = await self._click_text_fallback(context.page, selector)
+            if fallback_message:
+                return fallback_message
+            raise
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         context = self._active_context()
@@ -1073,6 +1123,55 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception:
             pass
 
+    async def _click_text_fallback(self, page: Any, selector: str) -> str | None:
+        label = self._extract_text_label(selector)
+        if not label:
+            return None
+        escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+        candidates = [
+            f"button:text-is(\"{escaped}\")",
+            f"[role='button']:text-is(\"{escaped}\")",
+            f"[role='tab']:text-is(\"{escaped}\")",
+            f"[role='option']:text-is(\"{escaped}\")",
+            f"[role='menuitem']:text-is(\"{escaped}\")",
+            f"a:text-is(\"{escaped}\")",
+            f"button:has-text(\"{escaped}\")",
+            f"[role='button']:has-text(\"{escaped}\")",
+            f"[role='tab']:has-text(\"{escaped}\")",
+            f"[role='option']:has-text(\"{escaped}\")",
+            f"[role='menuitem']:has-text(\"{escaped}\")",
+            f"a:has-text(\"{escaped}\")",
+            f"[aria-label='{escaped}']",
+            f"[aria-label*='{escaped}']",
+        ]
+        for candidate in candidates:
+            try:
+                locator = page.locator(candidate).first
+                if await locator.count() == 0:
+                    continue
+                await locator.click(timeout=1400)
+                return f"Clicked {candidate}"
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _extract_text_label(selector: str) -> str | None:
+        text = selector.strip()
+        text_match = re.match(r"^\s*text\s*=\s*(.+?)\s*$", text, flags=re.IGNORECASE)
+        if text_match:
+            value = text_match.group(1).strip().strip("'\"")
+            return value or None
+        exact_match = re.search(r":text-is\((['\"])(.*?)\1\)", text, flags=re.IGNORECASE)
+        if exact_match:
+            value = exact_match.group(2).strip()
+            return value or None
+        has_text_match = re.search(r":has-text\((['\"])(.*?)\1\)", text, flags=re.IGNORECASE)
+        if has_text_match:
+            value = has_text_match.group(2).strip()
+            return value or None
+        return None
+
     def _active_context(self) -> _PlaywrightRunContext:
         run_id = self._current_run_id.get()
         if not run_id:
@@ -1226,6 +1325,43 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
                 "  }"
                 f"  await page.locator({json.dumps(selector)}).first().click();"
                 f"  return {json.dumps(message)};"
+                "}"
+            )
+            result = await self._run_code(code)
+            return str(result) if result else message
+        text_label = PlaywrightBrowserMCPClient._extract_text_label(selector)
+        if text_label:
+            escaped = text_label.replace("\\", "\\\\").replace('"', '\\"')
+            fallback_candidates = [
+                f"button:text-is(\"{escaped}\")",
+                f"[role='button']:text-is(\"{escaped}\")",
+                f"[role='tab']:text-is(\"{escaped}\")",
+                f"[role='option']:text-is(\"{escaped}\")",
+                f"[role='menuitem']:text-is(\"{escaped}\")",
+                f"a:text-is(\"{escaped}\")",
+                f"button:has-text(\"{escaped}\")",
+                f"[role='button']:has-text(\"{escaped}\")",
+                f"[role='tab']:has-text(\"{escaped}\")",
+                f"[role='option']:has-text(\"{escaped}\")",
+                f"[role='menuitem']:has-text(\"{escaped}\")",
+                f"a:has-text(\"{escaped}\")",
+                f"[aria-label='{escaped}']",
+                f"[aria-label*='{escaped}']",
+            ]
+            code = (
+                "async (page) => {"
+                f"  const primary = {json.dumps(selector)};"
+                f"  const candidates = {json.dumps(fallback_candidates)};"
+                "  const all = [primary, ...candidates];"
+                "  for (const c of all) {"
+                "    try {"
+                "      const locator = page.locator(c).first();"
+                "      if ((await locator.count()) === 0) continue;"
+                "      await locator.click({ timeout: 1400 });"
+                "      return `Clicked ${c}`;"
+                "    } catch (e) {}"
+                "  }"
+                "  throw new Error(`Unable to click selector: ${primary}`);"
                 "}"
             )
             result = await self._run_code(code)

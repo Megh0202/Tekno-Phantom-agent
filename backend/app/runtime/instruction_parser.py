@@ -10,9 +10,14 @@ _QUOTED_RE = re.compile(r"['\"]([^'\"]+)['\"]")
 _TYPE_INTO_RE = re.compile(r"^\s*(?:type|enter)\s+(.+?)\s+into\s+(.+?)\s*$", flags=re.IGNORECASE)
 _DRAG_TO_RE = re.compile(r"^\s*drag\s+(.+?)\s+to\s+(.+?)\s*$", flags=re.IGNORECASE)
 _CLICK_RE = re.compile(r"^\s*click(?:\s+on)?\s+(.+?)\s*$", flags=re.IGNORECASE)
+_SELECT_RE = re.compile(r"^\s*select\s+(.+?)\s*$", flags=re.IGNORECASE)
 _WAIT_MS_RE = re.compile(r"\bwait\s+(\d{2,6})\s*ms\b", flags=re.IGNORECASE)
 _VERIFY_CONTAINS_ON_RE = re.compile(
     r"^\s*verify(?:\s+text)?\s+contains\s+(.+?)\s+on\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_VERIFY_VISIBLE_RE = re.compile(
+    r"^\s*verify\s+(.+?)\s+(?:is|should be)\s+(?:displayed|visible)\s*$",
     flags=re.IGNORECASE,
 )
 
@@ -184,7 +189,7 @@ def _parse_line(
         if value:
             return {"type": "type", "selector": "{{selector.password}}", "text": value, "clear_first": True}
 
-    if "verify" in lower and "create form" in lower and "visible" in lower:
+    if "create form" in lower and any(token in lower for token in ("visible", "available", "displayed")):
         return {
             "type": "wait",
             "until": "selector_visible",
@@ -192,12 +197,60 @@ def _parse_line(
             "ms": max(structured_selector_wait_ms, 0),
         }
 
+    if (
+        any(token in lower for token in ("change", "switch", "select"))
+        and "module" in lower
+        and "workflow" in lower
+    ):
+        return [
+            {"type": "click", "selector": "{{selector.module_launcher}}"},
+            {"type": "wait", "until": "timeout", "ms": 350},
+            {"type": "click", "selector": "{{selector.module_workflows}}"},
+        ]
+
+    if "verify" in lower and "create workflow" in lower and any(
+        token in lower for token in ("visible", "available", "displayed")
+    ):
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.create_workflow}}",
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
+    if "verify" in lower and "save changes" in lower and any(
+        token in lower for token in ("visible", "available", "displayed")
+    ):
+        return {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.workflow_save_changes}}",
+            "ms": max(structured_selector_wait_ms, 0),
+        }
+
+    if "click" in lower and "create workflow" in lower:
+        return {"type": "click", "selector": "{{selector.create_workflow}}"}
+
     if "click" in lower and "create form" in lower:
         return {"type": "click", "selector": "{{selector.create_form}}"}
 
     if "form name" in lower and any(token in lower for token in ("enter", "type")):
         value = _extract_form_name_value(line)
         return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
+
+    if "workflow name" in lower and any(token in lower for token in ("enter", "type")):
+        value = _extract_workflow_name_value(line)
+        return {"type": "type", "selector": "{{selector.workflow_name}}", "text": value, "clear_first": True}
+
+    if "description" in lower and any(token in lower for token in ("enter", "type")):
+        value = _after_delimiter(line) or quoted
+        if value:
+            return {
+                "type": "type",
+                "selector": "{{selector.workflow_description}}",
+                "text": _strip_wrapping_quotes(value),
+                "clear_first": True,
+            }
 
     if "verify" in lower and "form" in lower and "top" in lower and "list" in lower:
         return {
@@ -263,6 +316,10 @@ def _parse_line(
     if verify_contains is not None:
         return verify_contains
 
+    verify_visible = _parse_verify_visible(line)
+    if verify_visible is not None:
+        return verify_visible
+
     explicit_drag = _parse_explicit_drag(line)
     if explicit_drag is not None:
         return explicit_drag
@@ -274,6 +331,10 @@ def _parse_line(
     explicit_click = _parse_explicit_click(line)
     if explicit_click is not None:
         return explicit_click
+
+    explicit_select = _parse_explicit_select(line)
+    if explicit_select is not None:
+        return explicit_select
 
     if "drag" in lower and (
         "drop" in lower
@@ -315,6 +376,10 @@ def _parse_line(
         return {"type": "click", "selector": "{{selector.required_checkbox}}"}
 
     if "click" in lower and "save" in lower:
+        if "save changes" in lower:
+            return {"type": "click", "selector": "{{selector.workflow_save_changes}}"}
+        if "workflow" in lower:
+            return {"type": "click", "selector": "{{selector.save_workflow}}"}
         return {"type": "click", "selector": "{{selector.save_form}}"}
 
     if "wait" in lower:
@@ -384,10 +449,16 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     lowered_target = normalized_target.lower()
 
     if not _looks_like_explicit_selector(normalized_target):
+        if "create workflow" in lowered_target:
+            return {"type": "click", "selector": "{{selector.create_workflow}}"}
         if "create form" in lowered_target:
             return {"type": "click", "selector": "{{selector.create_form}}"}
         if "back button" in lowered_target or lowered_target == "back":
             return {"type": "click", "selector": "{{selector.back_button}}"}
+        if "save workflow" in lowered_target or ("save" in lowered_target and "workflow" in lowered_target):
+            return {"type": "click", "selector": "{{selector.save_workflow}}"}
+        if "save changes" in lowered_target:
+            return {"type": "click", "selector": "{{selector.workflow_save_changes}}"}
         if "save" in lowered_target:
             return {"type": "click", "selector": "{{selector.save_form}}"}
         if "required" in lowered_target:
@@ -408,6 +479,40 @@ def _parse_verify_contains_on_selector(line: str) -> dict[str, Any] | None:
     if not value or not selector:
         return None
     return {"type": "verify_text", "selector": selector, "match": "contains", "value": value}
+
+
+def _parse_verify_visible(line: str) -> dict[str, Any] | None:
+    match = _VERIFY_VISIBLE_RE.match(line)
+    if not match:
+        return None
+    target_text = _strip_wrapping_quotes(match.group(1)).strip(" ,.-")
+    if not target_text:
+        return None
+    return {
+        "type": "wait",
+        "until": "selector_visible",
+        "selector": f"text={target_text}",
+        "ms": 6000,
+    }
+
+
+def _parse_explicit_select(line: str) -> dict[str, Any] | None:
+    match = _SELECT_RE.match(line)
+    if not match:
+        return None
+    raw_target = _normalize_selector_text(match.group(1))
+    if not raw_target:
+        return None
+    lower_target = raw_target.lower()
+    # Keep form-builder/dropdown "select option" semantics untouched.
+    if any(token in lower_target for token in ("option", "dropdown", "from")):
+        return None
+    if _looks_like_explicit_selector(raw_target):
+        return {"type": "click", "selector": raw_target}
+    normalized_target = _strip_wrapping_quotes(raw_target).strip()
+    if not normalized_target:
+        return None
+    return {"type": "click", "selector": f"text={normalized_target}"}
 
 
 def _extract_wait_ms(text: str) -> int | None:
@@ -448,6 +553,15 @@ def _extract_form_name_value(text: str) -> str:
         normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
         return normalized
     return "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}"
+
+
+def _extract_workflow_name_value(text: str) -> str:
+    quoted = _first_quoted(text)
+    if quoted:
+        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        return normalized
+    return "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"
 
 
 def _extract_drag_field_label(text: str) -> str | None:
@@ -501,6 +615,8 @@ def _enforce_login_sequence(
     needs_authenticated_flow = any(
         (step.get("type") == "verify_text" and "create form" in str(step.get("value", "")).lower())
         or (step.get("type") == "click" and "create_form" in str(step.get("selector", "")).lower())
+        or (step.get("type") == "wait" and "create_workflow" in str(step.get("selector", "")).lower())
+        or (step.get("type") == "click" and "create_workflow" in str(step.get("selector", "")).lower())
         for step in steps
     )
     has_login_click = any(
