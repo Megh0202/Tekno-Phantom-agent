@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 
+import {
+  apiFetch as fetch,
+  buildApiHeaders,
+} from "@/lib/api-auth";
 import styles from "./page.module.css";
 
 type AgentConfig = {
@@ -11,6 +15,7 @@ type AgentConfig = {
   browser_mode?: string;
   filesystem_mode?: string;
   admin_auth_required?: boolean;
+  jwt_auth_enabled?: boolean;
   max_steps_per_run: number;
 };
 
@@ -83,6 +88,19 @@ type StepImportResponse = {
 
 type JsonObject = Record<string, unknown>;
 
+type AuthUser = {
+  id: number;
+  email: string;
+  role: string;
+  is_active: boolean;
+};
+
+type AuthSessionResponse = {
+  authenticated: boolean;
+  user: AuthUser;
+  expires_in: number;
+};
+
 type SuiteRunState = {
   suite_run_id: string;
   suite_name: string;
@@ -102,13 +120,6 @@ const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
   process.env.NEXT_PUBLIC_SHOW_ADVANCED_INPUTS?.trim().toLowerCase() === "true";
-
-function buildApiHeaders(options?: { json?: boolean }): HeadersInit {
-  const headers: Record<string, string> = {};
-  if (options?.json) headers["Content-Type"] = "application/json";
-  if (ADMIN_API_TOKEN) headers["X-Admin-Token"] = ADMIN_API_TOKEN;
-  return headers;
-}
 
 async function parseError(response: Response): Promise<string> {
   try {
@@ -223,6 +234,13 @@ export default function Home() {
   const router = useRouter();
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authConfirmPassword, setAuthConfirmPassword] = useState("");
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
 
   const [prompt, setPrompt] = useState(
     "Open https://example.com, wait for full load, then verify h1 contains 'Example Domain'.",
@@ -256,10 +274,13 @@ export default function Home() {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const testCaseNameInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedTestCaseIds, setSelectedTestCaseIds] = useState<string[]>([]);
+  const [selectedFolderIds, setSelectedFolderIds] = useState<string[]>([]);
   const [isStartingSuite, setIsStartingSuite] = useState(false);
   const [currentSuiteRun, setCurrentSuiteRun] = useState<SuiteRunState | null>(null);
 
   const [currentRun, setCurrentRun] = useState<RunState | null>(null);
+  const requiresJwtAuth = Boolean(config?.jwt_auth_enabled) && !ADMIN_API_TOKEN;
+  const authBlocked = requiresJwtAuth && (!authChecked || !authUser);
 
   const runIsActive = useMemo(
     () => currentRun && !isTerminal(currentRun.status),
@@ -370,7 +391,7 @@ export default function Home() {
       try {
         const response = await fetch(`${API_BASE_URL}/api/config`, {
           cache: "no-store",
-          headers: buildApiHeaders(),
+          headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
         });
         if (!response.ok) {
           throw new Error(await parseError(response));
@@ -393,7 +414,44 @@ export default function Home() {
     };
   }, []);
 
+  const loadCurrentUser = useCallback(async (): Promise<void> => {
+    if (!requiresJwtAuth) {
+      setAuthUser(null);
+      setAuthChecked(true);
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/me`, {
+        cache: "no-store",
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
+      });
+      if (response.status === 401) {
+        setAuthUser(null);
+        setAuthChecked(true);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const payload = (await response.json()) as AuthUser;
+      setAuthUser(payload);
+      setAuthChecked(true);
+    } catch (error) {
+      setAuthUser(null);
+      setAuthChecked(true);
+      setRequestError(error instanceof Error ? error.message : "Failed to load current user");
+    }
+  }, [requiresJwtAuth]);
+
+  useEffect(() => {
+    void loadCurrentUser();
+  }, [loadCurrentUser]);
+
   const loadTestCases = useCallback(async (options?: { silent?: boolean }): Promise<void> => {
+    if (requiresJwtAuth && !authUser) {
+      setSavedCases([]);
+      return;
+    }
     const silent = options?.silent ?? false;
     if (!silent) {
       setIsRefreshingCases(true);
@@ -401,7 +459,7 @@ export default function Home() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/test-cases`, {
         cache: "no-store",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         throw new Error(await parseError(response));
@@ -415,9 +473,13 @@ export default function Home() {
         setIsRefreshingCases(false);
       }
     }
-  }, []);
+  }, [authUser, requiresJwtAuth]);
 
   const loadFolders = useCallback(async (options?: { silent?: boolean }): Promise<void> => {
+    if (requiresJwtAuth && !authUser) {
+      setFolders([]);
+      return;
+    }
     const silent = options?.silent ?? false;
     if (!silent) {
       setIsRefreshingCases(true);
@@ -425,7 +487,7 @@ export default function Home() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/test-folders`, {
         cache: "no-store",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         throw new Error(await parseError(response));
@@ -439,7 +501,7 @@ export default function Home() {
         setIsRefreshingCases(false);
       }
     }
-  }, []);
+  }, [authUser, requiresJwtAuth]);
 
   useEffect(() => {
     void loadTestCases({ silent: true });
@@ -458,7 +520,7 @@ export default function Home() {
       try {
         const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}`, {
           cache: "no-store",
-          headers: buildApiHeaders(),
+          headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
         });
         if (!response.ok) return;
         const payload = (await response.json()) as RunState;
@@ -483,7 +545,7 @@ export default function Home() {
       try {
         const response = await fetch(`${API_BASE_URL}/api/suite-runs/${currentSuiteRun.suite_run_id}`, {
           cache: "no-store",
-          headers: buildApiHeaders(),
+          headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
         });
         if (!response.ok) return;
         const payload = (await response.json()) as SuiteRunState;
@@ -503,7 +565,7 @@ export default function Home() {
   ): Promise<PlanGenerateResponse> {
     const planResponse = await fetch(`${API_BASE_URL}/api/plan`, {
       method: "POST",
-      headers: buildApiHeaders({ json: true }),
+      headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
       body: JSON.stringify({
         task,
         max_steps: config?.max_steps_per_run ?? DEFAULT_MAX_STEPS,
@@ -580,7 +642,7 @@ export default function Home() {
 
       const response = await fetch(`${API_BASE_URL}/api/test-cases/import`, {
         method: "POST",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
         body: formData,
       });
       if (!response.ok) {
@@ -628,7 +690,7 @@ export default function Home() {
       setIsCreatingFolder(true);
       const response = await fetch(`${API_BASE_URL}/api/test-folders`, {
         method: "POST",
-        headers: buildApiHeaders({ json: true }),
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
         body: JSON.stringify({
           name: normalizedName,
           parent_folder_id: selectedFolderId,
@@ -660,7 +722,7 @@ export default function Home() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/test-folders/${folderId}`, {
         method: "DELETE",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         if (response.status === 404) {
@@ -671,6 +733,7 @@ export default function Home() {
       if (selectedFolderId === folderId) {
         setSelectedFolderId(null);
       }
+      setSelectedFolderIds((previous) => previous.filter((item) => item !== folderId));
       setRequestInfo(`Deleted folder: ${folderName}`);
       await loadFolders({ silent: true });
       await loadTestCases({ silent: true });
@@ -688,7 +751,7 @@ export default function Home() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}`, {
         method: "DELETE",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         if (response.status === 404) {
@@ -712,6 +775,15 @@ export default function Home() {
     });
   }
 
+  function toggleFolderSelection(folderId: string): void {
+    setSelectedFolderIds((previous) => {
+      if (previous.includes(folderId)) {
+        return previous.filter((item) => item !== folderId);
+      }
+      return [...previous, folderId];
+    });
+  }
+
   async function runSelectedTestsInParallel(): Promise<void> {
     if (selectedTestCaseIds.length < 2) {
       setRequestError("Select at least two tests to run in parallel.");
@@ -723,7 +795,7 @@ export default function Home() {
       setIsStartingSuite(true);
       const response = await fetch(`${API_BASE_URL}/api/suite-runs`, {
         method: "POST",
-        headers: buildApiHeaders({ json: true }),
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
         body: JSON.stringify({
           suite_name: "selected-tests-suite",
           test_case_ids: selectedTestCaseIds,
@@ -744,21 +816,44 @@ export default function Home() {
   }
 
   async function runCurrentFolderInParallel(): Promise<void> {
-    if (!selectedFolderId) {
-      setRequestError("Select a folder first to run folder tests in parallel.");
+    const folderScopeIds = selectedFolderIds.length > 0 ? selectedFolderIds : (selectedFolderId ? [selectedFolderId] : []);
+    if (folderScopeIds.length === 0) {
+      setRequestError("Select one or more folders first to run folder tests in parallel.");
       return;
     }
+
+    const scopedTestIds = new Set<string>();
+    const stack = [...folderScopeIds];
+    const visited = new Set<string>();
+    while (stack.length > 0) {
+      const currentFolderId = stack.pop() as string;
+      if (visited.has(currentFolderId)) continue;
+      visited.add(currentFolderId);
+
+      for (const testCase of testsByFolderMap.get(currentFolderId) ?? []) {
+        scopedTestIds.add(testCase.test_case_id);
+      }
+      for (const childFolder of folderChildrenMap.get(currentFolderId) ?? []) {
+        stack.push(childFolder.folder_id);
+      }
+    }
+
+    if (scopedTestIds.size === 0) {
+      setRequestError("No test cases found under selected folder scope.");
+      return;
+    }
+
     setRequestError(null);
     setRequestInfo(null);
     try {
       setIsStartingSuite(true);
       const response = await fetch(`${API_BASE_URL}/api/suite-runs`, {
         method: "POST",
-        headers: buildApiHeaders({ json: true }),
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
         body: JSON.stringify({
-          suite_name: "folder-suite-run",
-          folder_id: selectedFolderId,
-          max_parallel: 4,
+          suite_name: folderScopeIds.length > 1 ? "multi-folder-suite-run" : "folder-suite-run",
+          test_case_ids: Array.from(scopedTestIds),
+          max_parallel: Math.min(scopedTestIds.size, 4),
         }),
       });
       if (!response.ok) {
@@ -766,7 +861,7 @@ export default function Home() {
       }
       const suite = (await response.json()) as SuiteRunState;
       setCurrentSuiteRun(suite);
-      setRequestInfo(`Folder parallel suite started: ${suite.suite_run_id}`);
+      setRequestInfo(`Folder parallel suite started: ${suite.suite_run_id} (${scopedTestIds.size} tests)`);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "Failed to start folder suite");
     } finally {
@@ -820,7 +915,7 @@ export default function Home() {
 
       const runResponse = await fetch(`${API_BASE_URL}/api/runs`, {
         method: "POST",
-        headers: buildApiHeaders({ json: true }),
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
         body: JSON.stringify({
           run_name: plan.run_name || "prompt-run",
           start_url: plan.start_url ?? null,
@@ -896,7 +991,7 @@ export default function Home() {
 
       const response = await fetch(`${API_BASE_URL}/api/test-cases`, {
         method: "POST",
-        headers: buildApiHeaders({ json: true }),
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
         body: JSON.stringify({
           name: normalizedName,
           description: testCaseDescription.trim(),
@@ -929,7 +1024,7 @@ export default function Home() {
       setRunningCaseId(testCaseId);
       const detailResponse = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}`, {
         cache: "no-store",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (detailResponse.ok) {
         const detail = (await detailResponse.json()) as TestCaseState;
@@ -947,7 +1042,7 @@ export default function Home() {
 
       const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}/run`, {
         method: "POST",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         throw new Error(await parseError(response));
@@ -970,7 +1065,7 @@ export default function Home() {
       setIsCancelling(true);
       const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/cancel`, {
         method: "POST",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (!response.ok) {
         throw new Error(await parseError(response));
@@ -978,7 +1073,7 @@ export default function Home() {
 
       const refreshed = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}`, {
         cache: "no-store",
-        headers: buildApiHeaders(),
+        headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
       });
       if (refreshed.ok) {
         const payload = (await refreshed.json()) as RunState;
@@ -1032,7 +1127,7 @@ export default function Home() {
       if (currentRunSourceTestCaseId) {
         const detailResponse = await fetch(`${API_BASE_URL}/api/test-cases/${currentRunSourceTestCaseId}`, {
           cache: "no-store",
-          headers: buildApiHeaders(),
+          headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
         });
         if (!detailResponse.ok) {
           throw new Error(await parseError(detailResponse));
@@ -1064,7 +1159,7 @@ export default function Home() {
 
         const updateResponse = await fetch(`${API_BASE_URL}/api/test-cases/${currentRunSourceTestCaseId}`, {
           method: "PUT",
-          headers: buildApiHeaders({ json: true }),
+          headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
           body: JSON.stringify({
             name: detail.name,
             description: detail.description ?? "",
@@ -1082,7 +1177,7 @@ export default function Home() {
 
         const rerunResponse = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
           method: "POST",
-          headers: buildApiHeaders({ json: true }),
+          headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
           body: JSON.stringify({
             step_index: step.index,
             field: stepField,
@@ -1102,7 +1197,7 @@ export default function Home() {
       } else {
         const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
           method: "POST",
-          headers: buildApiHeaders({ json: true }),
+          headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
           body: JSON.stringify({
             step_index: step.index,
             field: stepField,
@@ -1149,6 +1244,97 @@ export default function Home() {
     }));
   }
 
+  async function signIn(): Promise<void> {
+    const email = authEmail.trim();
+    const password = authPassword;
+    if (!email || !password) {
+      setRequestError("Enter email and password to sign in.");
+      return;
+    }
+
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      setIsAuthenticating(true);
+      const response = await fetch(`${API_BASE_URL}/auth/login`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
+        body: JSON.stringify({ email, password }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const payload = (await response.json()) as AuthSessionResponse;
+      setAuthUser(payload.user);
+      setAuthChecked(true);
+      setAuthPassword("");
+      setAuthConfirmPassword("");
+      setRequestInfo(`Signed in as ${email}.`);
+      await loadFolders({ silent: true });
+      await loadTestCases({ silent: true });
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to sign in");
+    } finally {
+      setIsAuthenticating(false);
+    }
+  }
+
+  async function signUp(): Promise<void> {
+    const email = authEmail.trim();
+    const password = authPassword;
+    const confirmPassword = authConfirmPassword;
+    if (!email || !password || !confirmPassword) {
+      setRequestError("Enter email, password, and confirm password to sign up.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setRequestError("Password and confirm password must match.");
+      return;
+    }
+
+    setRequestError(null);
+    setRequestInfo(null);
+    try {
+      setIsAuthenticating(true);
+      const response = await fetch(`${API_BASE_URL}/auth/register`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
+        body: JSON.stringify({ email, password }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const payload = (await response.json()) as AuthSessionResponse;
+      setAuthUser(payload.user);
+      setAuthChecked(true);
+      setAuthMode("signin");
+      setAuthPassword("");
+      setAuthConfirmPassword("");
+      setRequestInfo(`Account created and signed in as ${email}.`);
+      await loadFolders({ silent: true });
+      await loadTestCases({ silent: true });
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to sign up");
+    } finally {
+      setIsAuthenticating(false);
+    }
+  }
+
+  async function signOut(): Promise<void> {
+    await fetch(`${API_BASE_URL}/auth/logout`, {
+      method: "POST",
+      headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
+    });
+    setAuthUser(null);
+    setAuthChecked(true);
+    setAuthPassword("");
+    setAuthConfirmPassword("");
+    setSavedCases([]);
+    setFolders([]);
+    setRequestError(null);
+    setRequestInfo("Signed out. Sign back in to plan, save, or run tests.");
+  }
+
   function renderLibraryNodes(parentFolderId: string | null, depth: number): ReactNode {
     const parentKey = normalizeParentFolderId(parentFolderId);
     const childFolders = folderChildrenMap.get(parentKey) ?? [];
@@ -1175,6 +1361,14 @@ export default function Home() {
                 >
                   {hasChildren ? (isExpanded ? "▾" : "▸") : "·"}
                 </button>
+                <input
+                  type="checkbox"
+                  className={styles.folderSelectCheckbox}
+                  checked={selectedFolderIds.includes(folder.folder_id)}
+                  onChange={() => toggleFolderSelection(folder.folder_id)}
+                  title="Select folder for folder-parallel run"
+                  aria-label={`Select folder ${folder.name} for folder-parallel run`}
+                />
                 <button
                   type="button"
                   className={`${styles.folderRowButton} ${isSelected ? styles.folderRowButtonActive : ""}`}
@@ -1234,7 +1428,7 @@ export default function Home() {
                 type="button"
                 className={styles.secondaryButton}
                 onClick={() => void runSavedTestCase(testCase.test_case_id)}
-                disabled={Boolean(runningCaseId)}
+                disabled={authBlocked || Boolean(runningCaseId)}
               >
                 {runningCaseId === testCase.test_case_id ? "Starting..." : "Run"}
               </button>
@@ -1289,6 +1483,93 @@ export default function Home() {
               <p className={styles.metaLine}>
                 {config?.llm_mode ?? "loading"} · {config?.model ?? "loading"} ·{" "}
                 {config?.browser_mode ?? "loading"} · {config?.filesystem_mode ?? "loading"}
+              </p>
+            )}
+          </div>
+          <div className={styles.heroCard}>
+            <p className={styles.heroCardTitle}>Access</p>
+            {requiresJwtAuth ? (
+              authUser ? (
+                <div className={styles.authBox}>
+                  <p className={styles.metaLine}>
+                    Signed in as {authUser.email} ({authUser.role}).
+                  </p>
+                  <div className={styles.authActions}>
+                    <button type="button" className={styles.secondaryButton} onClick={() => void signOut()}>
+                      Sign Out
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className={styles.authBox}>
+                  <p className={styles.metaLine}>
+                    {authMode === "signup"
+                      ? "Create your account here. Registration also signs you in."
+                      : "Sign in to plan, save, import, and run test cases."}
+                  </p>
+                  <div className={styles.authActions}>
+                    <button
+                      type="button"
+                      className={styles.secondaryButton}
+                      onClick={() => setAuthMode("signin")}
+                      disabled={isAuthenticating || authMode === "signin"}
+                    >
+                      Sign In
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.secondaryButton}
+                      onClick={() => setAuthMode("signup")}
+                      disabled={isAuthenticating || authMode === "signup"}
+                    >
+                      Sign Up
+                    </button>
+                  </div>
+                  <div className={styles.authGrid}>
+                    <label className={styles.fieldLabel}>
+                      <span>Email</span>
+                      <input
+                        value={authEmail}
+                        onChange={(event) => setAuthEmail(event.target.value)}
+                        placeholder="qa@example.com"
+                      />
+                    </label>
+                    <label className={styles.fieldLabel}>
+                      <span>Password</span>
+                      <input
+                        type="password"
+                        value={authPassword}
+                        onChange={(event) => setAuthPassword(event.target.value)}
+                        placeholder="Enter password"
+                      />
+                    </label>
+                    {authMode === "signup" ? (
+                      <label className={styles.fieldLabel}>
+                        <span>Confirm Password</span>
+                        <input
+                          type="password"
+                          value={authConfirmPassword}
+                          onChange={(event) => setAuthConfirmPassword(event.target.value)}
+                          placeholder="Confirm password"
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                  <div className={styles.authActions}>
+                    <button
+                      type="button"
+                      className={styles.primaryButton}
+                      onClick={() => void (authMode === "signup" ? signUp() : signIn())}
+                      disabled={isAuthenticating}
+                    >
+                      {isAuthenticating ? "Working..." : authMode === "signup" ? "Create Account" : "Sign In"}
+                    </button>
+                  </div>
+                </div>
+              )
+            ) : (
+              <p className={styles.metaLine}>
+                {ADMIN_API_TOKEN ? "Using frontend admin token." : "Planner access is open."}
               </p>
             )}
           </div>
@@ -1353,7 +1634,7 @@ export default function Home() {
                     type="button"
                     className={styles.secondaryButton}
                     onClick={importStepsFromFile}
-                    disabled={!importFile || isImporting || isSubmitting || isSavingTestCase}
+                    disabled={authBlocked || !importFile || isImporting || isSubmitting || isSavingTestCase}
                   >
                     {isImporting ? "Importing..." : "Import Steps"}
                   </button>
@@ -1403,7 +1684,7 @@ export default function Home() {
                     type="button"
                     className={styles.secondaryButton}
                     onClick={generatePlanPreview}
-                    disabled={isGenerating || isSubmitting}
+                    disabled={authBlocked || isGenerating || isSubmitting}
                   >
                     {isGenerating ? "Generating..." : "Generate Steps (AI)"}
                   </button>
@@ -1412,18 +1693,22 @@ export default function Home() {
                   type="button"
                   className={styles.secondaryButton}
                   onClick={saveTestCaseFromPrompt}
-                  disabled={isSavingTestCase || isSubmitting || isImporting}
+                  disabled={authBlocked || isSavingTestCase || isSubmitting || isImporting}
                 >
                   {isSavingTestCase ? "Saving..." : "Save Test Case"}
                 </button>
-                <button type="submit" className={styles.primaryButton} disabled={isSubmitting || isImporting}>
+                <button
+                  type="submit"
+                  className={styles.primaryButton}
+                  disabled={authBlocked || isSubmitting || isImporting}
+                >
                   {isSubmitting ? "Starting..." : "Run Prompt"}
                 </button>
                 <button
                   type="button"
                   className={styles.secondaryButton}
                   onClick={cancelRun}
-                  disabled={!runIsActive || isCancelling}
+                  disabled={authBlocked || !runIsActive || isCancelling}
                 >
                   {isCancelling ? "Cancelling..." : "Cancel"}
                 </button>
@@ -1469,7 +1754,7 @@ export default function Home() {
                     void loadFolders();
                     void loadTestCases();
                   }}
-                  disabled={isRefreshingCases}
+                  disabled={authBlocked || isRefreshingCases}
                 >
                   {isRefreshingCases ? "Refreshing..." : "Refresh"}
                 </button>
@@ -1477,7 +1762,7 @@ export default function Home() {
                   type="button"
                   className={styles.secondaryButton}
                   onClick={() => void runSelectedTestsInParallel()}
-                  disabled={isStartingSuite || selectedTestCaseIds.length < 2}
+                  disabled={authBlocked || isStartingSuite || selectedTestCaseIds.length < 2}
                 >
                   {isStartingSuite ? "Starting..." : "Run Selected Parallel"}
                 </button>
@@ -1485,7 +1770,7 @@ export default function Home() {
                   type="button"
                   className={styles.secondaryButton}
                   onClick={() => void runCurrentFolderInParallel()}
-                  disabled={isStartingSuite || !selectedFolderId}
+                  disabled={authBlocked || isStartingSuite || (selectedFolderIds.length === 0 && !selectedFolderId)}
                 >
                   {isStartingSuite ? "Starting..." : "Run Folder Parallel"}
                 </button>
@@ -1502,7 +1787,7 @@ export default function Home() {
                 type="button"
                 className={styles.secondaryButton}
                 onClick={() => void createFolder()}
-                disabled={isCreatingFolder}
+                disabled={authBlocked || isCreatingFolder}
               >
                 {isCreatingFolder ? "Creating..." : "+ Folder"}
               </button>
@@ -1510,6 +1795,7 @@ export default function Home() {
                 type="button"
                 className={`${styles.secondaryButton} ${!selectedFolderId ? styles.folderScopeActive : ""}`}
                 onClick={() => startCreateTestCaseInFolder(selectedFolderId, selectedFolderName)}
+                disabled={authBlocked}
               >
                 + Test Case
               </button>
