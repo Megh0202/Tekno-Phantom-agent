@@ -3,18 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from pathlib import Path
-from typing import Annotated
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.brain.http_client import HttpBrainClient
+from app.auth.dependencies import build_api_auth_dependency
+from app.auth.security import issue_csrf_token, set_csrf_cookie
+from app.auth.service import ensure_bootstrap_admin
 from app.config import Settings, get_settings
+from app.database import db_session, init_auth_database
 from app.mcp.browser_client import build_browser_client
 from app.mcp.filesystem_client import build_filesystem_client
+from app.routes.auth import router as auth_router
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
@@ -56,14 +61,46 @@ if sys.platform.startswith("win"):
         pass
 
 
-def _extract_bearer_token(authorization: str | None) -> str | None:
-    if not authorization:
-        return None
-    prefix = "bearer "
-    if not authorization.lower().startswith(prefix):
-        return None
-    token = authorization[len(prefix) :].strip()
-    return token or None
+_STRUCTURED_LINE_RE = re.compile(r"^\s*(?:\d+[\).:-]\s+|[-*]\s+)")
+
+
+def _instruction_line_count(task: str) -> int:
+    lines = [line.strip() for line in task.splitlines() if line.strip()]
+    if not lines:
+        return 0
+    structured = sum(1 for line in lines if _STRUCTURED_LINE_RE.match(line))
+    return structured if structured >= 2 else len(lines)
+
+
+def _should_use_structured_parse(task: str, parsed_steps: list[dict[str, object]]) -> bool:
+    if not parsed_steps:
+        return False
+    instruction_count = _instruction_line_count(task)
+    if instruction_count <= 0:
+        return False
+    coverage = len(parsed_steps) / instruction_count
+    lower_task = task.lower()
+    has_template_selector = any(
+        isinstance(step.get("selector"), str) and "{{selector." in step.get("selector", "")
+        for step in parsed_steps
+    )
+    has_explicit_selector_syntax = any(token in task for token in ("#", "[", "]", "text=", "xpath=", ":has-text("))
+    specialized_keywords = (
+        "vita",
+        "workflow",
+        "create form",
+        "form canvas",
+        "add status",
+        "transition",
+    )
+    is_specialized_prompt = any(keyword in lower_task for keyword in specialized_keywords)
+    if not (has_template_selector or has_explicit_selector_syntax or is_specialized_prompt):
+        return False
+    # Structured parser is Vita/workflow-specific. For non-Vita prompts with template
+    # selectors, prefer the LLM planner to avoid low-quality partial plans.
+    if "vita" not in lower_task and has_template_selector:
+        return False
+    return coverage >= 0.6
 
 
 def _sanitize_plan_steps(
@@ -350,26 +387,29 @@ def _expand_drag_steps(
     return expanded[:max_steps]
 
 
-def build_admin_auth_dependency(settings: Settings):
-    async def require_admin_auth(
-        authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-        x_admin_token: Annotated[str | None, Header(alias="X-Admin-Token")] = None,
-    ) -> None:
-        if not settings.admin_api_token:
-            return
-
-        provided = x_admin_token or _extract_bearer_token(authorization)
-        if provided != settings.admin_api_token:
-            raise HTTPException(status_code=401, detail="Unauthorized: invalid admin token")
-
-    return require_admin_auth
-
-
 def build_app() -> FastAPI:
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    log_level_name = str(settings.log_level).upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(level=log_level)
 
     app = FastAPI(title="Tekno Phantom Agent API", version="0.1.0")
+    init_auth_database()
+    if settings.auth_bootstrap_admin_email and settings.auth_bootstrap_admin_password:
+        with db_session() as db:
+            ensure_bootstrap_admin(
+                db,
+                email=settings.auth_bootstrap_admin_email,
+                password=settings.auth_bootstrap_admin_password,
+            )
+    app.include_router(auth_router)
+
+    @app.middleware("http")
+    async def ensure_csrf_cookie(request: Request, call_next):
+        response = await call_next(request)
+        if not request.cookies.get(settings.auth_csrf_cookie_name):
+            set_csrf_cookie(response, csrf_token=issue_csrf_token(), settings=settings)
+        return response
 
     app.add_middleware(
         CORSMiddleware,
@@ -402,7 +442,7 @@ def build_app() -> FastAPI:
         executor,
         file_client,
     )
-    require_admin_auth = build_admin_auth_dependency(settings)
+    require_api_auth = build_api_auth_dependency(settings)
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
@@ -432,13 +472,14 @@ def build_app() -> FastAPI:
             "run_store_backend": settings.run_store_backend,
             "max_steps_per_run": settings.max_steps_per_run,
             "admin_auth_required": bool(settings.admin_api_token),
+            "jwt_auth_enabled": settings.auth_enabled,
         }
 
     @app.post("/api/runs", response_model=RunState)
     async def create_run(
         request: RunCreateRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
         raw_steps = _sanitize_plan_steps(raw_steps, start_url=request.start_url)
@@ -452,6 +493,8 @@ def build_app() -> FastAPI:
             {
                 "run_name": request.run_name,
                 "start_url": request.start_url,
+                "prompt": request.prompt,
+                "execution_mode": request.execution_mode,
                 "steps": expanded_steps,
                 "test_data": request.test_data,
                 "selector_profile": request.selector_profile,
@@ -472,7 +515,7 @@ def build_app() -> FastAPI:
     @app.post("/api/test-cases", response_model=TestCaseState)
     async def create_test_case(
         request: TestCaseCreateRequest,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> TestCaseState:
         if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
             raise HTTPException(status_code=404, detail="Parent folder not found")
@@ -503,7 +546,7 @@ def build_app() -> FastAPI:
     @app.post("/api/test-folders", response_model=FolderState)
     async def create_test_folder(
         request: FolderCreateRequest,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> FolderState:
         if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
             raise HTTPException(status_code=404, detail="Parent folder not found")
@@ -517,7 +560,7 @@ def build_app() -> FastAPI:
     @app.delete("/api/test-folders/{folder_id}", status_code=204)
     async def delete_test_folder(
         folder_id: str,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> None:
         folders = test_case_store.list_folders()
         folder_by_id = {folder.folder_id: folder for folder in folders}
@@ -559,7 +602,7 @@ def build_app() -> FastAPI:
         file: UploadFile = File(...),
         run_name: str | None = Form(default=None),
         start_url: str | None = Form(default=None),
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> StepImportResponse:
         filename = (file.filename or "imported_steps.csv").strip() or "imported_steps.csv"
         payload = await file.read()
@@ -640,7 +683,7 @@ def build_app() -> FastAPI:
     async def update_test_case(
         test_case_id: str,
         request: TestCaseUpdateRequest,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> TestCaseState:
         current = test_case_store.get(test_case_id)
         if not current:
@@ -684,7 +727,7 @@ def build_app() -> FastAPI:
     @app.delete("/api/test-cases/{test_case_id}", status_code=204)
     async def delete_test_case(
         test_case_id: str,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> None:
         deleted = test_case_store.delete(test_case_id)
         if not deleted:
@@ -694,7 +737,7 @@ def build_app() -> FastAPI:
     async def run_test_case(
         test_case_id: str,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> RunState:
         test_case = test_case_store.get(test_case_id)
         if not test_case:
@@ -736,7 +779,7 @@ def build_app() -> FastAPI:
     @app.post("/api/plan", response_model=PlanGenerateResponse)
     async def generate_plan(
         request: PlanGenerateRequest,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> PlanGenerateResponse:
         max_steps = request.max_steps or settings.max_steps_per_run
         max_steps = min(max_steps, settings.max_steps_per_run)
@@ -751,6 +794,7 @@ def build_app() -> FastAPI:
         )
         if parsed_steps:
             parsed_steps = _sanitize_plan_steps(parsed_steps, start_url=None)
+        if _should_use_structured_parse(request.task, parsed_steps):
             validated = RunCreateRequest.model_validate(
                 {
                     "run_name": "prompt-steps-run",
@@ -860,7 +904,7 @@ def build_app() -> FastAPI:
     async def create_suite_run(
         request: SuiteRunCreateRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> SuiteRunState:
         all_test_cases = test_case_store.list()
         test_by_id = {item.test_case_id: item for item in all_test_cases}
@@ -959,7 +1003,7 @@ def build_app() -> FastAPI:
     @app.post("/api/suite-runs/{suite_run_id}/cancel", response_model=CancelSuiteRunResponse)
     async def cancel_suite_run(
         suite_run_id: str,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> CancelSuiteRunResponse:
         suite_run = suite_store.mark_cancelled(suite_run_id)
         if not suite_run:
@@ -982,7 +1026,7 @@ def build_app() -> FastAPI:
         run_id: str,
         request: SelectorRecoveryRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        _: object | None = Depends(require_api_auth),
     ) -> RunState:
         run = run_store.get(run_id)
         if not run:
@@ -1046,7 +1090,7 @@ def build_app() -> FastAPI:
         return FileResponse(artifact_path)
 
     @app.post("/api/runs/{run_id}/cancel", response_model=CancelRunResponse)
-    async def cancel_run(run_id: str, _: None = Depends(require_admin_auth)) -> CancelRunResponse:
+    async def cancel_run(run_id: str, _: object | None = Depends(require_api_auth)) -> CancelRunResponse:
         run = run_store.mark_cancelled(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
