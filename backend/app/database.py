@@ -21,7 +21,7 @@ Base = declarative_base()
 
 def init_auth_database() -> None:
     # Import models before create_all so metadata includes all tables.
-    from app.models import refresh_token, user  # noqa: F401
+    from app.models import project, refresh_token, user  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 

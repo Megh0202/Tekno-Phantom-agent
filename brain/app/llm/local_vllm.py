@@ -112,11 +112,71 @@ class LocalVLLMProvider:
                 message = choices[0].get("message", {})
                 text = message.get("content", "")
                 if isinstance(text, str) and text.strip():
-                    return self._normalize_plan(self._extract_json_object(text), task, max_steps)
+                    normalized = self._normalize_plan(self._extract_json_object(text), task, max_steps)
+                    normalized["raw_llm_response"] = text
+                    return normalized
         except Exception:
             pass
 
-        return self._fallback_plan(task, max_steps)
+        fallback = self._fallback_plan(task, max_steps)
+        fallback["raw_llm_response"] = None
+        return fallback
+
+    async def suggest_selectors(
+        self,
+        *,
+        step_type: str,
+        failed_selector: str,
+        error_message: str,
+        page: dict[str, Any],
+        text_hint: str | None = None,
+        max_candidates: int = 3,
+    ) -> list[str]:
+        url = f"{self._settings.vllm_base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You repair failed web automation selectors. "
+                        "Return ONLY strict JSON like {\"selectors\":[\"...\"]}. "
+                        "Prefer Playwright-compatible CSS/text selectors grounded in the provided DOM summary. "
+                        "Use page.interactive_elements as the primary grounding source (tags, roles, ids, names, placeholders, text, aria labels, href, scope). "
+                        "Do not rely only on page URL or title."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "step_type": step_type,
+                            "failed_selector": failed_selector,
+                            "error_message": error_message,
+                            "text_hint": text_hint or "",
+                            "page": page,
+                            "max_candidates": max_candidates,
+                        }
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 220,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(url, json=payload, headers=self._headers())
+                response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                text = message.get("content", "")
+                if isinstance(text, str) and text.strip():
+                    return self._extract_selector_list(text, max_candidates)
+        except Exception:
+            pass
+        return []
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -181,6 +241,19 @@ class LocalVLLMProvider:
             "start_url": start_url,
             "steps": steps,
         }
+
+    @staticmethod
+    def _extract_selector_list(text: str, max_candidates: int) -> list[str]:
+        if not text.strip():
+            return []
+        try:
+            payload = LocalVLLMProvider._extract_json_object(text)
+            selectors = payload.get("selectors", [])
+            if isinstance(selectors, list):
+                return [str(item).strip() for item in selectors if str(item).strip()][:max_candidates]
+        except Exception:
+            pass
+        return []
 
     @staticmethod
     def _fallback_plan(task: str, max_steps: int) -> dict[str, Any]:

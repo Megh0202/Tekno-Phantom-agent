@@ -43,8 +43,9 @@ class Settings(BaseSettings):
 
     max_steps_per_run: int = 300
     step_timeout_seconds: int = 60
+    step_failure_mode: Literal["stop", "continue"] = "continue"
     drag_step_timeout_seconds: int = 120
-    browser_mode: Literal["mock", "playwright", "mcp"] = "mock"
+    browser_mode: Literal["mock", "playwright", "mcp"] = "playwright"
     playwright_browser: Literal["chromium", "firefox", "webkit"] = "chromium"
     playwright_headless: bool = True
     playwright_default_timeout_ms: int = 15000
@@ -68,9 +69,15 @@ class Settings(BaseSettings):
     selector_memory_backend: Literal["sqlite", "in_memory", "disabled"] = "sqlite"
     selector_memory_db_path: Path = Path("data/selector_memory.sqlite3")
     selector_memory_max_candidates: int = 5
+    selector_help_mode: Literal["fail", "pause"] = "fail"
     selector_recovery_enabled: bool = True
     selector_recovery_attempts: int = 2
     selector_recovery_delay_ms: int = 350
+    selector_llm_recovery_enabled: bool = False
+    selector_llm_max_candidates: int = 3
+    execution_fast_path_enabled: bool = True
+    execution_fast_path_action_timeout_seconds: int = 4
+    execution_fast_path_selector_timeout_ms: int = 2000
     auto_drag_pre_click_enabled: bool = True
     auto_drag_post_wait_ms: int = 120
     auto_login_wait_ms: int = 500

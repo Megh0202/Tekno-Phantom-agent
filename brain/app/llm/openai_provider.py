@@ -76,10 +76,59 @@ class OpenAIProvider:
         if text.strip():
             try:
                 payload = self._extract_json_object(text)
-                return self._normalize_plan(payload, task, max_steps)
+                normalized = self._normalize_plan(payload, task, max_steps)
+                normalized["raw_llm_response"] = text
+                return normalized
             except Exception:
                 pass
-        return self._fallback_plan(task, max_steps)
+        fallback = self._fallback_plan(task, max_steps)
+        fallback["raw_llm_response"] = text or None
+        return fallback
+
+    async def suggest_selectors(
+        self,
+        *,
+        step_type: str,
+        failed_selector: str,
+        error_message: str,
+        page: dict[str, Any],
+        text_hint: str | None = None,
+        max_candidates: int = 3,
+    ) -> list[str]:
+        if not self._settings.openai_api_key:
+            return []
+
+        completion = await self._client.responses.create(
+            model=self.model_name,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You repair failed web automation selectors. "
+                        "Return ONLY strict JSON like {\"selectors\":[\"...\"]}. "
+                        "Prefer Playwright-compatible CSS/text selectors grounded in the provided DOM summary. "
+                        "Use page.interactive_elements as the primary grounding source (tags, roles, ids, names, placeholders, text, aria labels, href, scope). "
+                        "Do not rely only on page URL or title."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "step_type": step_type,
+                            "failed_selector": failed_selector,
+                            "error_message": error_message,
+                            "text_hint": text_hint or "",
+                            "page": page,
+                            "max_candidates": max_candidates,
+                        }
+                    ),
+                },
+            ],
+            max_output_tokens=220,
+        )
+        text = completion.output_text or ""
+        return self._extract_selector_list(text, max_candidates)
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -147,6 +196,19 @@ class OpenAIProvider:
         }
 
     @staticmethod
+    def _extract_selector_list(text: str, max_candidates: int) -> list[str]:
+        if not text.strip():
+            return []
+        try:
+            payload = OpenAIProvider._extract_json_object(text)
+            selectors = payload.get("selectors", [])
+            if isinstance(selectors, list):
+                return [str(item).strip() for item in selectors if str(item).strip()][:max_candidates]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
     def _fallback_plan(task: str, max_steps: int) -> dict[str, Any]:
         url_match = re.search(r"https?://[^\s]+", task)
         start_url = url_match.group(0) if url_match else "https://example.com"
@@ -158,6 +220,7 @@ class OpenAIProvider:
             "run_name": "ai-generated-run",
             "start_url": start_url,
             "steps": steps[:max(1, max_steps)],
+            "raw_llm_response": None,
         }
 
     @staticmethod

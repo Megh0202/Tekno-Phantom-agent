@@ -43,7 +43,31 @@ function buildRequestInit(options?: ApiFetchOptions): RequestInit {
 }
 
 export async function apiFetch(input: RequestInfo | URL, options?: ApiFetchOptions): Promise<Response> {
-  const response = await fetch(input, buildRequestInit(options));
+  let response: Response;
+  try {
+    response = await fetch(input, buildRequestInit(options));
+  } catch (error) {
+    if (error instanceof TypeError) {
+      const url = typeof input === "string" ? input : input.toString();
+      let hint = "Failed to reach the backend.";
+      if (typeof window !== "undefined") {
+        const pageHost = window.location.hostname;
+        try {
+          const apiHost = new URL(url, window.location.origin).hostname;
+          if (
+            (pageHost === "127.0.0.1" && apiHost === "localhost") ||
+            (pageHost === "localhost" && apiHost === "127.0.0.1")
+          ) {
+            hint = `Failed to reach the backend. Open frontend and backend on the same host name (${pageHost}) or allow both loopback origins.`;
+          }
+        } catch {
+          // Ignore URL parsing issues and fall back to the generic hint.
+        }
+      }
+      throw new Error(hint);
+    }
+    throw error;
+  }
   const url = typeof input === "string" ? input : input.toString();
   const isAuthRefreshCall = url.includes("/auth/refresh");
   const isAuthLoginOrRegister = url.includes("/auth/login") || url.includes("/auth/register");

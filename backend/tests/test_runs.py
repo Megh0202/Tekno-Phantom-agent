@@ -9,6 +9,7 @@ os.environ.setdefault("FILESYSTEM_MODE", "local")
 os.environ["ADMIN_API_TOKEN"] = ""
 
 from app.main import app
+from app.schemas import RunState, RunStatus, StepRuntimeState, StepSelectorHelpRequest, StepStatus
 
 
 def test_health_endpoint() -> None:
@@ -51,24 +52,17 @@ def test_run_creation_and_completion() -> None:
     assert all(step["status"] == "completed" for step in run["steps"])
 
 
-def test_run_truncates_when_step_count_exceeds_limit() -> None:
+def test_run_rejects_when_step_count_exceeds_limit() -> None:
+    payload = {
+        "run_name": "too-many-steps",
+        "steps": [{"type": "click", "selector": "button.x"}] * 301,
+    }
+
     with TestClient(app) as client:
-        health = client.get("/health")
-        assert health.status_code == 200, health.text
-        max_steps = int(health.json()["max_steps_per_run"])
-        payload = {
-            "run_name": "too-many-steps",
-            "steps": [{"type": "click", "selector": f"button.x-{index}"} for index in range(max_steps + 1)],
-        }
         response = client.post("/api/runs", json=payload)
-        assert response.status_code == 200, response.text
-        run_id = response.json()["run_id"]
 
-        fetched = client.get(f"/api/runs/{run_id}")
-        assert fetched.status_code == 200, fetched.text
-        run = fetched.json()
-
-    assert len(run["steps"]) == max_steps
+    assert response.status_code == 400
+    assert "max_steps_per_run" in response.json()["detail"]
 
 
 def test_run_accepts_test_data_and_selector_profile() -> None:
@@ -108,6 +102,28 @@ def test_run_accepts_test_data_and_selector_profile() -> None:
     assert body["test_data"]["email"] == "qa@example.com"
     assert body["selector_profile"]["email"] == ["#username"]
     assert body["selector_profile"]["password"] == ["#password", "input[name='password']"]
+
+
+def test_autonomous_run_accepts_prompt_without_static_steps() -> None:
+    payload = {
+        "run_name": "autonomous-run",
+        "prompt": "Open the site and figure out the next step yourself.",
+        "execution_mode": "autonomous",
+        "steps": [],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+        run_id = created.json()["run_id"]
+
+        fetched = client.get(f"/api/runs/{run_id}")
+        assert fetched.status_code == 200, fetched.text
+
+    run = fetched.json()
+    assert run["execution_mode"] == "autonomous"
+    assert run["prompt"] == "Open the site and figure out the next step yourself."
+    assert run["status"] == "completed"
 
 
 def test_run_generates_html_report_artifact() -> None:
@@ -199,94 +215,67 @@ def test_run_artifact_endpoint_serves_report_html() -> None:
         assert "Test Execution Report" in report.text
 
 
-def test_recover_selector_creates_new_run_with_patched_step() -> None:
-    payload = {
-        "run_name": "selector-recovery-source",
-        "steps": [{"type": "click", "selector": "button.old-selector"}],
-    }
+def test_selector_help_request_normalizes_playwright_get_by_text() -> None:
+    request = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_text("Workflows", exact=True)'}
+    )
 
-    with TestClient(app) as client:
-        created = client.post("/api/runs", json=payload)
-        assert created.status_code == 200, created.text
-        source_run = created.json()
-        source_run_id = source_run["run_id"]
+    assert request.selector == ':text-is("Workflows")'
 
-        recovered = client.post(
-            f"/api/runs/{source_run_id}/recover-selector",
-            json={
-                "step_index": 0,
-                "field": "selector",
-                "selector": "button.new-selector",
-            },
+
+def test_selector_help_request_normalizes_playwright_get_by_role_and_placeholder() -> None:
+    by_role = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_role("textbox", name="Enter email")'}
+    )
+    by_placeholder = StepSelectorHelpRequest.model_validate(
+        {"selector": 'page.get_by_placeholder("Enter Password")'}
+    )
+
+    assert "input[placeholder*='Enter email']" in by_role.selector
+    assert "input[aria-label*='Enter email']" in by_role.selector
+    assert by_placeholder.selector == "input[placeholder*='Enter Password'], textarea[placeholder*='Enter Password']"
+
+
+def test_selector_submit_retries_blocked_step_immediately() -> None:
+    executor = app.state.executor
+    run_store = app.state.run_store
+
+    original_dispatch = executor._dispatch_step
+    try:
+        async def _dispatch(run: RunState, raw_step: dict) -> str:
+            return f"Clicked {raw_step['selector']}"
+
+        executor._dispatch_step = _dispatch
+        run = RunState(
+            run_name="selector-submit-run",
+            status=RunStatus.waiting_for_input,
+            steps=[
+                StepRuntimeState(
+                    index=0,
+                    type="click",
+                    input={"type": "click", "selector": "button:has-text('Workflows')"},
+                    status=StepStatus.waiting_for_input,
+                    user_input_kind="selector",
+                    requested_selector_target="button:has-text('Workflows')",
+                    error="All selector candidates failed",
+                    failure_screenshot="step-000-failed.png",
+                )
+            ],
         )
-        assert recovered.status_code == 200, recovered.text
-        recovered_run = recovered.json()
-        assert recovered_run["run_id"] != source_run_id
+        run_store.persist(run)
 
-        fetched = client.get(f"/api/runs/{recovered_run['run_id']}")
-        assert fetched.status_code == 200, fetched.text
-        latest = fetched.json()
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/runs/{run.run_id}/steps/{run.steps[0].step_id}/selector",
+                json={"selector": "a:has-text('Workflows')"},
+            )
 
-    assert latest["run_name"].endswith("[resume-step-1]")
-    assert latest["steps"][0]["input"]["selector"] == "button.new-selector"
-    assert "Clicked button.new-selector" in (latest["steps"][0]["message"] or "")
-
-
-def test_recover_selector_rejects_invalid_step_index() -> None:
-    payload = {
-        "run_name": "selector-recovery-invalid-index",
-        "steps": [{"type": "click", "selector": "button.old-selector"}],
-    }
-
-    with TestClient(app) as client:
-        created = client.post("/api/runs", json=payload)
-        assert created.status_code == 200, created.text
-        source_run_id = created.json()["run_id"]
-
-        recovered = client.post(
-            f"/api/runs/{source_run_id}/recover-selector",
-            json={
-                "step_index": 5,
-                "field": "selector",
-                "selector": "button.new-selector",
-            },
-        )
-
-    assert recovered.status_code == 400
-    assert "step_index is out of range" in recovered.json()["detail"]
-
-
-def test_recover_selector_resumes_from_selected_step_index() -> None:
-    payload = {
-        "run_name": "selector-recovery-resume-index",
-        "steps": [
-            {"type": "wait", "until": "timeout", "ms": 1},
-            {"type": "click", "selector": "button.old-selector"},
-            {"type": "wait", "until": "timeout", "ms": 2},
-        ],
-    }
-
-    with TestClient(app) as client:
-        created = client.post("/api/runs", json=payload)
-        assert created.status_code == 200, created.text
-        source_run_id = created.json()["run_id"]
-
-        recovered = client.post(
-            f"/api/runs/{source_run_id}/recover-selector",
-            json={
-                "step_index": 1,
-                "field": "selector",
-                "selector": "button.new-selector",
-            },
-        )
-        assert recovered.status_code == 200, recovered.text
-        recovered_run_id = recovered.json()["run_id"]
-
-        fetched = client.get(f"/api/runs/{recovered_run_id}")
-        assert fetched.status_code == 200, fetched.text
-        latest = fetched.json()
-
-    assert latest["run_name"].endswith("[resume-step-2]")
-    assert len(latest["steps"]) == 2
-    assert latest["steps"][0]["type"] == "click"
-    assert latest["steps"][0]["input"]["selector"] == "button.new-selector"
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        step = payload["steps"][0]
+        assert step["status"] == "completed"
+        assert step["message"] == "Clicked a:has-text('Workflows')"
+        assert step["failure_screenshot"] is None
+        assert payload["status"] == "completed"
+    finally:
+        executor._dispatch_step = original_dispatch

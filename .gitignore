@@ -19,6 +19,8 @@ venv/
 *.log
 artifacts/
 reports/
+# Selector memory database
+selector_memory.sqlite3
 # Python
 __pycache__/
 *.pyc

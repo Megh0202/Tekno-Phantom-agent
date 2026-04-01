@@ -50,10 +50,52 @@ type AuthSessionResponse = {
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 
+function formatApiDetail(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail.trim();
+  }
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => formatApiDetail(item))
+      .filter((item) => Boolean(item));
+    if (parts.length) return parts.join("; ");
+    return "";
+  }
+  if (detail && typeof detail === "object") {
+    const payload = detail as Record<string, unknown>;
+    const directMessage =
+      (typeof payload.message === "string" && payload.message.trim())
+      || (typeof payload.error === "string" && payload.error.trim())
+      || (typeof payload.detail === "string" && payload.detail.trim());
+    const validationErrors = Array.isArray(payload.validation_errors)
+      ? payload.validation_errors.map((item) => formatApiDetail(item)).filter((item) => Boolean(item))
+      : [];
+    const rejectionReasons = Array.isArray(payload.rejection_reasons)
+      ? payload.rejection_reasons.map((item) => formatApiDetail(item)).filter((item) => Boolean(item))
+      : [];
+    const parts = [directMessage, ...validationErrors, ...rejectionReasons].filter((item) => Boolean(item));
+    if (parts.length) return parts.join("; ");
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return String(detail);
+    }
+  }
+  if (detail === null || detail === undefined) {
+    return "";
+  }
+  return String(detail);
+}
+
 async function parseError(response: Response): Promise<string> {
   try {
-    const body = (await response.json()) as { detail?: string };
-    if (body.detail) return body.detail;
+    const body = (await response.json()) as { detail?: unknown; message?: unknown; error?: unknown };
+    const detail = formatApiDetail(body.detail);
+    if (detail) return detail;
+    const message = formatApiDetail(body.message);
+    if (message) return message;
+    const error = formatApiDetail(body.error);
+    if (error) return error;
   } catch {
     // Ignore parse failures and use fallback.
   }

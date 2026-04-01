@@ -24,7 +24,7 @@ type RuntimeStep = {
   index: number;
   type: string;
   input?: Record<string, unknown>;
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "skipped" | "cancelled";
   message?: string | null;
   error?: string | null;
 };
@@ -32,7 +32,7 @@ type RuntimeStep = {
 type RunState = {
   run_id: string;
   run_name: string;
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "cancelled";
   summary?: string | null;
   report_artifact?: string | null;
   steps: RuntimeStep[];
@@ -121,10 +121,52 @@ const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
   process.env.NEXT_PUBLIC_SHOW_ADVANCED_INPUTS?.trim().toLowerCase() === "true";
 
+function formatApiDetail(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail.trim();
+  }
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => formatApiDetail(item))
+      .filter((item) => Boolean(item));
+    if (parts.length) return parts.join("; ");
+    return "";
+  }
+  if (detail && typeof detail === "object") {
+    const payload = detail as Record<string, unknown>;
+    const directMessage =
+      (typeof payload.message === "string" && payload.message.trim())
+      || (typeof payload.error === "string" && payload.error.trim())
+      || (typeof payload.detail === "string" && payload.detail.trim());
+    const validationErrors = Array.isArray(payload.validation_errors)
+      ? payload.validation_errors.map((item) => formatApiDetail(item)).filter((item) => Boolean(item))
+      : [];
+    const rejectionReasons = Array.isArray(payload.rejection_reasons)
+      ? payload.rejection_reasons.map((item) => formatApiDetail(item)).filter((item) => Boolean(item))
+      : [];
+    const parts = [directMessage, ...validationErrors, ...rejectionReasons].filter((item) => Boolean(item));
+    if (parts.length) return parts.join("; ");
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return String(detail);
+    }
+  }
+  if (detail === null || detail === undefined) {
+    return "";
+  }
+  return String(detail);
+}
+
 async function parseError(response: Response): Promise<string> {
   try {
-    const body = (await response.json()) as { detail?: string };
-    if (body.detail) return body.detail;
+    const body = (await response.json()) as { detail?: unknown; message?: unknown; error?: unknown };
+    const detail = formatApiDetail(body.detail);
+    if (detail) return detail;
+    const message = formatApiDetail(body.message);
+    if (message) return message;
+    const error = formatApiDetail(body.error);
+    if (error) return error;
   } catch {
     // Ignore parse failures and use fallback message.
   }
@@ -153,6 +195,11 @@ function statusClass(status: RunState["status"] | RuntimeStep["status"] | undefi
   if (status === "running") return styles.statusRunning;
   if (status === "cancelled") return styles.statusCancelled;
   return styles.statusPending;
+}
+
+function firstFailedStep(run: RunState | null): RuntimeStep | null {
+  if (!run) return null;
+  return run.steps.find((step) => step.status === "failed" || step.status === "waiting_for_input") ?? null;
 }
 
 function formatStepType(stepType: string): string {
@@ -516,7 +563,10 @@ export default function Home() {
     const shouldPoll = !isTerminal(currentRun.status) || !currentRun.report_artifact;
     if (!shouldPoll) return;
 
-    const interval = setInterval(async () => {
+    let cancelled = false;
+    const pollDelayMs = !isTerminal(currentRun.status) ? 350 : 900;
+
+    const pollRun = async (): Promise<void> => {
       try {
         const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}`, {
           cache: "no-store",
@@ -524,13 +574,23 @@ export default function Home() {
         });
         if (!response.ok) return;
         const payload = (await response.json()) as RunState;
-        setCurrentRun(payload);
+        if (!cancelled) {
+          setCurrentRun(payload);
+        }
       } catch {
         // Poll errors are ignored while run is active.
       }
-    }, 1200);
+    };
 
-    return () => clearInterval(interval);
+    void pollRun();
+    const interval = setInterval(() => {
+      void pollRun();
+    }, pollDelayMs);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [currentRun]);
 
   useEffect(() => {
@@ -1040,6 +1100,28 @@ export default function Home() {
         setSelectedFolderId(detail.parent_folder_id ?? null);
       }
 
+      if (
+        currentRun &&
+        currentRunSourceTestCaseId === testCaseId &&
+        (currentRun.status === "failed" || currentRun.status === "waiting_for_input") &&
+        firstFailedStep(currentRun)
+      ) {
+        const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/resume`, {
+          method: "POST",
+          headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
+          body: JSON.stringify({
+            run_name: `${currentRun.run_name} [resume]`,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(await parseError(response));
+        }
+        const resumed = (await response.json()) as RunState;
+        setCurrentRun(resumed);
+        setRequestInfo(`Resumed from failed step: ${resumed.run_name}`);
+        return;
+      }
+
       const response = await fetch(`${API_BASE_URL}/api/test-cases/${testCaseId}/run`, {
         method: "POST",
         headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
@@ -1175,14 +1257,11 @@ export default function Home() {
           throw new Error(await parseError(updateResponse));
         }
 
-        const rerunResponse = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
+        const rerunResponse = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/steps/${step.step_id}/selector`, {
           method: "POST",
           headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
           body: JSON.stringify({
-            step_index: step.index,
-            field: stepField,
             selector: selectorValue,
-            run_name: `${currentRun.run_name} [resume-step-${step.index + 1}]`,
           }),
         });
         if (!rerunResponse.ok) {
@@ -1191,18 +1270,15 @@ export default function Home() {
         const run = (await rerunResponse.json()) as RunState;
         setCurrentRun(run);
         setRequestInfo(
-          `Selector updated in saved test case. Resumed from step #${step.index + 1}: ${run.run_id}`,
+          `Selector updated in saved test case. Continuing step #${step.index + 1} in run ${run.run_id}.`,
         );
         await loadTestCases({ silent: true });
       } else {
-        const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/recover-selector`, {
+        const response = await fetch(`${API_BASE_URL}/api/runs/${currentRun.run_id}/steps/${step.step_id}/selector`, {
           method: "POST",
           headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
           body: JSON.stringify({
-            step_index: step.index,
-            field: stepField,
             selector: selectorValue,
-            run_name: `${currentRun.run_name} [selector-fix]`,
           }),
         });
         if (!response.ok) {
@@ -1212,7 +1288,7 @@ export default function Home() {
         setCurrentRun(run);
         setCurrentRunSourceTestCaseId(null);
         setRequestInfo(
-          `Selector updated. Resumed from step #${step.index + 1}: ${run.run_id}`,
+          `Selector updated. Continuing step #${step.index + 1} in run ${run.run_id}.`,
         );
       }
     } catch (error) {
@@ -1909,8 +1985,8 @@ export default function Home() {
                       <div className={styles.selectorFixBox}>
                         <p className={styles.selectorFixTitle}>Selector Recovery</p>
                         <p className={styles.selectorFixHint}>
-                          Paste a corrected selector from your inspector tool and rerun directly.
-                          {!currentRunSourceTestCaseId ? " This applies to the new rerun." : ""}
+                          Paste a corrected selector from your inspector tool and continue this step directly.
+                          {currentRunSourceTestCaseId ? " The saved test case will also be updated." : ""}
                         </p>
                         <div className={styles.selectorFixRow}>
                           <input
@@ -1930,7 +2006,7 @@ export default function Home() {
                             onClick={() => void applySelectorFixAndRerun(step)}
                             disabled={Boolean(selectorFixBusyByStepId[step.step_id])}
                           >
-                            {selectorFixBusyByStepId[step.step_id] ? "Applying..." : "Apply & Rerun"}
+                            {selectorFixBusyByStepId[step.step_id] ? "Applying..." : "Apply & Continue"}
                           </button>
                         </div>
                       </div>
