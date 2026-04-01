@@ -21,7 +21,7 @@ def utc_now() -> datetime:
 
 
 class TestCaseStore(Protocol):
-    def create_folder(self, request: FolderCreateRequest) -> FolderState:
+    def create_folder(self, request: FolderCreateRequest, user_id: int) -> FolderState:
         ...
 
     def get_folder(self, folder_id: str) -> FolderState | None:
@@ -36,7 +36,7 @@ class TestCaseStore(Protocol):
     def persist_folder(self, folder: FolderState) -> None:
         ...
 
-    def create(self, request: TestCaseCreateRequest) -> TestCaseState:
+    def create(self, request: TestCaseCreateRequest, user_id: int) -> TestCaseState:
         ...
 
     def get(self, test_case_id: str) -> TestCaseState | None:
@@ -58,10 +58,11 @@ class InMemoryTestCaseStore:
         self._cases: dict[str, TestCaseState] = {}
         self._folders: dict[str, FolderState] = {}
 
-    def create_folder(self, request: FolderCreateRequest) -> FolderState:
+    def create_folder(self, request: FolderCreateRequest, user_id: int) -> FolderState:
         now = utc_now()
         folder = FolderState(
             name=request.name,
+            user_id=user_id,
             parent_folder_id=request.parent_folder_id,
             created_at=now,
             updated_at=now,
@@ -90,12 +91,13 @@ class InMemoryTestCaseStore:
         with self._lock:
             self._folders[folder.folder_id] = folder
 
-    def create(self, request: TestCaseCreateRequest) -> TestCaseState:
+    def create(self, request: TestCaseCreateRequest, user_id: int) -> TestCaseState:
         now = utc_now()
         test_case = TestCaseState(
             name=request.name,
             description=request.description,
             prompt=request.prompt,
+            user_id=user_id,
             parent_folder_id=request.parent_folder_id,
             start_url=request.start_url,
             test_data=request.test_data,
@@ -121,6 +123,7 @@ class InMemoryTestCaseStore:
                     name=item.name,
                     description=item.description,
                     prompt=item.prompt,
+                    user_id=item.user_id,
                     parent_folder_id=item.parent_folder_id,
                     start_url=item.start_url,
                     step_count=len(item.steps),
@@ -151,13 +154,13 @@ class SqliteTestCaseStore(InMemoryTestCaseStore):
         self._init_db()
         self._load_from_db()
 
-    def create(self, request: TestCaseCreateRequest) -> TestCaseState:
-        test_case = super().create(request)
+    def create(self, request: TestCaseCreateRequest, user_id: int) -> TestCaseState:
+        test_case = super().create(request, user_id)
         self._save_test_case(test_case)
         return test_case
 
-    def create_folder(self, request: FolderCreateRequest) -> FolderState:
-        folder = super().create_folder(request)
+    def create_folder(self, request: FolderCreateRequest, user_id: int) -> FolderState:
+        folder = super().create_folder(request, user_id)
         self._save_folder(folder)
         return folder
 

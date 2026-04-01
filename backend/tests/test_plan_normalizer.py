@@ -38,6 +38,23 @@ def test_normalize_verify_text_maps_text_to_value() -> None:
     assert steps[0]["match"] == "contains"
 
 
+def test_normalize_verify_text_maps_message_and_builds_text_selector() -> None:
+    steps = normalize_plan_steps(
+        [
+            {
+                "type": "verify_text",
+                "message": "Passwords must match",
+            }
+        ],
+        max_steps=10,
+    )
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "verify_text"
+    assert steps[0]["selector"] == "text=Passwords must match"
+    assert steps[0]["value"] == "Passwords must match"
+
+
 def test_normalize_alias_types() -> None:
     steps = normalize_plan_steps(
         [
