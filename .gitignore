@@ -46,3 +46,7 @@ artifacts/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local tooling / runtime output
+.claude/
+backend/logs/
