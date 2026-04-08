@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from app.config import Settings
+from app.llm.utils import (
+    build_element_hint_clause,
+    extract_json_object,
+    extract_selector_list,
+    fallback_plan,
+    normalize_plan,
+)
 
 
 class OpenAIProvider:
@@ -46,7 +52,7 @@ class OpenAIProvider:
 
     async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
         if not self._settings.openai_api_key:
-            return self._fallback_plan(task, max_steps)
+            return fallback_plan(task, max_steps)
 
         completion = await self._client.responses.create(
             model=self.model_name,
@@ -75,15 +81,15 @@ class OpenAIProvider:
         text = completion.output_text or ""
         if text.strip():
             try:
-                payload = self._extract_json_object(text)
-                normalized = self._normalize_plan(payload, task, max_steps)
+                payload = extract_json_object(text)
+                normalized = normalize_plan(payload, task, max_steps)
                 normalized["raw_llm_response"] = text
                 return normalized
             except Exception:
                 pass
-        fallback = self._fallback_plan(task, max_steps)
-        fallback["raw_llm_response"] = text or None
-        return fallback
+        result = fallback_plan(task, max_steps)
+        result["raw_llm_response"] = text or None
+        return result
 
     async def suggest_selectors(
         self,
@@ -94,10 +100,12 @@ class OpenAIProvider:
         page: dict[str, Any],
         text_hint: str | None = None,
         max_candidates: int = 3,
+        element_hint: dict[str, Any] | None = None,
     ) -> list[str]:
         if not self._settings.openai_api_key:
             return []
 
+        hint_clause = build_element_hint_clause(element_hint)
         completion = await self._client.responses.create(
             model=self.model_name,
             input=[
@@ -108,7 +116,8 @@ class OpenAIProvider:
                         "Return ONLY strict JSON like {\"selectors\":[\"...\"]}. "
                         "Prefer Playwright-compatible CSS/text selectors grounded in the provided DOM summary. "
                         "Use page.interactive_elements as the primary grounding source (tags, roles, ids, names, placeholders, text, aria labels, href, scope). "
-                        "Do not rely only on page URL or title."
+                        + (f"IMPORTANT: The target element identity is known: {hint_clause} — prioritise matching these attributes. " if hint_clause else "")
+                        + "Do not rely only on page URL or title."
                     ),
                 },
                 {
@@ -119,6 +128,7 @@ class OpenAIProvider:
                             "failed_selector": failed_selector,
                             "error_message": error_message,
                             "text_hint": text_hint or "",
+                            "element_hint": element_hint or {},
                             "page": page,
                             "max_candidates": max_candidates,
                         }
@@ -127,145 +137,4 @@ class OpenAIProvider:
             ],
             max_output_tokens=220,
         )
-        text = completion.output_text or ""
-        return self._extract_selector_list(text, max_candidates)
-
-    @staticmethod
-    def _extract_json_object(text: str) -> dict[str, Any]:
-        stripped = text.strip()
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-
-        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-        if match:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        raise ValueError("No valid JSON object found in plan response")
-
-    @staticmethod
-    def _normalize_plan(payload: dict[str, Any], task: str, max_steps: int) -> dict[str, Any]:
-        run_name = payload.get("run_name")
-        if not isinstance(run_name, str) or not run_name.strip():
-            run_name = f"ai-plan-{task[:24].strip() or 'run'}"
-        run_name = run_name.strip()[:80]
-
-        start_url = payload.get("start_url")
-        if not isinstance(start_url, str) or not start_url.strip():
-            start_url = None
-        else:
-            start_url = start_url.strip()
-
-        steps_raw = payload.get("steps")
-        steps: list[dict[str, Any]] = []
-        if isinstance(steps_raw, list):
-            for step in steps_raw:
-                if not isinstance(step, dict):
-                    continue
-                step_type = step.get("type")
-                if step_type not in {
-                    "navigate",
-                    "click",
-                    "type",
-                    "select",
-                    "drag",
-                    "scroll",
-                    "wait",
-                    "handle_popup",
-                    "verify_text",
-                    "verify_image",
-                }:
-                    continue
-                steps.append(step)
-                if len(steps) >= max_steps:
-                    break
-
-        steps = OpenAIProvider._enforce_task_constraints(task, steps, max_steps)
-
-        if not steps:
-            return OpenAIProvider._fallback_plan(task, max_steps)
-
-        return {
-            "run_name": run_name,
-            "start_url": start_url,
-            "steps": steps,
-        }
-
-    @staticmethod
-    def _extract_selector_list(text: str, max_candidates: int) -> list[str]:
-        if not text.strip():
-            return []
-        try:
-            payload = OpenAIProvider._extract_json_object(text)
-            selectors = payload.get("selectors", [])
-            if isinstance(selectors, list):
-                return [str(item).strip() for item in selectors if str(item).strip()][:max_candidates]
-        except Exception:
-            pass
-        return []
-
-    @staticmethod
-    def _fallback_plan(task: str, max_steps: int) -> dict[str, Any]:
-        url_match = re.search(r"https?://[^\s]+", task)
-        start_url = url_match.group(0) if url_match else "https://example.com"
-        steps = [
-            {"type": "wait", "until": "load_state", "load_state": "load", "ms": 10000},
-            {"type": "verify_text", "selector": "h1", "match": "contains", "value": "Example"},
-        ]
-        return {
-            "run_name": "ai-generated-run",
-            "start_url": start_url,
-            "steps": steps[:max(1, max_steps)],
-            "raw_llm_response": None,
-        }
-
-    @staticmethod
-    def _enforce_task_constraints(
-        task: str,
-        steps: list[dict[str, Any]],
-        max_steps: int,
-    ) -> list[dict[str, Any]]:
-        task_lower = task.lower()
-
-        if "image" in task_lower and not any(step.get("type") == "verify_image" for step in steps):
-            image_step: dict[str, Any] = {"type": "verify_image"}
-
-            baseline_match = re.search(
-                r"(artifacts/[^\s\"']+\.(?:png|jpg|jpeg))",
-                task,
-                flags=re.IGNORECASE,
-            )
-            if baseline_match:
-                image_step["baseline_path"] = baseline_match.group(1)
-
-            threshold_match = re.search(
-                r"threshold\s*[:=]?\s*([0-9]*\.?[0-9]+)",
-                task,
-                flags=re.IGNORECASE,
-            )
-            if threshold_match:
-                try:
-                    image_step["threshold"] = float(threshold_match.group(1))
-                except ValueError:
-                    pass
-
-            selector_match = re.search(
-                r"image(?:\s+verification)?\s+on\s+([#.\w:-]+)",
-                task,
-                flags=re.IGNORECASE,
-            )
-            if selector_match:
-                image_step["selector"] = selector_match.group(1)
-
-            if len(steps) < max_steps:
-                steps.append(image_step)
-            elif steps:
-                steps[-1] = image_step
-            else:
-                steps = [image_step]
-
-        return steps
+        return extract_selector_list(completion.output_text or "", max_candidates)

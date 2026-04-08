@@ -27,6 +27,8 @@ type RuntimeStep = {
   status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "skipped" | "cancelled";
   message?: string | null;
   error?: string | null;
+  user_input_kind?: string | null;
+  user_input_prompt?: string | null;
 };
 
 type RunState = {
@@ -1981,11 +1983,13 @@ export default function Home() {
                         {currentRun.run_id}
                       </p>
                     ) : null}
-                    {step.status === "failed" && editableSelectorField(step) ? (
+                    {(step.status === "failed" || (step.status === "waiting_for_input" && step.user_input_kind === "selector")) && editableSelectorField(step) ? (
                       <div className={styles.selectorFixBox}>
                         <p className={styles.selectorFixTitle}>Selector Recovery</p>
                         <p className={styles.selectorFixHint}>
-                          Paste a corrected selector from your inspector tool and continue this step directly.
+                          {step.user_input_prompt
+                            ? step.user_input_prompt
+                            : "Paste a corrected selector from your inspector tool and continue this step directly."}
                           {currentRunSourceTestCaseId ? " The saved test case will also be updated." : ""}
                         </p>
                         <div className={styles.selectorFixRow}>

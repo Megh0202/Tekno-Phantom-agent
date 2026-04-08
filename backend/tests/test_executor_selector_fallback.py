@@ -1128,6 +1128,81 @@ def test_selector_candidates_prioritize_amazon_second_result_targets() -> None:
     assert "h2 a" not in candidates
 
 
+@pytest.mark.asyncio
+async def test_assert_step_page_state_fails_when_natural_language_target_is_not_on_current_page() -> None:
+    executor = _executor()
+    snapshot = {
+        "url": "https://example.com/login",
+        "title": "Login",
+        "text_excerpt": "Sign in to continue",
+        "interactive_elements": [
+            {
+                "tag": "input",
+                "role": "textbox",
+                "text": "",
+                "name": "username",
+                "id": "username",
+                "visible": True,
+                "enabled": True,
+                "scope": "form",
+            },
+            {
+                "tag": "button",
+                "role": "button",
+                "text": "Sign In",
+                "name": "login",
+                "id": "login",
+                "visible": True,
+                "enabled": True,
+                "scope": "form",
+            },
+        ],
+        "page_count": 1,
+    }
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "Create Form"},
+    )
+    intent = executor._build_step_intent("click", "Create Form")
+
+    with pytest.raises(ValueError, match="Page state assertion failed before click"):
+        await executor._assert_step_page_state(
+            RunState(run_name="guard-test", steps=[]),
+            step,
+            snapshot,
+            intent,
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_step_page_state_skips_explicit_selector_without_live_match() -> None:
+    executor = _executor()
+    snapshot = {
+        "url": "https://example.com/login",
+        "title": "Login",
+        "text_excerpt": "Sign in to continue",
+        "interactive_elements": [],
+        "page_count": 1,
+    }
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={"type": "click", "selector": "#create-form"},
+    )
+    intent = executor._build_step_intent("click", "#create-form")
+
+    result = await executor._assert_step_page_state(
+        RunState(run_name="guard-test", steps=[]),
+        step,
+        snapshot,
+        intent,
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "explicit_selector"
+
+
 def test_step_intent_infers_amazon_result_ordinal_from_widget_selector() -> None:
     executor = _executor()
 
@@ -1483,6 +1558,17 @@ def test_simple_actions_use_single_selector_cycle() -> None:
     assert executor._effective_selector_recovery_attempts("click", 12) == 2
 
 
+def test_explicit_selector_detection_keeps_only_strong_stable_selectors() -> None:
+    executor = _executor()
+
+    assert executor._looks_like_explicit_selector("#username") is True
+    assert executor._looks_like_explicit_selector("input[name='search_query']") is True
+    assert executor._looks_like_explicit_selector("xpath=//button[@type='submit']") is True
+    assert executor._looks_like_explicit_selector("ytd-video-renderer:first-of-type a[id='video-title']") is False
+    assert executor._looks_like_explicit_selector("a:has-text('Logout')") is False
+    assert executor._looks_like_explicit_selector("input[name='email'], input[type='email'], #email") is False
+
+
 def test_simple_type_skips_live_candidates() -> None:
     executor = _executor()
 
@@ -1666,6 +1752,102 @@ def test_login_click_hang_fails_instead_of_claiming_post_login_success() -> None
                 },
             )
         )
+
+
+def test_grounded_selection_stops_on_wrong_page_before_profile_guessing() -> None:
+    executor = _executor(step_timeout_seconds=4)
+    call_count = 0
+
+    class _Browser:
+        async def inspect_page(self, include_screenshot: bool = True) -> dict[str, object]:
+            return {
+                "url": "https://example.com/login",
+                "title": "Login",
+                "text_excerpt": "Sign in to continue",
+                "interactive_elements": [
+                    {
+                        "tag": "input",
+                        "role": "textbox",
+                        "name": "username",
+                        "id": "username",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "form",
+                    },
+                    {
+                        "tag": "button",
+                        "role": "button",
+                        "text": "Sign In",
+                        "name": "login",
+                        "id": "login",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "form",
+                    },
+                ],
+                "page_count": 1,
+            }
+
+    executor._browser = _Browser()
+
+    async def operation(selector: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        return f"Clicked {selector}"
+
+    with pytest.raises(ValueError, match="Grounded selection failed"):
+        asyncio.run(
+            executor._run_with_selector_fallback(
+                raw_selector="{{selector.create_form}}",
+                step_type="click",
+                selector_profile={},
+                test_data={},
+                run_domain="test.vitaone.io",
+                operation=operation,
+            )
+        )
+
+    assert call_count == 0
+
+
+def test_grounded_selection_prefers_live_page_match_over_profile_guess() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    class _Browser:
+        async def inspect_page(self, include_screenshot: bool = True) -> dict[str, object]:
+            return {
+                "url": "https://example.com/forms",
+                "title": "Forms",
+                "text_excerpt": "Create Form",
+                "interactive_elements": [
+                    {
+                        "tag": "button",
+                        "role": "button",
+                        "text": "Create Form",
+                        "name": "createFormLive",
+                        "id": "create-form-live",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "main",
+                    }
+                ],
+                "page_count": 1,
+            }
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._run_with_selector_fallback(
+            raw_selector="{{selector.create_form}}",
+            step_type="click",
+            selector_profile={},
+            test_data={},
+            run_domain="test.vitaone.io",
+            operation=lambda selector: asyncio.sleep(0, result=f"Clicked {selector}"),
+        )
+    )
+
+    assert result == "Clicked #create-form-live"
 
 
 def test_transition_canvas_click_short_circuits_when_label_is_visible() -> None:

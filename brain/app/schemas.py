@@ -30,6 +30,11 @@ class SelectorSuggestionRequest(BaseModel):
     page: dict[str, Any]
     text_hint: str | None = Field(default=None, max_length=500)
     max_candidates: int = Field(default=3, ge=1, le=8)
+    # Semantic fingerprint of the target element captured by the perception
+    # layer before the selector was attempted.  Provides the LLM with a
+    # precise identity description (tag, role, visible text, aria-label,
+    # testid, name, placeholder) so it can ground suggestions directly.
+    element_hint: dict[str, Any] | None = Field(default=None)
 
 
 class SelectorSuggestionResponse(BaseModel):

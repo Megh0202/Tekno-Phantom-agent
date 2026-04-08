@@ -218,7 +218,15 @@ def _parse_line(
     quoted = _first_quoted(line)
     url = _extract_url(line)
 
-    if url and any(token in lower for token in ("launch", "open", "navigate", "visit", "go to")):
+    if url and (
+        any(token in lower for token in (
+            "launch", "open", "navigate", "visit", "go to",
+            # Handle truncated "launch" (e.g. "unch the application") and
+            # common synonyms so a single missing character doesn't drop the step.
+            "application", "app", "browser", "url", "site", "page",
+        ))
+        or lower.strip().startswith("http")   # bare URL line
+    ):
         return {"type": "navigate", "url": url}
 
     if any(token in lower for token in ("enter email", "type email", "email -", "email:", "into email", "email field")):
@@ -438,6 +446,23 @@ def _parse_line(
     explicit_click = _parse_explicit_click(line)
     if explicit_click is not None:
         return explicit_click
+
+    # "Select 'Short answer' field" (standalone, without drag/drop keywords)
+    # generates a click on the palette item — required by some form builders
+    # before the element can be dragged to the canvas.
+    if (
+        any(token in lower for token in ("select", "choose", "pick"))
+        and not any(token in lower for token in ("drag", "drop", "status", "category", "option type", "from status", "to status"))
+    ):
+        if any(token in lower for token in ("short answer", "short-answer", "short_answer")):
+            return {"type": "click", "selector": "{{selector.short_answer_source}}"}
+        if "email" in lower and "field" in lower and "password" not in lower:
+            return {"type": "click", "selector": "{{selector.email_field_source}}"}
+        # Generic quoted field name → click on a draggable palette item by text
+        field_label = _extract_drag_field_label(line)
+        if field_label:
+            escaped = field_label.replace('"', '\\"')
+            return {"type": "click", "selector": f"[draggable='true']:has-text(\"{escaped}\")"}
 
     if "drag" in lower and (
         "drop" in lower
@@ -661,6 +686,8 @@ def _extract_form_name_value(text: str) -> str:
     if quoted:
         normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
         normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("{{timestamp}}", "{{NOW_YYYYMMDD_HHMMSS}}")
+        normalized = normalized.replace("{timestamp}", "{{NOW_YYYYMMDD_HHMMSS}}")
         return normalized
     return "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}"
 
@@ -919,9 +946,18 @@ def _enforce_form_create_sequence(
     if has_create_click_after:
         return steps
 
-    create_sequence = [{"type": "click", "selector": "{{selector.create_form_confirm}}"}]
-    if auto_create_confirm_wait_ms > 0:
-        create_sequence.append({"type": "wait", "until": "timeout", "ms": auto_create_confirm_wait_ms})
+    create_sequence: list[dict[str, Any]] = [
+        {"type": "click", "selector": "{{selector.create_form_confirm}}"},
+        # Wait for the form builder canvas to become visible before attempting
+        # any builder interactions (drag, label type, checkbox clicks).
+        # selector_visible is more reliable than a fixed timeout.
+        {
+            "type": "wait",
+            "until": "selector_visible",
+            "selector": "{{selector.form_canvas_target}}",
+            "ms": max(auto_create_confirm_wait_ms * 6, 2500),
+        },
+    ]
     merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
     return merged[:max_steps]
 

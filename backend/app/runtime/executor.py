@@ -20,6 +20,13 @@ from app.config import Settings
 from app.mcp.browser_client import BrowserMCPClient
 from app.mcp.filesystem_client import FileSystemClient
 from app.runtime.plan_normalizer import normalize_plan_steps
+from app.runtime.perception import (
+    ElementIndex,
+    PerceptionMatch,
+    build_element_index,
+    find_best_match,
+    find_by_signatures,
+)
 from app.runtime.selector_memory import SelectorMemoryStore
 from app.runtime.store import RunStore
 from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
@@ -538,6 +545,14 @@ class CandidateConfidence:
     retained_count: int
 
 
+@dataclass(frozen=True)
+class GroundedCandidate:
+    score: int
+    order: int
+    selectors: list[str]
+    element: dict[str, Any]
+
+
 class _FastPathEscalation(Exception):
     pass
 
@@ -571,9 +586,17 @@ class AgentExecutor:
     async def execute(self, run_id: str) -> None:
         run = self._run_store.get(run_id)
         if not run:
+            LOGGER.warning("execute() called for unknown run_id=%s", run_id)
             return
 
         is_new_run = run.started_at is None
+        LOGGER.info(
+            "Run %s: starting execution (mode=%s, steps=%d, url=%s)",
+            run_id,
+            run.execution_mode,
+            len(run.steps),
+            run.start_url or "",
+        )
         run.test_data = self._initialize_runtime_test_data(run.test_data or {})
         run.status = RunStatus.running
         if is_new_run:
@@ -607,6 +630,7 @@ class AgentExecutor:
             if run.status == RunStatus.running:
                 run.status = RunStatus.failed if has_step_failure else RunStatus.completed
                 self._run_store.persist(run)
+                LOGGER.info("Run %s: finished with status=%s", run_id, run.status.value)
 
             if run.status != RunStatus.waiting_for_input:
                 summary_text = self._build_summary(run)
@@ -642,7 +666,22 @@ class AgentExecutor:
                 self._run_store.persist(run)
                 break
 
+            LOGGER.info(
+                "Run %s: step %d/%d type=%s selector=%r",
+                run.run_id,
+                step.index + 1,
+                len(run.steps),
+                step.type,
+                step.input.get("selector", "") if step.input else "",
+            )
             await self._execute_step(run, step)
+            LOGGER.info(
+                "Run %s: step %d done status=%s message=%r",
+                run.run_id,
+                step.index + 1,
+                step.status.value,
+                (step.message or "")[:120],
+            )
             self._run_store.persist(run)
             if step.status == StepStatus.waiting_for_input:
                 run.status = RunStatus.waiting_for_input
@@ -959,14 +998,23 @@ class AgentExecutor:
 
         selector = str(raw_step["selector"])
         text_hint = self._step_text_hint(raw_step)
-        resolved_selector = classification.get("primary_selector") or await self._resolve_selector(
-            selector,
-            step_type,
-            selector_profile,
-            test_data,
-            run_domain,
-            text_hint,
+        # Prefer perception-grounded selector (identified from live DOM) over
+        # the classification's profile-generated primary_selector.
+        grounded = raw_step.get("_grounded_selector")
+        resolved_selector = (
+            grounded
+            or classification.get("primary_selector")
+            or await self._resolve_selector(
+                selector,
+                step_type,
+                selector_profile,
+                test_data,
+                run_domain,
+                text_hint,
+            )
         )
+        if grounded:
+            LOGGER.debug("Fast path: using perception-grounded selector=%r for step_type=%s", grounded, step_type)
         active_step = self._active_step_state()
         if active_step is not None:
             active_step.provided_selector = resolved_selector
@@ -1054,6 +1102,16 @@ class AgentExecutor:
                 resolved_selector=resolved_selector,
                 text_hint=text_hint,
             )
+            # Store the element signature so future runs can use signature-based
+            # recovery even when the fast path is taken (perception may have
+            # grounded the element; if not, _remember_selector_signature returns
+            # early and the post-success extraction in _execute_step fills the gap).
+            self._remember_selector_signature(
+                run_domain=run_domain,
+                step_type=step_type,
+                raw_selector=selector,
+                text_hint=text_hint,
+            )
             trace_group["result"] = result
             self._record_group_attempt(
                 trace_group,
@@ -1083,6 +1141,52 @@ class AgentExecutor:
                 },
             )
             raise _FastPathEscalation(self._compact_error(exc)) from exc
+
+    async def _perceive_before_act(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        snapshot: dict[str, Any] | None = None,
+    ) -> PerceptionMatch | None:
+        """
+        Identify the live DOM element that best matches this step's intent
+        BEFORE attempting any selector.
+
+        Pass *snapshot* to reuse an already-fetched inspect_page() result
+        (zero extra cost).  If omitted, a fresh inspect_page() call is made.
+
+        Returns a PerceptionMatch on confident identification.
+        Returns None when the page is empty, intent is too vague, or no
+        element scores high enough — the existing pipeline handles those.
+        """
+        step_input = step.input or {}
+        raw_selector = str(step_input.get("selector", "")).strip()
+        text_hint = self._step_text_hint(step_input)
+
+        intent_text = " ".join(p for p in [raw_selector, text_hint or ""] if p).strip()
+        if not intent_text:
+            return None
+
+        if snapshot is None:
+            try:
+                snapshot = await asyncio.wait_for(
+                    self._browser.inspect_page(include_screenshot=False),
+                    timeout=4.0,
+                )
+            except Exception as exc:
+                LOGGER.debug("Perception: inspect_page failed (step %d): %s", step.index + 1, exc)
+                return None
+
+        element_index = build_element_index(snapshot)
+        if element_index.count == 0:
+            LOGGER.debug("Perception: no interactive elements at step %d", step.index + 1)
+            return None
+
+        return find_best_match(
+            intent_text=intent_text,
+            step_type=step.type,
+            element_index=element_index,
+        )
 
     async def _execute_step(self, run: RunState, step: StepRuntimeState) -> None:
         step_started_perf = perf_counter()
@@ -1117,6 +1221,81 @@ class AgentExecutor:
         step_token = self._step_state_context.set(step)
 
         try:
+            before_snapshot = await self._safe_page_snapshot()
+            step_trace["page_state_before"] = self._summarize_page_state(before_snapshot)
+
+            # ------------------------------------------------------------------
+            # PRE-ACTION PAGE HEALTH CHECK
+            # Detect error pages, domain mismatches, blocking modals, and
+            # loading states BEFORE spending any time on selector attempts.
+            # ------------------------------------------------------------------
+            page_health = self._check_page_health(before_snapshot, run, step)
+            step_trace["page_health"] = page_health
+            if page_health["status"] == "block":
+                for issue in page_health.get("issues", []):
+                    LOGGER.error(
+                        "Run %s step %d (type=%s): pre-action health check BLOCKED [%s] %s",
+                        run.run_id, step.index + 1, step.type,
+                        issue["type"], issue["detail"],
+                    )
+                first_issue = (page_health.get("issues") or [{}])[0]
+                raise ValueError(
+                    f"Pre-action page health check failed ({first_issue.get('type', 'unknown')}): "
+                    f"{first_issue.get('detail', 'see logs')}"
+                )
+            elif page_health["status"] == "warn":
+                for issue in page_health.get("issues", []):
+                    LOGGER.warning(
+                        "Run %s step %d (type=%s): pre-action health check WARN [%s] %s",
+                        run.run_id, step.index + 1, step.type,
+                        issue["type"], issue["detail"],
+                    )
+
+            page_assertion = await self._assert_step_page_state(run, step, before_snapshot, step_intent)
+            if page_assertion:
+                step_trace["page_state_assertion"] = page_assertion
+
+            # ------------------------------------------------------------------
+            # PERCEIVE FIRST — reuse the already-fetched page snapshot (zero
+            # extra network/browser cost) to identify the target element from
+            # what is actually visible on the page right now.
+            # ------------------------------------------------------------------
+            if step.type in {"click", "type", "select"} and before_snapshot:
+                perception_match = await self._perceive_before_act(
+                    run, step, snapshot=before_snapshot
+                )
+                if perception_match is not None:
+                    step_trace["perception"] = {
+                        "confidence": perception_match.confidence,
+                        "score": perception_match.score,
+                        "grounded_selector": perception_match.selector,
+                        "alternative_count": perception_match.alternative_count,
+                        "element_text": perception_match.element.text[:80],
+                        "element_tag": perception_match.element.tag,
+                        "element_role": perception_match.element.role,
+                    }
+                    if perception_match.confidence in {"unique", "high", "medium"}:
+                        step.input = {
+                            **step.input,
+                            "_grounded_selector": perception_match.selector,
+                            "_grounded_signature": perception_match.element.signature(),
+                        }
+                        LOGGER.info(
+                            "Run %s step %d (type=%s): perception GROUNDED selector=%r "
+                            "(confidence=%s score=%d alternatives=%d element=%r)",
+                            run.run_id, step.index + 1, step.type,
+                            perception_match.selector, perception_match.confidence,
+                            perception_match.score, perception_match.alternative_count,
+                            perception_match.element.text[:50],
+                        )
+                    elif perception_match.confidence == "ambiguous":
+                        LOGGER.warning(
+                            "Run %s step %d (type=%s): perception is AMBIGUOUS "
+                            "(top=%r alternatives=%d) — full fallback pipeline will run",
+                            run.run_id, step.index + 1, step.type,
+                            perception_match.selector, perception_match.alternative_count,
+                        )
+
             classification = self._classify_execution_path(run, step)
             step_trace["execution_path"] = classification.get("path")
             step_trace["execution_path_reason"] = classification.get("reason")
@@ -1127,11 +1306,22 @@ class AgentExecutor:
             }
 
             if classification.get("path") == "fast":
+                LOGGER.debug(
+                    "Run %s step %d type=%s: taking FAST path (reason=%s selector=%r)",
+                    run.run_id, step.index + 1, step.type,
+                    classification.get("reason"), classification.get("primary_selector", ""),
+                )
                 try:
                     message = await self._dispatch_fast_step(run, step.input, classification)
                     step_trace["execution_path"] = "fast"
                 except _FastPathEscalation as fast_exc:
-                    step_trace["fast_path_error"] = self._compact_error(fast_exc)
+                    fast_error = self._compact_error(fast_exc)
+                    step_trace["fast_path_error"] = fast_error
+                    LOGGER.warning(
+                        "Run %s step %d type=%s: fast path failed (%s), escalating to slow path. selector=%r",
+                        run.run_id, step.index + 1, step.type,
+                        fast_error, step.input.get("selector", ""),
+                    )
                     if step.type != "handle_popup":
                         await self._auto_handle_known_popups(run)
                     message = await asyncio.wait_for(
@@ -1140,6 +1330,11 @@ class AgentExecutor:
                     )
                     step_trace["execution_path"] = "fast->slow"
             else:
+                LOGGER.debug(
+                    "Run %s step %d type=%s: taking SLOW path (reason=%s selector=%r)",
+                    run.run_id, step.index + 1, step.type,
+                    classification.get("reason"), step.input.get("selector", ""),
+                )
                 if step.type != "handle_popup":
                     await self._auto_handle_known_popups(run)
                 message = await asyncio.wait_for(
@@ -1147,9 +1342,55 @@ class AgentExecutor:
                     timeout=self._settings.step_timeout_seconds,
                 )
                 step_trace["execution_path"] = "slow"
+            outcome_verification = await self._verify_step_outcome_against_page_state(
+                run,
+                step,
+                message,
+                before_snapshot=before_snapshot,
+            )
+            step_trace["page_state_verification"] = outcome_verification
+            step_trace["page_state_after"] = outcome_verification.get("after_state")
             step.status = StepStatus.completed
             step.message = message
             step_trace["result"] = message
+
+            # ------------------------------------------------------------------
+            # POST-SUCCESS SIGNATURE CAPTURE
+            # If perception did not run (or was ambiguous) for this step, the
+            # element signature was never stored.  We extract it now from the
+            # pre-action page snapshot using the winning selector so that future
+            # runs can use signature-based recovery instead of immediately falling
+            # through to LLM recovery.
+            # ------------------------------------------------------------------
+            if (
+                step.type in {"click", "type", "select"}
+                and before_snapshot
+                and step.provided_selector
+                and not step.input.get("_grounded_signature")
+            ):
+                extracted_sig = self._extract_signature_from_snapshot(
+                    step.provided_selector, before_snapshot
+                )
+                if extracted_sig:
+                    raw_sel = str((step.input or {}).get("selector", step.provided_selector)).strip()
+                    text_hint_val = self._step_text_hint(step.input or {})
+                    run_domain_val = self._extract_run_domain(run)
+                    self._remember_selector_signature(
+                        run_domain=run_domain_val,
+                        step_type=step.type,
+                        raw_selector=raw_sel,
+                        text_hint=text_hint_val,
+                        signature=extracted_sig,
+                    )
+                    step_trace["snapshot_signature_captured"] = True
+                    LOGGER.debug(
+                        "Run %s step %d: captured element signature from snapshot "
+                        "(selector=%r tag=%r text=%r)",
+                        run.run_id, step.index + 1,
+                        step.provided_selector,
+                        extracted_sig.get("tag"), extracted_sig.get("text", "")[:40],
+                    )
+
             original_selector_request = step.input.get("_selector_help_original")
             if (
                 isinstance(original_selector_request, str)
@@ -1166,7 +1407,23 @@ class AgentExecutor:
         except Exception as exc:
             compact = self._compact_error(exc)
             step_trace["exception"] = compact
+            # Build root-cause chain for logging
+            root_cause = exc
+            cause_chain: list[str] = []
+            _walk = exc
+            while _walk is not None:
+                cause_chain.append(f"{type(_walk).__name__}: {_walk}")
+                _walk = getattr(_walk, "__cause__", None) or getattr(_walk, "__context__", None)
+                if _walk is exc:
+                    break
+            root_cause_str = " <- ".join(cause_chain)
+
             if self._should_request_selector_help(step, exc) and self._selector_help_mode() == "pause":
+                LOGGER.warning(
+                    "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
+                    run.run_id, step.index + 1, len(run.steps), step.type,
+                    step.input.get("selector", ""), root_cause_str,
+                )
                 step.status = StepStatus.waiting_for_input
                 step.error = compact
                 step.message = "Waiting for selector help"
@@ -1175,6 +1432,13 @@ class AgentExecutor:
                 step.user_input_prompt = self._build_selector_help_prompt(step)
                 step_trace["result"] = step.message
             else:
+                LOGGER.error(
+                    "Run %s step %d/%d (type=%s) FAILED. selector=%r provided_selector=%r "
+                    "error=%s root_cause=%s",
+                    run.run_id, step.index + 1, len(run.steps), step.type,
+                    step.input.get("selector", ""), step.provided_selector,
+                    compact, root_cause_str,
+                )
                 step.status = StepStatus.failed
                 if isinstance(exc, TimeoutError):
                     step.error = f"{compact} (step_type={step.type})"
@@ -1321,6 +1585,16 @@ class AgentExecutor:
         except Exception:
             return None
 
+        # Pull element signature from perception grounding (may be None if
+        # perception did not run or found no confident match for this step).
+        element_hint: dict | None = step.input.get("_grounded_signature") or None
+        if element_hint:
+            LOGGER.debug(
+                "LLM recovery: passing element_hint to brain (tag=%r text=%r aria=%r testid=%r)",
+                element_hint.get("tag"), element_hint.get("text"),
+                element_hint.get("aria"), element_hint.get("testid"),
+            )
+
         try:
             suggestions_started = perf_counter()
             suggestions = await self._brain.suggest_selectors(
@@ -1330,6 +1604,7 @@ class AgentExecutor:
                 page=page_snapshot,
                 text_hint=text_hint,
                 max_candidates=self._selector_llm_max_candidates(),
+                element_hint=element_hint,
             )
             suggestions_ms = self._elapsed_ms(suggestions_started)
         except Exception:
@@ -1618,6 +1893,11 @@ class AgentExecutor:
             return explicit
 
         lowered = raw_selector.strip().lower()
+        alias_match = re.search(r"\{\{\s*selector\.([a-z0-9_.-]+)\s*\}\}", lowered)
+        if alias_match:
+            alias_text = alias_match.group(1).replace(".", " ").replace("_", " ").replace("-", " ").strip()
+            if alias_text:
+                return alias_text
         for phrase in (
             "add to cart",
             "search",
@@ -1835,6 +2115,7 @@ class AgentExecutor:
                         raw_selector=selector,
                         text_hint=str(text_hint) if text_hint is not None else None,
                     ),
+                    grounded_selector=raw_step.get("_grounded_selector"),
                 )
                 if alias_key in {"login_button", "transition_canvas_label"}:
                     click_budget_s = max(
@@ -1936,6 +2217,7 @@ class AgentExecutor:
                     expected_text=text,
                     clear_first=clear_first,
                 ),
+                grounded_selector=raw_step.get("_grounded_selector"),
             )
 
         if step_type == "select":
@@ -1956,6 +2238,7 @@ class AgentExecutor:
                     resolved_selector=resolved,
                     expected_value=value,
                 ),
+                grounded_selector=raw_step.get("_grounded_selector"),
             )
 
         if step_type == "drag":
@@ -2158,6 +2441,421 @@ class AgentExecutor:
         except Exception:
             return None
 
+    @staticmethod
+    def _snapshot_item_summary(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tag": str(item.get("tag", "")).strip()[:40],
+            "role": str(item.get("role", "")).strip()[:40],
+            "text": str(item.get("text", "")).strip()[:80],
+            "aria": str(item.get("aria", "")).strip()[:80],
+            "id": str(item.get("id", "")).strip()[:80],
+            "name": str(item.get("name", "")).strip()[:80],
+            "scope": str(item.get("scope", "")).strip()[:40],
+            "visible": bool(item.get("visible", True)),
+            "enabled": bool(item.get("enabled", True)),
+        }
+
+    def _summarize_page_state(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(snapshot, dict):
+            return None
+        interactive_elements = snapshot.get("interactive_elements")
+        visible_count = 0
+        sample: list[dict[str, Any]] = []
+        if isinstance(interactive_elements, list):
+            for item in interactive_elements:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("visible", True):
+                    visible_count += 1
+                if len(sample) < 5:
+                    sample.append(self._snapshot_item_summary(item))
+        return {
+            "url": str(snapshot.get("url", ""))[:240],
+            "title": str(snapshot.get("title", ""))[:160],
+            "text_excerpt": str(snapshot.get("text_excerpt", ""))[:240],
+            "visible_interactive_count": visible_count,
+            "page_count": int(snapshot.get("page_count") or 1),
+            "interactive_sample": sample,
+        }
+
+    @staticmethod
+    def _looks_like_explicit_selector(selector: str) -> bool:
+        normalized = selector.strip()
+        if not normalized:
+            return False
+        if normalized.startswith("{{selector.") and normalized.endswith("}}"):
+            return False
+        lowered = normalized.lower()
+        if "," in normalized:
+            return False
+        if any(token in lowered for token in (":has-text(", ":text-is(", ":nth-of-type(", ":first-", " >> ", "nth=")):
+            return False
+        if lowered.startswith(("text=", "{{selector.")):
+            return False
+        if lowered.startswith("xpath="):
+            return True
+        if lowered.startswith("#") and " " not in normalized:
+            return True
+        simple_prefixes = ("input", "button", "select", "textarea", "a", "form")
+        if lowered.startswith(simple_prefixes):
+            return normalized.count(" ") <= 1
+        if lowered.startswith(("[", ".")):
+            return " " not in normalized
+        return False
+
+    # ------------------------------------------------------------------
+    # Pre-action page health check
+    # ------------------------------------------------------------------
+
+    # Patterns that strongly suggest the browser landed on an HTTP error
+    # page rather than the intended target.  Checked against page title
+    # first (more reliable) then text_excerpt (only when element count is
+    # very low, to avoid false positives on pages that legitimately mention
+    # these terms).
+    _ERROR_PAGE_TITLE_PATTERNS: tuple[tuple[str, str], ...] = (
+        ("404", "http_404"),
+        ("403", "http_403"),
+        ("401", "http_401"),
+        ("500", "http_500"),
+        ("502", "http_502"),
+        ("503", "http_503"),
+        ("not found", "page_not_found"),
+        ("page not found", "page_not_found"),
+        ("access denied", "access_denied"),
+        ("forbidden", "forbidden"),
+        ("internal server error", "server_error"),
+        ("bad gateway", "http_502"),
+        ("service unavailable", "http_503"),
+        ("unauthorized", "http_401"),
+    )
+    _ERROR_BROWSER_PATTERNS: tuple[tuple[str, str], ...] = (
+        ("err_name_not_resolved", "dns_error"),
+        ("err_connection_refused", "connection_refused"),
+        ("err_connection_timed_out", "connection_timeout"),
+        ("this site can't be reached", "connection_error"),
+        ("this page isn't working", "page_error"),
+        ("net::err_", "network_error"),
+    )
+
+    @staticmethod
+    def _check_page_health(
+        snapshot: dict[str, Any] | None,
+        run: RunState,
+        step: StepRuntimeState,
+    ) -> dict[str, Any]:
+        """
+        Inspect the page snapshot for conditions that will make any selector
+        attempt pointless or misleading.  Returns a structured health report:
+
+            {
+                "status": "ok" | "warn" | "block",
+                "issues": [{"type": "<issue_type>", "detail": "<human message>"}]
+            }
+
+        ``block``  — a hard issue (error page, critical domain mismatch).
+                     The caller should raise and skip selector attempts.
+        ``warn``   — a soft issue (loading indicator, unexpected domain,
+                     non-cookie modal overlay).  Log and proceed; the normal
+                     pipeline may still succeed.
+        ``ok``     — no issues detected.
+        """
+        if not isinstance(snapshot, dict):
+            return {"status": "ok", "issues": []}
+
+        issues: list[dict[str, str]] = []
+        current_url = str(snapshot.get("url", "")).strip()
+        title = str(snapshot.get("title", "")).lower().strip()
+        text_excerpt = str(snapshot.get("text_excerpt", "")).lower().strip()
+        interactive_elements: list[Any] = snapshot.get("interactive_elements") or []
+        visible_count = sum(
+            1 for el in interactive_elements
+            if isinstance(el, dict) and el.get("visible", True)
+        )
+
+        # ---- 1. Error page detection ----------------------------------------
+        # Check title first (most reliable signal).
+        for pattern, code in AgentExecutor._ERROR_PAGE_TITLE_PATTERNS:
+            if pattern in title:
+                issues.append({
+                    "type": "error_page",
+                    "detail": (
+                        f"Page title suggests an HTTP error ({code}): {title!r} — "
+                        f"URL: {current_url}"
+                    ),
+                })
+                break
+
+        # Check for browser-level error messages (DNS/network errors).
+        if not issues:
+            combined = title + " " + text_excerpt
+            for pattern, code in AgentExecutor._ERROR_BROWSER_PATTERNS:
+                if pattern in combined:
+                    issues.append({
+                        "type": "browser_error",
+                        "detail": (
+                            f"Browser error detected ({code}): {title!r} — "
+                            f"URL: {current_url}"
+                        ),
+                    })
+                    break
+
+        # Check text_excerpt only when the page is nearly empty (low element
+        # count), making it very likely to be a dedicated error page.
+        if not issues and visible_count <= 3 and text_excerpt:
+            for pattern, code in AgentExecutor._ERROR_PAGE_TITLE_PATTERNS:
+                if pattern in text_excerpt:
+                    issues.append({
+                        "type": "error_page",
+                        "detail": (
+                            f"Near-empty page with error text ({code}): {text_excerpt[:120]!r} — "
+                            f"URL: {current_url}"
+                        ),
+                    })
+                    break
+
+        # ---- 2. Domain mismatch (warn only) ---------------------------------
+        expected_url = (run.start_url or "").strip()
+        if current_url and expected_url:
+            current_domain = urlparse(current_url).netloc.lower()
+            expected_domain = urlparse(expected_url).netloc.lower()
+            # Strip leading "www." for comparison
+            current_root = current_domain.lstrip("www.")
+            expected_root = expected_domain.lstrip("www.")
+            if (
+                current_root
+                and expected_root
+                and current_root != expected_root
+                # Allow subdomains of the expected root
+                and not current_root.endswith("." + expected_root)
+                and not expected_root.endswith("." + current_root)
+            ):
+                issues.append({
+                    "type": "domain_mismatch",
+                    "detail": (
+                        f"Current page domain {current_domain!r} does not match "
+                        f"expected domain {expected_domain!r} — "
+                        f"current URL: {current_url}"
+                    ),
+                })
+
+        # ---- 3. Blocking modal / overlay detection (warn only) --------------
+        # Look for dialog/alertdialog roles that are NOT cookie consent
+        # popups (those are already handled elsewhere).
+        cookie_signals = {"cookie", "cookies", "consent", "privacy", "gdpr"}
+        for el in interactive_elements[:40]:
+            if not isinstance(el, dict):
+                continue
+            if not el.get("visible", True):
+                continue
+            role = str(el.get("role", "")).lower()
+            if role not in {"dialog", "alertdialog"}:
+                continue
+            el_text = str(el.get("text", "") or el.get("aria", "")).lower()
+            if any(s in el_text for s in cookie_signals):
+                continue  # already handled by popup-blocker path
+            issues.append({
+                "type": "modal_overlay",
+                "detail": (
+                    f"A blocking modal/dialog is open (role={role!r} text={el_text[:80]!r}) "
+                    f"which may intercept interaction with the target element."
+                ),
+            })
+            break  # one warning is enough
+
+        # ---- 4. Loading state detection (warn only) -------------------------
+        loading_signals = ("loading", "please wait", "spinner", "skeleton")
+        if visible_count == 0 and any(s in title for s in loading_signals):
+            issues.append({
+                "type": "loading_state",
+                "detail": (
+                    f"Page appears to still be loading (title={title!r}, "
+                    f"visible_elements={visible_count})"
+                ),
+            })
+
+        # ---- Determine overall status ---------------------------------------
+        # "error_page" and "browser_error" are hard blockers.
+        # Everything else is a soft warning.
+        blocking_types = {"error_page", "browser_error"}
+        has_block = any(i["type"] in blocking_types for i in issues)
+        status = "block" if has_block else ("warn" if issues else "ok")
+
+        return {"status": status, "issues": issues}
+
+    async def _assert_step_page_state(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        snapshot: dict[str, Any] | None,
+        intent: StepIntent | None,
+    ) -> dict[str, Any]:
+        if step.type not in {"click", "type", "select"}:
+            return {"status": "skipped", "reason": "step_type_not_guarded"}
+        if not isinstance(snapshot, dict):
+            return {"status": "skipped", "reason": "snapshot_unavailable"}
+        if self._looks_like_popup_blocker(snapshot):
+            return {"status": "skipped", "reason": "popup_blocker_detected"}
+
+        raw_selector = str(step.input.get("selector", "")).strip()
+        if not raw_selector:
+            return {"status": "skipped", "reason": "missing_selector"}
+        if self._looks_like_explicit_selector(raw_selector):
+            return {"status": "skipped", "reason": "explicit_selector"}
+
+        target_terms = self._selector_search_terms(
+            raw_selector,
+            self._step_text_hint(step.input),
+            intent,
+        )
+        interactive_elements = snapshot.get("interactive_elements")
+        matched_elements: list[dict[str, Any]] = []
+        if target_terms and isinstance(interactive_elements, list):
+            for item in interactive_elements:
+                if not isinstance(item, dict):
+                    continue
+                if not self._snapshot_item_matches_intent(item, intent or self._build_step_intent(step.type, raw_selector)):
+                    continue
+                haystack = " ".join(
+                    str(item.get(field, "")).lower()
+                    for field in ("text", "aria", "name", "id", "testid", "placeholder", "title", "href")
+                )
+                if any(term in haystack for term in target_terms):
+                    matched_elements.append(item)
+        if target_terms and not matched_elements:
+            # Before giving up, check whether the intent text appears anywhere in
+            # the page's visible text content.  This handles display elements
+            # (divs, headings, paragraphs) that are valid click targets but
+            # never appear in interactive_elements.
+            text_excerpt = str(snapshot.get("text_excerpt", "")).lower()
+            if any(term in text_excerpt for term in target_terms):
+                LOGGER.debug(
+                    "Page assertion: intent terms %s not in interactive_elements "
+                    "but found in text_excerpt — treating as display element, proceeding.",
+                    target_terms,
+                )
+                return {
+                    "status": "passed",
+                    "reason": "intent_found_in_page_text",
+                    "matched_terms": [t for t in target_terms if t in text_excerpt],
+                }
+            intent_label = (intent.target_text if intent else None) or raw_selector
+            LOGGER.warning(
+                "Page assertion: no element matched intent %r for step %d (type=%s) — "
+                "continuing to selector pipeline (assertion is advisory only).",
+                intent_label, step.index + 1, step.type,
+            )
+            return {
+                "status": "warn",
+                "reason": "no_element_matched_intent",
+                "intent": intent_label,
+            }
+
+        candidates = self._page_snapshot_selector_candidates(
+            snapshot,
+            raw_selector,
+            step.type,
+            self._step_text_hint(step.input),
+        )
+        if candidates:
+            return {
+                "status": "passed",
+                "reason": "matching_live_candidates_found",
+                "candidate_count": len(candidates),
+                "top_candidates": candidates[:3],
+            }
+
+        intent_label = (intent.target_text if intent else None) or raw_selector
+        LOGGER.warning(
+            "Page assertion: no snapshot candidates for intent %r step %d (type=%s) — "
+            "continuing to selector pipeline (assertion is advisory only).",
+            intent_label, step.index + 1, step.type,
+        )
+        return {
+            "status": "warn",
+            "reason": "no_snapshot_candidates",
+            "intent": intent_label,
+        }
+
+    async def _verify_step_outcome_against_page_state(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        message: str,
+        *,
+        before_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        after_snapshot = await self._safe_page_snapshot()
+        verification: dict[str, Any] = {
+            "status": "skipped",
+            "reason": "no_additional_verification",
+            "after_state": self._summarize_page_state(after_snapshot),
+        }
+
+        if step.type in {"click", "type", "select"} and "post_validation=passed" in str(message):
+            verification["status"] = "passed"
+            verification["reason"] = "dispatcher_post_validation"
+            return verification
+
+        if step.type == "navigate":
+            target_url = self._apply_template(str(step.input.get("url", "")), run.test_data or {}, run_id=run.run_id)
+            actual_url = str((after_snapshot or {}).get("url", "")).strip()
+            if target_url and actual_url and (
+                actual_url == target_url
+                or actual_url.startswith(target_url)
+                or target_url.startswith(actual_url)
+            ):
+                verification["status"] = "passed"
+                verification["reason"] = "target_url_reached"
+                return verification
+            raise ValueError(
+                f"Navigate verification failed: expected page near '{target_url}' but reached '{actual_url or '<empty>'}'."
+            )
+
+        if step.type == "click" and step.provided_selector:
+            assessment = await self._browser.assess_click_effect(
+                selector=step.provided_selector,
+                before_snapshot=before_snapshot,
+                raw_selector=str(step.input.get("selector", "")) or None,
+                text_hint=self._step_text_hint(step.input),
+            )
+            verification["assessment"] = assessment
+            if str(assessment.get("status", "")).strip().lower() == "passed":
+                verification["status"] = "passed"
+                verification["reason"] = "click_effect_observed"
+                return verification
+            raise ValueError(f"Click verification failed: {assessment.get('detail') or assessment}")
+
+        if step.type == "type" and step.provided_selector:
+            detail = await self._validate_type_post_action(
+                resolved_selector=step.provided_selector,
+                expected_text=self._apply_template(
+                    str(step.input.get("text", "")),
+                    run.test_data or {},
+                    run_id=run.run_id,
+                ),
+                clear_first=bool(step.input.get("clear_first", True)),
+            )
+            verification["status"] = "passed"
+            verification["reason"] = "typed_value_verified"
+            verification["detail"] = detail
+            return verification
+
+        if step.type == "select" and step.provided_selector:
+            detail = await self._validate_select_post_action(
+                resolved_selector=step.provided_selector,
+                expected_value=self._apply_template(
+                    str(step.input.get("value", "")),
+                    run.test_data or {},
+                    run_id=run.run_id,
+                ),
+            )
+            verification["status"] = "passed"
+            verification["reason"] = "selected_value_verified"
+            verification["detail"] = detail
+            return verification
+
+        return verification
+
     async def _capture_click_pre_state(self, resolved_selector: str) -> dict[str, Any]:
         page_snapshot = await self._safe_page_snapshot()
         try:
@@ -2357,17 +3055,33 @@ class AgentExecutor:
         text_hint: str | None = None,
         pre_attempt: Callable[[str], Awaitable[Any]] | None = None,
         post_validate: Callable[[str, str, Any], Awaitable[str | None]] | None = None,
+        grounded_selector: str | None = None,
     ) -> str:
         intent = self._build_step_intent(step_type, raw_selector, text_hint)
         selector_generation_started = perf_counter()
-        dom_first_candidates = await self._find_element_from_intent(
-            step_type=step_type,
-            raw_selector=raw_selector,
-            text_hint=text_hint,
-            selector_profile=selector_profile,
-            test_data=test_data,
-            run_domain=run_domain,
+        explicit_selector = self._looks_like_explicit_selector(raw_selector)
+        grounded_candidates: list[str] = []
+        grounded_confidence = CandidateConfidence(
+            level="none",
+            top_score=0,
+            second_score=None,
+            score_gap=0,
+            retained_count=0,
         )
+        live_snapshot = await self._safe_page_snapshot()
+        if not explicit_selector and isinstance(live_snapshot, dict):
+            grounded_candidates = self._page_snapshot_selector_candidates(
+                live_snapshot,
+                raw_selector,
+                step_type,
+                text_hint,
+            )
+            grounded_candidates, grounded_confidence = self._confidence_gate_candidates(
+                grounded_candidates,
+                intent,
+                step_type=step_type,
+                source="live",
+            )
 
         profile_candidates = self._selector_candidates(
             raw_selector,
@@ -2378,19 +3092,56 @@ class AgentExecutor:
             text_hint,
         )
 
-        if dom_first_candidates:
-            candidates = self._dedupe(
-                dom_first_candidates + profile_candidates
-            )
+        # If the perception layer identified an element before this method was
+        # called, prepend it to whatever candidates were found from the DOM
+        # snapshot. Perception selectors are derived from OBSERVED elements so
+        # they take priority over heuristic candidates.
+        if grounded_selector:
+            if grounded_selector not in grounded_candidates:
+                grounded_candidates = [grounded_selector] + list(grounded_candidates)
+                LOGGER.debug(
+                    "Selector fallback: perception selector prepended: %r (step_type=%s)",
+                    grounded_selector, step_type,
+                )
+            elif grounded_candidates[0] != grounded_selector:
+                grounded_candidates = [grounded_selector] + [
+                    c for c in grounded_candidates if c != grounded_selector
+                ]
+
+        grounded_failure_reason: str | None = None
+        if not explicit_selector and isinstance(live_snapshot, dict) and not grounded_candidates:
+            grounded_failure_reason = "no_grounded_candidates"
+
+        if not explicit_selector and isinstance(live_snapshot, dict):
+            if grounded_candidates:
+                candidates = list(grounded_candidates)
+                candidate_confidence = grounded_confidence
+            else:
+                # Perception found no grounded candidates from the live DOM snapshot.
+                # Fall back to profile/heuristic candidates rather than hard-failing —
+                # the page may still have the element at a slightly different position
+                # or the snapshot may have been stale.
+                intent_label = (intent.target_text or raw_selector).strip() or raw_selector
+                LOGGER.warning(
+                    "Selector fallback: grounded selection found no candidates for "
+                    "intent=%r step_type=%s domain=%r — falling back to profile candidates.",
+                    intent_label, step_type, run_domain,
+                )
+                candidates = profile_candidates
+                candidates, candidate_confidence = self._confidence_gate_candidates(
+                    candidates,
+                    intent,
+                    step_type=step_type,
+                    source="initial",
+                )
         else:
             candidates = profile_candidates
-
-        candidates, candidate_confidence = self._confidence_gate_candidates(
-            candidates,
-            intent,
-            step_type=step_type,
-            source="initial",
-        )
+            candidates, candidate_confidence = self._confidence_gate_candidates(
+                candidates,
+                intent,
+                step_type=step_type,
+                source="initial",
+            )
         execution_policy = self._candidate_execution_policy(candidate_confidence, step_type=step_type)
         selector_generation_ms = self._elapsed_ms(selector_generation_started)
         last_error: Exception | None = None
@@ -2399,6 +3150,12 @@ class AgentExecutor:
         recovery_attempts = self._effective_selector_recovery_attempts(step_type, len(candidates))
         if execution_policy["recovery_attempts"] is not None:
             recovery_attempts = min(recovery_attempts, int(execution_policy["recovery_attempts"]))
+        LOGGER.debug(
+            "Selector fallback: step_type=%s raw_selector=%r domain=%r "
+            "candidates=%d confidence=%s policy=%s",
+            step_type, raw_selector, run_domain,
+            len(candidates), candidate_confidence.level, execution_policy.get("mode"),
+        )
         trace_group = self._record_step_trace_group(
             {
                 "kind": "selector_fallback",
@@ -2421,8 +3178,19 @@ class AgentExecutor:
                 "live_candidate_lookup_ms": 0.0,
                 "candidates": list(candidates),
                 "attempts": [],
-                "live_first_prepass": bool(dom_first_candidates),
-                "live_first_count": len(dom_first_candidates),
+                "live_first_prepass": bool(grounded_candidates),
+                "live_first_count": len(grounded_candidates),
+                "grounded_selection_enabled": not explicit_selector,
+                "dom_first_mode": not explicit_selector,
+                "grounded_confidence": {
+                    "level": grounded_confidence.level,
+                    "top_score": grounded_confidence.top_score,
+                    "second_score": grounded_confidence.second_score,
+                    "score_gap": grounded_confidence.score_gap,
+                    "retained_count": grounded_confidence.retained_count,
+                },
+                "page_state_summary": self._summarize_page_state(live_snapshot),
+                "grounded_failure_reason": grounded_failure_reason,
             }
         )
 
@@ -2433,6 +3201,40 @@ class AgentExecutor:
                 pre_attempt_ms = 0.0
                 browser_action_ms = 0.0
                 post_validate_ms = 0.0
+                # Fast-fail probe: quickly verify element is present before
+                # spending the full candidate timeout attempting the action.
+                # Only applies to interactive steps; skips generic operations.
+                #
+                # Grounded selectors (from perception / signature memory) get
+                # a longer timeout because the element is known to exist —
+                # it may just be slow to render after an async SPA operation.
+                # All other candidates fail fast to avoid wasting time.
+                if step_type in {"click", "type", "select"}:
+                    is_grounded = bool(grounded_selector and selector == grounded_selector)
+                    probe_timeout_ms = 3000 if is_grounded else 1500
+                    probe_ok = await self._probe_element_present(selector, timeout_ms=probe_timeout_ms)
+                    if not probe_ok:
+                        compact_error = f"probe: element not visible within {probe_timeout_ms} ms"
+                        LOGGER.warning(
+                            "Selector fallback: probe MISS (cycle=%d step_type=%s selector=%r grounded=%s) — skipping",
+                            cycle + 1, step_type, selector, is_grounded,
+                        )
+                        attempts.append(f"pass {cycle + 1}: {selector} -> {compact_error}")
+                        last_error = TimeoutError(compact_error)
+                        self._record_group_attempt(
+                            trace_group,
+                            {
+                                "phase": "candidate",
+                                "cycle": cycle,
+                                "selector": selector,
+                                "status": "probe_miss",
+                                "probe_timeout_ms": probe_timeout_ms,
+                                "grounded": is_grounded,
+                                "elapsed_ms": self._elapsed_ms(attempt_started),
+                                "error": compact_error,
+                            },
+                        )
+                        continue
                 try:
                     if pre_attempt is not None:
                         pre_started = perf_counter()
@@ -2453,6 +3255,12 @@ class AgentExecutor:
                         step_type=step_type,
                         raw_selector=raw_selector,
                         resolved_selector=selector,
+                        text_hint=text_hint,
+                    )
+                    self._remember_selector_signature(
+                        run_domain=run_domain,
+                        step_type=step_type,
+                        raw_selector=raw_selector,
                         text_hint=text_hint,
                     )
                     active_step = self._active_step_state()
@@ -2481,6 +3289,10 @@ class AgentExecutor:
                 except Exception as exc:
                     last_error = exc
                     compact_error = self._compact_error(exc)
+                    LOGGER.warning(
+                        "Selector fallback: candidate FAILED (cycle=%d step_type=%s selector=%r) -> %s",
+                        cycle + 1, step_type, selector, compact_error,
+                    )
                     attempts.append(f"pass {cycle + 1}: {selector} -> {compact_error}")
                     self._record_group_attempt(
                         trace_group,
@@ -2501,22 +3313,84 @@ class AgentExecutor:
             if cycle >= recovery_attempts - 1:
                 break
             if not self._should_retry_selector_error(last_error):
+                LOGGER.debug(
+                    "Selector fallback: not retrying after cycle=%d (error is not transient) step_type=%s selector=%r",
+                    cycle + 1, step_type, raw_selector,
+                )
                 break
+            LOGGER.debug(
+                "Selector fallback: transient error on cycle=%d, pausing before retry. step_type=%s selector=%r",
+                cycle + 1, step_type, raw_selector,
+            )
             await self._selector_recovery_pause()
 
-        live_lookup_started = perf_counter()
-        live_candidates = await self._live_page_selector_candidates(
-            raw_selector=raw_selector,
-            step_type=step_type,
-            text_hint=text_hint,
-        )
-        live_candidate_lookup_ms = self._elapsed_ms(live_lookup_started)
-        live_candidates, live_confidence = self._confidence_gate_candidates(
-            live_candidates,
-            intent,
-            step_type=step_type,
-            source="live",
-        )
+        live_candidates: list[str] = []
+        live_candidate_lookup_ms = 0.0
+        if execution_policy.get("allow_live_candidates", True):
+            LOGGER.debug(
+                "Selector fallback: all initial candidates exhausted, querying live DOM. "
+                "step_type=%s selector=%r attempts_so_far=%d",
+                step_type, raw_selector, len(attempts),
+            )
+            live_lookup_started = perf_counter()
+
+            # --- Signature Recovery -------------------------------------------
+            # Before running the full live DOM re-rank, check whether we have
+            # stored element signatures for this step.  If so, fetch the DOM
+            # once, find elements by their semantic fingerprint, and prepend any
+            # fresh selectors so they are tried first (before heuristic re-rank).
+            live_snapshot: dict | None = None
+            try:
+                live_snapshot = await self._browser.inspect_page(include_screenshot=False)
+            except Exception:
+                pass
+
+            if live_snapshot and self._selector_memory and run_domain:
+                sig_lookup_keys = self._selector_memory_lookup_keys(raw_selector)
+                if text_hint:
+                    sig_lookup_keys.extend(self._selector_memory_lookup_keys(text_hint))
+                stored_signatures: list[dict] = []
+                for sig_key in self._dedupe(sig_lookup_keys):
+                    stored_signatures.extend(
+                        self._selector_memory.get_signatures(run_domain, step_type, sig_key, limit=3)
+                    )
+                if stored_signatures:
+                    sig_index = build_element_index(live_snapshot)
+                    sig_selectors = find_by_signatures(stored_signatures, sig_index)
+                    if sig_selectors:
+                        LOGGER.info(
+                            "Selector fallback: signature recovery found %d fresh selector(s) "
+                            "step_type=%s selector=%r",
+                            len(sig_selectors), step_type, raw_selector,
+                        )
+                        live_candidates = [s for s in sig_selectors if s not in live_candidates]
+
+            live_candidates_from_dom = (
+                self._page_snapshot_selector_candidates(live_snapshot, raw_selector, step_type, text_hint)
+                if live_snapshot
+                else []
+            )
+            # Merge: signature-recovered selectors first, then DOM re-rank
+            for sel in live_candidates_from_dom:
+                if sel not in live_candidates:
+                    live_candidates.append(sel)
+            live_candidate_lookup_ms = self._elapsed_ms(live_lookup_started)
+            live_candidates, live_confidence = self._confidence_gate_candidates(
+                live_candidates,
+                intent,
+                step_type=step_type,
+                source="live",
+            )
+            LOGGER.debug(
+                "Selector fallback: live DOM returned %d candidate(s) confidence=%s step_type=%s selector=%r",
+                len(live_candidates), live_confidence.level, step_type, raw_selector,
+            )
+        else:
+            LOGGER.debug(
+                "Selector fallback: skipping live DOM lookup (policy=%s confidence=%s) step_type=%s selector=%r",
+                execution_policy.get("mode"), candidate_confidence.level, step_type, raw_selector,
+            )
+            live_confidence = CandidateConfidence(level="low", top_score=0, second_score=None, score_gap=0, retained_count=0)
         trace_group["dynamic_dom_rerank"] = len(live_candidates) > 0
         trace_group["live_candidate_lookup_ms"] = live_candidate_lookup_ms
         trace_group["live_candidates"] = list(live_candidates)
@@ -2556,6 +3430,12 @@ class AgentExecutor:
                     resolved_selector=selector,
                     text_hint=text_hint,
                 )
+                self._remember_selector_signature(
+                    run_domain=run_domain,
+                    step_type=step_type,
+                    raw_selector=raw_selector,
+                    text_hint=text_hint,
+                )
                 active_step = self._active_step_state()
                 if active_step is not None:
                     active_step.provided_selector = selector
@@ -2581,6 +3461,10 @@ class AgentExecutor:
             except Exception as exc:
                 last_error = exc
                 compact_error = self._compact_error(exc)
+                LOGGER.warning(
+                    "Selector fallback: live DOM candidate FAILED (step_type=%s selector=%r) -> %s",
+                    step_type, selector, compact_error,
+                )
                 attempts.append(f"live: {selector} -> {compact_error}")
                 self._record_group_attempt(
                     trace_group,
@@ -2599,7 +3483,13 @@ class AgentExecutor:
 
         if last_error:
             active_step = self._active_step_state()
-            if active_step is not None and not self._active_step_has_llm_recovery_group():
+            allow_llm = execution_policy.get("allow_llm_recovery", True)
+            if allow_llm and active_step is not None and not self._active_step_has_llm_recovery_group():
+                LOGGER.warning(
+                    "Selector fallback: all candidates exhausted (%d attempts), attempting LLM recovery. "
+                    "step_type=%s raw_selector=%r last_error=%s",
+                    len(attempts), step_type, raw_selector, self._compact_error(last_error),
+                )
                 synthetic_run = SimpleNamespace(
                     run_id="inline-selector-recovery",
                     test_data=test_data,
@@ -2615,6 +3505,22 @@ class AgentExecutor:
                 )
                 if recovered:
                     return recovered
+            # Build root-cause chain
+            cause_chain: list[str] = []
+            _walk: BaseException | None = last_error
+            while _walk is not None:
+                cause_chain.append(f"{type(_walk).__name__}: {_walk}")
+                _next = getattr(_walk, "__cause__", None) or getattr(_walk, "__context__", None)
+                _walk = _next if _next is not _walk else None
+            root_cause_str = " <- ".join(cause_chain)
+            LOGGER.error(
+                "Selector fallback: ALL candidates FAILED. step_type=%s raw_selector=%r domain=%r "
+                "total_attempts=%d confidence=%s policy=%s root_cause=%s attempted=[%s]",
+                step_type, raw_selector, run_domain,
+                len(attempts), candidate_confidence.level, execution_policy.get("mode"),
+                root_cause_str,
+                "; ".join(attempts[-5:]),  # last 5 so logs don't explode
+            )
             trace_group["final_error"] = self._compact_error(last_error)
             if attempts:
                 attempted = "; ".join(attempts)
@@ -2732,13 +3638,13 @@ class AgentExecutor:
             ordinal_index = max(intent.ordinal - 1, 0)
             if ordinal_index < len(ordinal_ranked):
                 selected = ordinal_ranked[ordinal_index][2]
-                return self._rank_selectors_by_intent(self._dedupe(selected), intent)
+                return self._rank_live_snapshot_selectors(self._dedupe(selected), intent)
 
         ranked.sort(key=lambda entry: (-entry[0], entry[1]))
         flattened: list[str] = []
         for _, _, selectors in ranked[:8]:
             flattened.extend(selectors)
-        return self._rank_selectors_by_intent(self._dedupe(flattened), intent)
+        return self._rank_live_snapshot_selectors(self._dedupe(flattened), intent)
 
     def _preferred_scopes_for_intent(self, intent: StepIntent) -> list[str]:
         if intent.scope_hint:
@@ -2879,13 +3785,18 @@ class AgentExecutor:
             return 0
 
         score = 0
+        keyword_matches = 0
         label = self._snapshot_item_label(item)
         duplicate_count = 0
         if duplicate_counts and label:
             duplicate_count = int(duplicate_counts.get(label, 0))
         for term in target_terms:
             if term in haystack:
+                keyword_matches += 1
                 score += max(8, len(term))
+
+        if target_terms and keyword_matches == 0:
+            return 0
 
         tag = str(item.get("tag", "")).lower()
         role = str(item.get("role", "")).lower()
@@ -2991,6 +3902,61 @@ class AgentExecutor:
 
         return self._dedupe(selectors)
 
+    @staticmethod
+    def _selector_stability_score(selector: str) -> int:
+        lowered = selector.strip().lower()
+        if not lowered:
+            return -100
+
+        score = 0
+        if lowered.startswith("#"):
+            score += 36
+        if "[data-testid=" in lowered:
+            score += 32
+        if "name=" in lowered:
+            score += 20
+        if "[aria-label" in lowered or "[title" in lowered or "[placeholder" in lowered:
+            score += 12
+        if lowered.startswith("text="):
+            score -= 18
+        if ":has-text(" in lowered:
+            score -= 10
+        if any(token in lowered for token in (":nth-of-type(", ":first-", "nth=")):
+            score -= 24
+        if " >> " in lowered:
+            score -= 10
+        return score
+
+    def _live_selector_score(self, selector: str, intent: StepIntent) -> int:
+        score = self._intent_selector_score(selector, intent)
+        if intent.element_type == "listitem" and intent.ordinal is not None:
+            return score
+        return score + self._selector_stability_score(selector)
+
+    async def _probe_element_present(self, selector: str, timeout_ms: int = 1500) -> bool:
+        """
+        Fast-fail DOM probe: returns True if the selector resolves to a visible
+        element within timeout_ms, False otherwise.
+
+        This is called BEFORE the full candidate operation so that wrong
+        selectors are discarded in ~1.5 s instead of consuming the full
+        candidate_timeout budget (2.5–4 s).  Only used for interactive-action
+        step types (click / type / select).
+        """
+        try:
+            await asyncio.wait_for(
+                self._browser.wait_for(
+                    until="selector_visible",
+                    ms=timeout_ms,
+                    selector=selector,
+                    load_state=None,
+                ),
+                timeout=timeout_ms / 1000 + 0.5,
+            )
+            return True
+        except Exception:
+            return False
+
     def _candidate_timeout_seconds(self, candidate_count: int, step_type: str | None = None) -> float:
         step_timeout = max(float(self._settings.step_timeout_seconds), 1.0)
         if candidate_count <= 1:
@@ -3080,6 +4046,21 @@ class AgentExecutor:
 
         return score
 
+    def _rank_live_snapshot_selectors(self, selectors: list[str], intent: StepIntent) -> list[str]:
+        if not selectors:
+            return selectors
+        scored = [
+            (
+                self._live_selector_score(selector, intent),
+                self._selector_stability_score(selector),
+                index,
+                selector,
+            )
+            for index, selector in enumerate(selectors)
+        ]
+        scored.sort(key=lambda entry: (-entry[0], -entry[1], entry[2]))
+        return [selector for _, _, _, selector in scored]
+
     def _rank_selectors_by_intent(self, selectors: list[str], intent: StepIntent) -> list[str]:
         if not selectors:
             return selectors
@@ -3108,7 +4089,19 @@ class AgentExecutor:
         step_type: str,
         source: str,
     ) -> tuple[list[str], CandidateConfidence]:
-        scored = self._scored_selectors_by_intent(selectors, intent)
+        if source == "live":
+            scored = [
+                (
+                    self._live_selector_score(selector, intent),
+                    index,
+                    selector,
+                )
+                for index, selector in enumerate(selectors)
+            ]
+            scored.sort(key=lambda entry: (-entry[0], entry[1]))
+            scored = [(score, selector) for score, _, selector in scored]
+        else:
+            scored = self._scored_selectors_by_intent(selectors, intent)
         if not scored:
             return [], CandidateConfidence(
                 level="none",
@@ -4664,6 +5657,9 @@ class AgentExecutor:
             "all selector candidates failed",
             "no valid selector candidates",
             "no selector candidates available",
+            "grounded selection failed",
+            "grounded selection",
+            "selector candidates",
         )
         actionable_markers = (
             "timeout",
@@ -4691,8 +5687,6 @@ class AgentExecutor:
             return any(marker in message for marker in click_markers)
         if any(marker in message for marker in selector_failure_markers):
             return True
-        if not any(marker in message for marker in selector_failure_markers):
-            return False
         return any(marker in message for marker in actionable_markers)
 
     @staticmethod
@@ -4806,6 +5800,83 @@ class AgentExecutor:
 
         for key in self._dedupe(keys):
             store.remember_success(run_domain, step_type, key, resolved_selector)
+
+    def _remember_selector_signature(
+        self,
+        *,
+        run_domain: str | None,
+        step_type: str,
+        raw_selector: str,
+        text_hint: str | None,
+        signature: dict | None = None,
+    ) -> None:
+        """
+        Persist the element signature alongside the same memory keys used by
+        remember_success.  This allows signature-based re-identification when
+        the raw selector stops working.
+
+        *signature* may be supplied directly (e.g. extracted from a DOM snapshot
+        after a successful execution when perception did not run).  If omitted,
+        the method falls back to reading _grounded_signature from the active
+        step's input (set by the perception layer).
+        """
+        store = self._selector_memory
+        if not store or not run_domain:
+            return
+
+        if signature is None:
+            active_step = self._active_step_state()
+            if active_step is None:
+                return
+            signature = active_step.input.get("_grounded_signature")
+
+        if not signature or not isinstance(signature, dict):
+            return
+
+        keys = self._selector_memory_lookup_keys(raw_selector)
+        if text_hint:
+            keys.extend(self._selector_memory_lookup_keys(text_hint))
+
+        for key in self._dedupe(keys):
+            store.remember_signature(run_domain, step_type, key, signature)
+
+        LOGGER.debug(
+            "Selector memory: stored element signature domain=%r step_type=%r raw_selector=%r",
+            run_domain, step_type, raw_selector,
+        )
+
+    @staticmethod
+    def _extract_signature_from_snapshot(
+        selector: str,
+        snapshot: dict[str, Any],
+    ) -> dict | None:
+        """
+        Scan the element index built from *snapshot* and return the semantic
+        signature (.signature()) of the element whose derived selectors include
+        *selector*.
+
+        Used to capture a signature after a successful execution even when the
+        perception layer did not run (or returned an ambiguous match), so that
+        future runs can use signature-based recovery without relying on the
+        original selector string.
+
+        Returns None when no element in the snapshot matches the selector.
+        """
+        if not selector or not snapshot:
+            return None
+        element_index = build_element_index(snapshot)
+        selector_stripped = selector.strip()
+        for el in element_index.elements:
+            if selector_stripped in el.selectors:
+                return el.signature()
+        # Fallback: check if selector is a prefix-match of any element selector
+        # (handles minor quoting differences such as ' vs ")
+        sel_lower = selector_stripped.lower()
+        for el in element_index.elements:
+            for s in el.selectors:
+                if s.lower() == sel_lower:
+                    return el.signature()
+        return None
 
     @staticmethod
     def _selector_memory_lookup_keys(key: str) -> list[str]:

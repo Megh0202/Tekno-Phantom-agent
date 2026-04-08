@@ -10,7 +10,12 @@ class BrainClient(Protocol):
     async def summarize(self, content: str) -> str:
         ...
 
-    async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
+    async def plan_task(
+        self,
+        task: str,
+        max_steps: int,
+        page_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         ...
 
     async def suggest_selectors(

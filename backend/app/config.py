@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     backend_host: str = "0.0.0.0"
     backend_port: int = 8080
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.7:3000"
     admin_api_token: str = ""
     auth_enabled: bool = True
     auth_database_url: str = "sqlite:///./data/auth.sqlite3"
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     selector_memory_backend: Literal["sqlite", "in_memory", "disabled"] = "sqlite"
     selector_memory_db_path: Path = Path("data/selector_memory.sqlite3")
     selector_memory_max_candidates: int = 5
-    selector_help_mode: Literal["fail", "pause"] = "fail"
+    selector_help_mode: Literal["fail", "pause"] = "pause"
     selector_recovery_enabled: bool = True
     selector_recovery_attempts: int = 2
     selector_recovery_delay_ms: int = 350
@@ -119,7 +119,12 @@ class Settings(BaseSettings):
 
     @property
     def cors_origin_list(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        origins: list[str] = []
+        for raw_origin in self.cors_origins.split(","):
+            origin = raw_origin.strip().rstrip("/")
+            if origin:
+                origins.append(origin)
+        return origins
 
 
 @lru_cache

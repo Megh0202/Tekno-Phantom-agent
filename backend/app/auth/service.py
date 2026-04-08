@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +12,8 @@ from app.auth.security import create_access_token, hash_password, verify_passwor
 from app.config import Settings
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
+
+LOGGER = logging.getLogger("tekno.phantom.auth.service")
 
 
 class AuthError(ValueError):
@@ -93,11 +96,13 @@ def revoke_refresh_session(db: Session, *, refresh_token: str) -> None:
     record.revoked_at = utc_now()
     db.add(record)
     db.commit()
+    LOGGER.info("revoke_refresh_session: token revoked for user_id=%s", record.user_id)
 
 
 def register_user(db: Session, *, email: str, password: str, role: str = "user") -> User:
     existing = get_user_by_email(db, email)
     if existing:
+        LOGGER.warning("register_user: email already registered email=%r", email)
         raise AuthError("email is already registered")
 
     user = User(
@@ -109,15 +114,19 @@ def register_user(db: Session, *, email: str, password: str, role: str = "user")
     db.add(user)
     db.commit()
     db.refresh(user)
+    LOGGER.info("register_user: new user created email=%r role=%s", email, role)
     return user
 
 
 def authenticate_user(db: Session, *, email: str, password: str) -> User:
     user = get_user_by_email(db, email)
     if not user or not verify_password(password, user.password_hash):
+        LOGGER.warning("authenticate_user: failed login attempt for email=%r", email)
         raise AuthError("invalid email or password")
     if not user.is_active:
+        LOGGER.warning("authenticate_user: inactive account login attempt email=%r", email)
         raise AuthError("user account is inactive")
+    LOGGER.info("authenticate_user: successful login email=%r role=%s", email, user.role)
     return user
 
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from app.config import Settings
+
+LOGGER = logging.getLogger("tekno.phantom.brain")
 
 
 class HttpBrainClient:
@@ -44,6 +47,7 @@ class HttpBrainClient:
             }
 
     async def summarize(self, content: str) -> str:
+        LOGGER.debug("Brain: summarize request (content_len=%d)", len(content))
         url = f"{self._base_url}/v1/summarize"
         body = {"content": content}
         try:
@@ -54,13 +58,21 @@ class HttpBrainClient:
             summary = payload.get("summary")
             if isinstance(summary, str) and summary.strip():
                 return summary.strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning("Brain: summarize request failed: %s", exc)
         return f"[brain-unavailable] {content[:220]}"
 
-    async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
+    async def plan_task(
+        self,
+        task: str,
+        max_steps: int,
+        page_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        LOGGER.info("Brain: plan_task request (max_steps=%d task=%r)", max_steps, task[:80])
         url = f"{self._base_url}/v1/plan"
         body = {"task": task, "max_steps": max_steps}
+        if page_context:
+            body["page"] = page_context
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(url, json=body, headers=self._headers())
             response.raise_for_status()
@@ -86,6 +98,7 @@ class HttpBrainClient:
         remaining_steps: int,
         memory: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        LOGGER.debug("Brain: next_action request (remaining_steps=%d history_len=%d)", remaining_steps, len(history))
         url = f"{self._base_url}/v1/next-action"
         body = {
             "goal": goal,
@@ -118,9 +131,14 @@ class HttpBrainClient:
         page: dict[str, Any],
         text_hint: str | None = None,
         max_candidates: int = 3,
+        element_hint: dict[str, Any] | None = None,
     ) -> list[str]:
+        LOGGER.info(
+            "Brain: suggest_selectors request step_type=%s failed_selector=%r element_hint=%s",
+            step_type, failed_selector, bool(element_hint),
+        )
         url = f"{self._base_url}/v1/selector-suggestions"
-        body = {
+        body: dict[str, Any] = {
             "step_type": step_type,
             "failed_selector": failed_selector,
             "error_message": error_message,
@@ -128,6 +146,8 @@ class HttpBrainClient:
             "text_hint": text_hint,
             "max_candidates": max_candidates,
         }
+        if element_hint:
+            body["element_hint"] = element_hint
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(url, json=body, headers=self._headers())

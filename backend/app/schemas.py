@@ -218,6 +218,7 @@ class RunCreateRequest(BaseModel):
 class PlanGenerateRequest(BaseModel):
     task: str = Field(min_length=1, max_length=5000)
     max_steps: int | None = Field(default=None, ge=1, le=500)
+    start_url: str | None = None
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
 
@@ -591,6 +592,29 @@ class CancelRunResponse(BaseModel):
     status: RunStatus
 
 
+class SelectorRecoveryRequest(BaseModel):
+    step_index: int = Field(ge=0)
+    field: Literal["selector", "source_selector", "target_selector"]
+    selector: str = Field(min_length=1, max_length=2000)
+    run_name: str | None = Field(default=None, max_length=120)
+
+    @field_validator("selector")
+    @classmethod
+    def normalize_selector(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("selector cannot be blank")
+        return normalized
+
+    @field_validator("run_name")
+    @classmethod
+    def normalize_run_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class StepSelectorHelpRequest(BaseModel):
     selector: str = Field(min_length=1, max_length=1000)
 
@@ -663,29 +687,6 @@ class StepSelectorHelpRequest(BaseModel):
         if not normalized:
             raise ValueError("selector cannot be blank")
         return normalized
-
-
-class SelectorRecoveryRequest(BaseModel):
-    step_index: int = Field(ge=0)
-    selector: str = Field(min_length=1, max_length=2000)
-    field: Literal["selector", "source_selector", "target_selector"] = "selector"
-    run_name: str | None = Field(default=None, max_length=120)
-
-    @field_validator("selector")
-    @classmethod
-    def normalize_selector(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("selector cannot be blank")
-        return normalized
-
-    @field_validator("run_name")
-    @classmethod
-    def normalize_run_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
 
 
 class RunResumeRequest(BaseModel):

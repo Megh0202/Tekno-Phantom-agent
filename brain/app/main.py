@@ -78,6 +78,7 @@ def build_app() -> FastAPI:
             page=request.page,
             text_hint=request.text_hint,
             max_candidates=request.max_candidates,
+            element_hint=request.element_hint,
         )
         return SelectorSuggestionResponse(selectors=selectors[: request.max_candidates])
 

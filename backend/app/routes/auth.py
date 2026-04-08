@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
+
+LOGGER = logging.getLogger("tekno.phantom.routes.auth")
 
 from app.auth.csrf import validate_csrf
 from app.auth.dependencies import get_current_user, require_role
@@ -56,6 +60,7 @@ def register(
         user = register_user(db, email=payload.email.lower(), password=payload.password, role="user")
     except AuthError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    LOGGER.info("POST /auth/register: user registered email=%r", payload.email.lower())
     return _establish_session(response, user=user, db=db, settings=settings)
 
 
@@ -76,7 +81,9 @@ def login(
             password=payload.password,
         )
     except AuthError as exc:
+        LOGGER.warning("POST /auth/login: login failed for email=%r", payload.email.lower())
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    LOGGER.info("POST /auth/login: successful login email=%r", payload.email.lower())
     return _establish_session(response, user=user, db=db, settings=settings)
 
 
@@ -134,5 +141,6 @@ def logout(
     clear_auth_cookie(response, settings=settings)
     clear_refresh_cookie(response, settings=settings)
     clear_csrf_cookie(response, settings=settings)
+    LOGGER.info("POST /auth/logout: session cleared")
     response.status_code = status.HTTP_204_NO_CONTENT
     return response

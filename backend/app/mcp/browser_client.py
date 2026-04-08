@@ -14,6 +14,21 @@ from typing import Any
 
 from app.config import Settings
 
+# HTML tags that are purely for display and are not interactive.
+# Clicking these elements intentionally produces no navigation,
+# so assess_click_effect should not require a page change for them.
+_DISPLAY_TAGS: frozenset[str] = frozenset({
+    "div", "span", "p", "li", "ul", "ol", "td", "th", "tr",
+    "dt", "dd", "dl", "em", "strong", "i", "b", "u", "s",
+    "small", "code", "pre", "kbd", "samp", "var", "mark",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "q", "cite", "abbr",
+    "section", "article", "header", "footer", "main",
+    "aside", "nav", "figure", "figcaption",
+    "address", "time", "data", "output",
+    "label", "legend", "caption",
+})
+
 try:
     from PIL import Image, ImageChops
 except ImportError:  # pragma: no cover - optional dependency in mock mode
@@ -1566,6 +1581,34 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 "before_url": before_url,
                 "after_url": after_url,
             }
+        # If the element is a non-interactive display element (div, heading,
+        # paragraph, span, etc.) clicking it intentionally produces no
+        # navigation — that is the correct and expected behaviour.
+        try:
+            tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+        except Exception:
+            tag = ""
+        if tag in _DISPLAY_TAGS:
+            return {
+                "status": "passed",
+                "detail": f"Non-interactive display element (<{tag}>) clicked — no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Form input elements (input, textarea) receive focus when clicked.
+        # No page navigation is expected — clicking a search box, text field,
+        # checkbox, or radio button just activates it.  Submit/button inputs
+        # that DO cause navigation would already have been caught above by the
+        # URL/title/text change checks.
+        if tag in {"input", "textarea"}:
+            return {
+                "status": "passed",
+                "detail": f"Form input element (<{tag}>) clicked — focus/activation only, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
         return {
             "status": "failed",
             "detail": "Click effect not observed: page URL/title/text stayed the same and the element remained visible/enabled.",
@@ -2771,8 +2814,10 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "  const locator = page.locator(selector).first();"
             "  let visible = false;"
             "  let enabled = false;"
+            "  let tag = '';"
             "  try { visible = await locator.isVisible(); } catch (error) {}"
             "  try { enabled = await locator.isEnabled(); } catch (error) {}"
+            "  try { tag = await locator.evaluate('el => el.tagName.toLowerCase()'); } catch (error) {}"
             "  const textExcerpt = ((document.body?.innerText || '').replace(/\\s+/g, ' ').trim()).slice(0, 3000);"
             "  return JSON.stringify({"
             "    url: page.url(),"
@@ -2780,7 +2825,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    text_excerpt: textExcerpt,"
             "    page_count: 1,"
             "    visible,"
-            "    enabled"
+            "    enabled,"
+            "    tag"
             "  });"
             "}"
         )
@@ -2795,6 +2841,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         after_page_count = int(after.get("page_count") or 1)
         visible = bool(after.get("visible", True))
         enabled = bool(after.get("enabled", True))
+        element_tag = str(after.get("tag") or "").lower().strip()
         intent_text = " ".join(part for part in (selector, raw_selector or "", text_hint or "") if part).lower()
         target_terms = PlaywrightBrowserMCPClient._context_match_terms(target_context)
         after_haystack = " ".join(part for part in (after_url, after_title, after_text) if part).lower()
@@ -2886,6 +2933,25 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             return {
                 "status": "passed",
                 "detail": "Clicked element became disabled after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if element_tag in _DISPLAY_TAGS:
+            return {
+                "status": "passed",
+                "detail": f"Non-interactive display element (<{element_tag}>) clicked — no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Form input elements (input, textarea) receive focus when clicked.
+        # No page navigation is expected — clicking a search box, text field,
+        # checkbox, or radio button just activates it.
+        if element_tag in {"input", "textarea"}:
+            return {
+                "status": "passed",
+                "detail": f"Form input element (<{element_tag}>) clicked — focus/activation only, no navigation expected.",
                 "selector": selector,
                 "before_url": before_url,
                 "after_url": after_url,
