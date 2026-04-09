@@ -13,8 +13,10 @@ from fastapi.responses import FileResponse
 
 from app.brain.http_client import HttpBrainClient
 from app.config import Settings, get_settings
+from app.database import init_auth_database
 from app.mcp.browser_client import build_browser_client
 from app.mcp.filesystem_client import build_filesystem_client
+from app.routes import auth_router
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
@@ -379,6 +381,10 @@ def build_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    if settings.auth_enabled:
+        init_auth_database()
+        app.include_router(auth_router)
+
     run_store = build_run_store(settings)
     suite_store = build_suite_store(settings)
     test_case_store = build_test_case_store(settings)
@@ -432,6 +438,7 @@ def build_app() -> FastAPI:
             "run_store_backend": settings.run_store_backend,
             "max_steps_per_run": settings.max_steps_per_run,
             "admin_auth_required": bool(settings.admin_api_token),
+            "jwt_auth_enabled": settings.auth_enabled,
         }
 
     @app.post("/api/runs", response_model=RunState)

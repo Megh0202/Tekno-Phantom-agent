@@ -47,7 +47,34 @@ type AuthSessionResponse = {
   expires_in: number;
 };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
+function resolveApiBaseUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
+  if (typeof window === "undefined") {
+    return configured || "http://localhost:8080";
+  }
+
+  const browserHost = window.location.hostname.trim();
+  const browserProtocol = window.location.protocol === "https:" ? "https:" : "http:";
+  if (!configured) {
+    return `${browserProtocol}//${browserHost}:8080`;
+  }
+
+  try {
+    const url = new URL(configured);
+    const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+    const configuredIsLoopback = loopbackHosts.has(url.hostname);
+    const browserIsLoopback = loopbackHosts.has(browserHost);
+    if (configuredIsLoopback !== browserIsLoopback) {
+      url.hostname = browserHost;
+      return url.toString().replace(/\/$/, "");
+    }
+    return configured.replace(/\/$/, "");
+  } catch {
+    return configured.replace(/\/$/, "");
+  }
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 
 function formatApiDetail(detail: unknown): string {
