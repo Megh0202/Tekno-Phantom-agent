@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   apiFetch as fetch,
   buildApiHeaders,
+  ensureCsrfCookie,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
 
@@ -46,6 +47,13 @@ type AuthSessionResponse = {
   user: AuthUser;
   expires_in: number;
 };
+const CONFIG_RETRY_DELAY_MS = 2000;
+
+function hasResolvedLiveConfig(config: AgentConfig): boolean {
+  return Boolean(
+    config.jwt_auth_enabled !== undefined,
+  );
+}
 
 function resolveApiBaseUrl(): string {
   const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
@@ -208,6 +216,7 @@ export default function TestCaseDetailsPage() {
 
   useEffect(() => {
     let disposed = false;
+    let retryHandle: ReturnType<typeof setTimeout> | null = null;
 
     async function loadConfig(): Promise<void> {
       try {
@@ -221,10 +230,18 @@ export default function TestCaseDetailsPage() {
         const payload = (await response.json()) as AgentConfig;
         if (!disposed) {
           setConfig(payload);
+          if (!hasResolvedLiveConfig(payload)) {
+            retryHandle = setTimeout(() => {
+              void loadConfig();
+            }, CONFIG_RETRY_DELAY_MS);
+          }
         }
       } catch (error) {
         if (!disposed) {
           setRequestError(error instanceof Error ? error.message : "Failed to load config");
+          retryHandle = setTimeout(() => {
+            void loadConfig();
+          }, CONFIG_RETRY_DELAY_MS);
         }
       }
     }
@@ -232,6 +249,9 @@ export default function TestCaseDetailsPage() {
     void loadConfig();
     return () => {
       disposed = true;
+      if (retryHandle) {
+        clearTimeout(retryHandle);
+      }
     };
   }, []);
 
@@ -449,6 +469,7 @@ export default function TestCaseDetailsPage() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL);
       const response = await fetch(`${API_BASE_URL}/auth/login`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -488,6 +509,7 @@ export default function TestCaseDetailsPage() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL);
       const response = await fetch(`${API_BASE_URL}/auth/register`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -512,6 +534,7 @@ export default function TestCaseDetailsPage() {
   }
 
   async function signOut(): Promise<void> {
+    await ensureCsrfCookie(API_BASE_URL);
     await fetch(`${API_BASE_URL}/auth/logout`, {
       method: "POST",
       headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),

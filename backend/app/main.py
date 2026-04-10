@@ -92,6 +92,17 @@ def _sanitize_plan_steps(
             selector = selector[1:-1].strip()
         return selector
 
+    def _normalize_target(raw: object) -> dict[str, str] | None:
+        if not isinstance(raw, dict):
+            return None
+        allowed_fields = ("kind", "role", "text", "label", "placeholder", "context")
+        normalized: dict[str, str] = {}
+        for field in allowed_fields:
+            value = _clean_text(raw.get(field))
+            if value:
+                normalized[field] = value
+        return normalized or None
+
     def _looks_like_explicit_selector(value: str) -> bool:
         lowered = value.lower()
         if lowered.startswith(("text=", "xpath=", "css=", "id=", "role=", "label=", "placeholder=")):
@@ -149,6 +160,11 @@ def _sanitize_plan_steps(
 
         normalized_step = dict(step)
         normalized_step["type"] = step_type
+        target = _normalize_target(normalized_step.get("target"))
+        if target is not None:
+            normalized_step["target"] = target
+        else:
+            normalized_step.pop("target", None)
 
         if step_type in {"click", "type", "select", "verify_text", "wait", "handle_popup"}:
             if "selector" in normalized_step:
@@ -156,7 +172,7 @@ def _sanitize_plan_steps(
 
         if step_type == "click":
             selector = _to_click_selector(normalized_step.get("selector"))
-            if not selector:
+            if not selector and target is None:
                 continue
             if selector.lower() in generic_click_targets:
                 continue
@@ -165,7 +181,7 @@ def _sanitize_plan_steps(
         if step_type == "type":
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             text_value = _clean_text(normalized_step.get("text"))
-            if not selector or not text_value:
+            if (not selector and target is None) or not text_value:
                 continue
             normalized_step["selector"] = selector
             normalized_step["text"] = text_value
@@ -174,7 +190,7 @@ def _sanitize_plan_steps(
         if step_type == "select":
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             value = _clean_text(normalized_step.get("value"))
-            if not selector or not value:
+            if (not selector and target is None) or not value:
                 continue
             normalized_step["selector"] = selector
             normalized_step["value"] = value
@@ -188,7 +204,7 @@ def _sanitize_plan_steps(
                 value_text = _clean_text(normalized_step.get("value"))
                 if value_text:
                     selector = f"text={value_text}"
-            if not selector:
+            if not selector and target is None:
                 continue
             normalized_step["selector"] = selector
 

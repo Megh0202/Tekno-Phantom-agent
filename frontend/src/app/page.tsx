@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   apiFetch as fetch,
   buildApiHeaders,
+  ensureCsrfCookie,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
 
@@ -149,6 +150,16 @@ const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
   process.env.NEXT_PUBLIC_SHOW_ADVANCED_INPUTS?.trim().toLowerCase() === "true";
+const CONFIG_RETRY_DELAY_MS = 2000;
+
+function hasResolvedLiveConfig(config: AgentConfig): boolean {
+  return Boolean(
+    config.llm_mode
+    && config.model
+    && config.llm_mode !== "unknown"
+    && config.model !== "unknown",
+  );
+}
 
 function formatApiDetail(detail: unknown): string {
   if (typeof detail === "string" && detail.trim()) {
@@ -462,6 +473,7 @@ export default function Home() {
 
   useEffect(() => {
     let disposed = false;
+    let retryHandle: ReturnType<typeof setTimeout> | null = null;
 
     async function loadConfig(): Promise<void> {
       try {
@@ -476,10 +488,18 @@ export default function Home() {
         if (!disposed) {
           setConfig(payload);
           setConfigError(null);
+          if (!hasResolvedLiveConfig(payload)) {
+            retryHandle = setTimeout(() => {
+              void loadConfig();
+            }, CONFIG_RETRY_DELAY_MS);
+          }
         }
       } catch (error) {
         if (!disposed) {
           setConfigError(error instanceof Error ? error.message : "Failed to load config");
+          retryHandle = setTimeout(() => {
+            void loadConfig();
+          }, CONFIG_RETRY_DELAY_MS);
         }
       }
     }
@@ -487,6 +507,9 @@ export default function Home() {
     void loadConfig();
     return () => {
       disposed = true;
+      if (retryHandle) {
+        clearTimeout(retryHandle);
+      }
     };
   }, []);
 
@@ -1361,6 +1384,7 @@ export default function Home() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL);
       const response = await fetch(`${API_BASE_URL}/auth/login`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -1401,6 +1425,7 @@ export default function Home() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL);
       const response = await fetch(`${API_BASE_URL}/auth/register`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -1426,6 +1451,7 @@ export default function Home() {
   }
 
   async function signOut(): Promise<void> {
+    await ensureCsrfCookie(API_BASE_URL);
     await fetch(`${API_BASE_URL}/auth/logout`, {
       method: "POST",
       headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),

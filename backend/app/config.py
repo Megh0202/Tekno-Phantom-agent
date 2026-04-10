@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     backend_port: int = 8080
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.7:3000"
     admin_api_token: str = ""
-    auth_enabled: bool = True
+    auth_enabled: bool = False
     auth_database_url: str = "sqlite:///./data/auth.sqlite3"
     auth_jwt_secret: str = ""
     auth_jwt_algorithm: str = "HS256"

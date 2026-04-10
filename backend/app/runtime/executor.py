@@ -1160,7 +1160,7 @@ class AgentExecutor:
         element scores high enough — the existing pipeline handles those.
         """
         step_input = step.input or {}
-        raw_selector = str(step_input.get("selector", "")).strip()
+        raw_selector = str(step_input.get("selector", "")).strip() or self._selector_seed_from_target(step_input, step.type)
         text_hint = self._step_text_hint(step_input)
 
         intent_text = " ".join(p for p in [raw_selector, text_hint or ""] if p).strip()
@@ -1215,6 +1215,8 @@ class AgentExecutor:
             if isinstance(value, str) and value.strip():
                 selector_probe = value.strip()
                 break
+        if selector_probe is None:
+            selector_probe = self._selector_seed_from_target(step.input, step.type) or None
         step_intent = self._build_step_intent(step.type, selector_probe, self._step_text_hint(step.input))
         step_trace["intent"] = self._serialize_step_intent(step_intent)
         trace_token = self._step_trace_context.set(step_trace)
@@ -1848,7 +1850,31 @@ class AgentExecutor:
             value = step_input.get(field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        target = step_input.get("target")
+        if isinstance(target, dict):
+            for field in ("text", "label", "placeholder", "context", "kind", "role"):
+                value = target.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
         return None
+
+    @staticmethod
+    def _selector_seed_from_target(step_input: dict[str, Any], step_type: str) -> str:
+        target = step_input.get("target")
+        if not isinstance(target, dict):
+            return ""
+        for field in ("text", "label", "placeholder", "context"):
+            value = target.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        role = target.get("role")
+        kind = target.get("kind")
+        pieces = []
+        if isinstance(kind, str) and kind.strip():
+            pieces.append(kind.strip())
+        if isinstance(role, str) and role.strip():
+            pieces.append(role.strip())
+        return " ".join(pieces).strip()
 
     @staticmethod
     def _intent_ordinal(value: str) -> int | None:
@@ -2059,7 +2085,7 @@ class AgentExecutor:
             return result
 
         if step_type == "click":
-            selector = str(raw_step["selector"])
+            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
             alias_key = self._selector_alias_key(selector)
             text_hint = raw_step.get("text_hint")
             if alias_key == "transition_canvas_label":
@@ -2190,7 +2216,7 @@ class AgentExecutor:
                 raise
 
         if step_type == "type":
-            selector = str(raw_step["selector"])
+            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
             raw_text = str(raw_step["text"])
             text = self._apply_template(raw_text, test_data, run_id=run.run_id)
             clear_first = bool(raw_step.get("clear_first", True))
@@ -2221,7 +2247,7 @@ class AgentExecutor:
             )
 
         if step_type == "select":
-            selector = str(raw_step["selector"])
+            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
             value = self._apply_template(str(raw_step["value"]), test_data, run_id=run.run_id)
             return await self._run_with_selector_fallback(
                 selector,
@@ -2353,7 +2379,7 @@ class AgentExecutor:
             return await self._browser.handle_popup(policy=policy, selector=None)
 
         if step_type == "verify_text":
-            selector = str(raw_step["selector"])
+            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
             match = str(raw_step.get("match", "contains"))
             value = self._apply_template(str(raw_step["value"]), test_data, run_id=run.run_id)
             value_lower = value.lower()

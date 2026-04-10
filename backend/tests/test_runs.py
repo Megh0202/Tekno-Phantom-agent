@@ -52,6 +52,37 @@ def test_run_creation_and_completion() -> None:
     assert all(step["status"] == "completed" for step in run["steps"])
 
 
+def test_run_creation_accepts_semantic_target_without_selector() -> None:
+    payload = {
+        "run_name": "semantic-target-run",
+        "start_url": "https://example.com",
+        "steps": [
+            {
+                "type": "verify_text",
+                "target": {
+                    "text": "Example Domain",
+                },
+                "value": "Example Domain",
+            },
+        ],
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/runs", json=payload)
+        assert created.status_code == 200, created.text
+
+        run_id = created.json()["run_id"]
+        fetched = client.get(f"/api/runs/{run_id}")
+
+    assert fetched.status_code == 200
+    run = fetched.json()
+    assert run["status"] == "completed"
+    assert len(run["steps"]) == 1
+    assert run["steps"][0]["status"] == "completed"
+    assert run["steps"][0]["input"]["selector"] == ""
+    assert run["steps"][0]["input"]["target"]["text"] == "Example Domain"
+
+
 def test_run_rejects_when_step_count_exceeds_limit() -> None:
     payload = {
         "run_name": "too-many-steps",

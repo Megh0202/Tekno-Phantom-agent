@@ -46,6 +46,13 @@ def _establish_session(response: Response, *, user: User, db: Session, settings:
     return TokenResponse(user=UserResponse.model_validate(user), expires_in=access_expires_in)
 
 
+@router.get("/csrf")
+def issue_csrf(response: Response, settings: Settings = Depends(get_settings)) -> dict[str, bool]:
+    csrf_token = issue_csrf_token()
+    set_csrf_cookie(response, csrf_token=csrf_token, settings=settings)
+    return {"ok": True}
+
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 def register(
     request: Request,

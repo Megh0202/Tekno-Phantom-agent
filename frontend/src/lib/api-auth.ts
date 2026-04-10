@@ -84,3 +84,14 @@ export async function apiFetch(input: RequestInfo | URL, options?: ApiFetchOptio
   }
   return fetch(input, buildRequestInit(options));
 }
+
+export async function ensureCsrfCookie(apiBaseUrl: string): Promise<void> {
+  const csrfToken = getCookie("tekno_phantom_csrf");
+  if (csrfToken) {
+    return;
+  }
+  const response = await fetch(`${apiBaseUrl}/auth/csrf`, buildRequestInit({ method: "GET" }));
+  if (!response.ok) {
+    throw new Error("Failed to initialize CSRF protection");
+  }
+}

@@ -40,6 +40,23 @@ class StepStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class SemanticTarget(BaseModel):
+    kind: str | None = None
+    role: str | None = None
+    text: str | None = None
+    label: str | None = None
+    placeholder: str | None = None
+    context: str | None = None
+
+    @field_validator("kind", "role", "text", "label", "placeholder", "context")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class NavigateStep(BaseModel):
     type: Literal["navigate"]
     url: str
@@ -47,20 +64,35 @@ class NavigateStep(BaseModel):
 
 class ClickStep(BaseModel):
     type: Literal["click"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("click step requires selector or target")
 
 
 class TypeStep(BaseModel):
     type: Literal["type"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     text: str
     clear_first: bool = True
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("type step requires selector or target")
 
 
 class SelectStep(BaseModel):
     type: Literal["select"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     value: str
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("select step requires selector or target")
 
 
 class DragStep(BaseModel):
@@ -95,9 +127,14 @@ class HandlePopupStep(BaseModel):
 
 class VerifyTextStep(BaseModel):
     type: Literal["verify_text"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     match: Literal["exact", "contains", "regex"] = "contains"
     value: str
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("verify_text step requires selector or target")
 
 
 class VerifyImageStep(BaseModel):
