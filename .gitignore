@@ -19,6 +19,8 @@ venv/
 *.log
 artifacts/
 reports/
+# Selector memory database
+selector_memory.sqlite3
 # Python
 __pycache__/
 *.pyc
@@ -44,3 +46,7 @@ artifacts/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local tooling / runtime output
+.claude/
+backend/logs/

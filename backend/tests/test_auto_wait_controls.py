@@ -32,3 +32,25 @@ def test_expand_drag_steps_can_disable_auto_click_and_wait() -> None:
     assert expanded == [
         {"type": "drag", "source_selector": "short answer", "target_selector": "form canvas"},
     ]
+
+
+def test_expand_drag_steps_skips_preclick_for_known_field_source_aliases() -> None:
+    expanded = _expand_drag_steps(
+        [
+            {
+                "type": "drag",
+                "source_selector": "{{selector.short_answer_source}}",
+                "target_selector": "{{selector.form_canvas_target}}",
+            }
+        ],
+        max_steps=10,
+    )
+
+    assert expanded == [
+        {
+            "type": "drag",
+            "source_selector": "{{selector.short_answer_source}}",
+            "target_selector": "{{selector.form_canvas_target}}",
+        },
+        {"type": "wait", "until": "timeout", "ms": 120},
+    ]

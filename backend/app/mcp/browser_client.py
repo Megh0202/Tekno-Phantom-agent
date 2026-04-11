@@ -14,6 +14,21 @@ from typing import Any
 
 from app.config import Settings
 
+# HTML tags that are purely for display and are not interactive.
+# Clicking these elements intentionally produces no navigation,
+# so assess_click_effect should not require a page change for them.
+_DISPLAY_TAGS: frozenset[str] = frozenset({
+    "div", "span", "p", "li", "ul", "ol", "td", "th", "tr",
+    "dt", "dd", "dl", "em", "strong", "i", "b", "u", "s",
+    "small", "code", "pre", "kbd", "samp", "var", "mark",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "q", "cite", "abbr",
+    "section", "article", "header", "footer", "main",
+    "aside", "nav", "figure", "figcaption",
+    "address", "time", "data", "output",
+    "label", "legend", "caption",
+})
+
 try:
     from PIL import Image, ImageChops
 except ImportError:  # pragma: no cover - optional dependency in mock mode
@@ -108,11 +123,24 @@ class BrowserMCPClient:
         return f"Clicked {selector}"
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
+        store = getattr(self, "_mock_field_values", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self, "_mock_field_values", store)
+        if clear_first:
+            store[selector] = text
+        else:
+            store[selector] = f"{store.get(selector, '')}{text}"
         await asyncio.sleep(0.1)
         mode = "after clear" if clear_first else "append"
         return f"Typed into {selector} ({mode})"
 
     async def select(self, selector: str, value: str) -> str:
+        store = getattr(self, "_mock_select_values", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self, "_mock_select_values", store)
+        store[selector] = value
         await asyncio.sleep(0.1)
         return f"Selected {value} in {selector}"
 
@@ -184,6 +212,64 @@ class BrowserMCPClient:
     async def capture_screenshot(self, selector: str | None = None) -> bytes:
         await asyncio.sleep(0.05)
         return _MOCK_SCREENSHOT_BYTES
+
+    async def inspect_page(self, include_screenshot: bool = True) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        payload = {
+            "url": "",
+            "title": "Mock Browser",
+            "text_excerpt": "",
+            "interactive_elements": [],
+            "page_count": 1,
+        }
+        if include_screenshot:
+            payload["screenshot_base64"] = ""
+            payload["screenshot_mime_type"] = "image/png"
+        return payload
+
+    async def get_element_value(self, selector: str) -> str | None:
+        await asyncio.sleep(0.01)
+        store = getattr(self, "_mock_field_values", None)
+        if isinstance(store, dict):
+            return store.get(selector)
+        return None
+
+    async def get_select_value(self, selector: str) -> str | None:
+        await asyncio.sleep(0.01)
+        store = getattr(self, "_mock_select_values", None)
+        if isinstance(store, dict):
+            return store.get(selector)
+        return None
+
+    async def get_element_context(self, selector: str) -> dict[str, Any] | None:
+        await asyncio.sleep(0.01)
+        return {
+            "selector": selector,
+            "text": selector,
+            "title": "",
+            "aria": "",
+            "href": "",
+        }
+
+    async def assess_click_effect(
+        self,
+        selector: str,
+        before_snapshot: dict[str, Any] | None = None,
+        raw_selector: str | None = None,
+        text_hint: str | None = None,
+        target_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await asyncio.sleep(0.01)
+        return {
+            "status": "passed",
+            "detail": f"Mock click accepted for {selector}",
+            "selector": selector,
+            "before_url": (before_snapshot or {}).get("url"),
+            "after_url": (before_snapshot or {}).get("url"),
+        }
+
+    def get_live_page(self) -> Any | None:
+        return None
 
 
 @dataclass
@@ -265,6 +351,12 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         if self._current_run_id.get() == run_id:
             self._current_run_id.set(None)
 
+    def get_live_page(self) -> Any | None:
+        try:
+            return self._active_context().page
+        except Exception:
+            return None
+
     async def navigate(self, url: str) -> str:
         context = self._active_context()
         await context.page.goto(url, wait_until="domcontentloaded")
@@ -272,51 +364,12 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def click(self, selector: str) -> str:
         context = self._active_context()
+        before_page_count = 0
+        try:
+            before_page_count = len(context.context.pages)
+        except Exception:
+            before_page_count = 0
         selector_lower = selector.lower()
-        is_module_launcher_click = any(
-            token in selector_lower
-            for token in (
-                "selector.module_launcher",
-                "module_launcher",
-                "app switcher",
-                "module switcher",
-                "launchpad",
-                "workflows launcher",
-            )
-        )
-        if is_module_launcher_click:
-            candidate_selectors = [
-                selector,
-                "button[aria-label*='module']",
-                "button[aria-label*='app']",
-                "button[aria-label*='switch']",
-                "[role='button'][aria-label*='module']",
-                "[role='button'][aria-label*='app']",
-                "button:has(svg[data-lucide='layout-grid'])",
-                "button:has(svg[class*='grid'])",
-                "button:has(i[class*='grid'])",
-                "[class*='app-switcher']",
-                "[class*='module-switcher']",
-                "header svg:first-of-type",
-                "header [class*='grid']:first-of-type",
-            ]
-            for candidate in candidate_selectors:
-                try:
-                    locator = context.page.locator(candidate).first
-                    if await locator.count() == 0:
-                        continue
-                    await locator.click(timeout=1200)
-                    await context.page.wait_for_timeout(220)
-                    return f"Clicked {candidate}"
-                except Exception:
-                    continue
-            # Final fallback for UIs where launcher is an icon without stable attributes.
-            try:
-                await context.page.mouse.click(34, 30)
-                await context.page.wait_for_timeout(260)
-                return "Clicked module launcher (coordinate fallback)"
-            except Exception:
-                pass
         is_add_option_click = (
             "add-option" in selector_lower
             or "text=+" in selector_lower
@@ -345,14 +398,82 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                         return f"Clicked {candidate}"
                 except Exception:
                     continue
+        locator = context.page.locator(selector).first
         try:
-            await context.page.locator(selector).first.click()
-            return f"Clicked {selector}"
+            await locator.wait_for(state="visible", timeout=2200)
         except Exception:
-            fallback_message = await self._click_text_fallback(context.page, selector)
-            if fallback_message:
-                return fallback_message
-            raise
+            pass
+        try:
+            await locator.scroll_into_view_if_needed(timeout=1200)
+        except Exception:
+            pass
+        try:
+            await locator.hover(timeout=900)
+        except Exception:
+            pass
+        try:
+            await locator.click(timeout=2400)
+        except Exception as click_error:
+            try:
+                await locator.click(timeout=1800, force=True)
+            except Exception:
+                try:
+                    tag_name = await locator.evaluate(
+                        """
+                        (el) => {
+                            if (!(el instanceof HTMLElement)) {
+                                throw new Error("Resolved node is not an HTMLElement");
+                            }
+                            return (el.tagName || "").toLowerCase();
+                        }
+                        """
+                    )
+                    if tag_name in {"button", "a"}:
+                        try:
+                            await locator.press("Enter", timeout=900)
+                            return f"Clicked {selector}"
+                        except Exception:
+                            try:
+                                await locator.press("Space", timeout=900)
+                                return f"Clicked {selector}"
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    await locator.evaluate(
+                        """
+                        (el) => {
+                            if (!(el instanceof HTMLElement)) {
+                                throw new Error("Resolved node is not an HTMLElement");
+                            }
+                            el.focus();
+                            el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                        }
+                        """
+                    )
+                except Exception:
+                    diagnostics = await self._collect_click_diagnostics(context.page, selector)
+                    raise ValueError(
+                        f"Click failed for {selector}. "
+                        f"selector={diagnostics['selector']}; exists={diagnostics['exists']}; "
+                        f"visible={diagnostics['visible']}; enabled={diagnostics['enabled']}; "
+                        f"blocked={diagnostics['blocked']}; blocker={diagnostics['blocker']}; "
+                        f"in_iframe={diagnostics['in_iframe']}; iframe_count={diagnostics['iframe_count']}; "
+                        f"reason={self._compact_click_error(click_error)}"
+                    ) from click_error
+        try:
+            after_pages = list(context.context.pages)
+        except Exception:
+            after_pages = []
+        if len(after_pages) > before_page_count:
+            newest_page = after_pages[-1]
+            try:
+                await newest_page.wait_for_load_state("domcontentloaded", timeout=4000)
+            except Exception:
+                pass
+            context.page = newest_page
+        return f"Clicked {selector}"
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         context = self._active_context()
@@ -1101,6 +1222,480 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             return await context.page.locator(selector).first.screenshot()
         return await context.page.screenshot(full_page=True)
 
+    async def inspect_page(self, include_screenshot: bool = True) -> dict[str, Any]:
+        context = self._active_context()
+        code = """
+() => {
+  const cssEscape = (value) => {
+    if (!value) return "";
+    if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
+    return String(value).replace(/([ #;?%&,.+*~\\':"!^$\\[\\]()=>|/@])/g, "\\\\$1");
+  };
+  const detectScope = (el) => {
+    const scopes = [
+      ["form", "form"],
+      ["[role='search']", "search"],
+      ["main, [role='main']", "main"],
+      ["nav, [role='navigation']", "nav"],
+      ["header", "header"],
+      ["article, [role='article']", "article"],
+      ["aside", "aside"],
+      ["footer", "footer"],
+      ["[role='dialog'], dialog, .modal", "dialog"],
+    ];
+    for (const [selector, label] of scopes) {
+      try {
+        if (el.closest(selector)) return label;
+      } catch (error) {}
+    }
+    return "body";
+  };
+  const titleLinkSelector = (el) => {
+    try {
+      if (!(el instanceof Element)) return null;
+      if (el.matches("a#video-title")) {
+        const all = Array.from(document.querySelectorAll("a#video-title"));
+        const index = all.indexOf(el);
+        if (index >= 0) return `a#video-title >> nth=${index}`;
+      }
+      const amazonTitle = el.matches("div[data-component-type='s-search-result'] h2 a")
+        ? el
+        : el.closest("div[data-component-type='s-search-result']")?.querySelector("h2 a, [data-cy='title-recipe-title'] a");
+      if (amazonTitle) {
+        const all = Array.from(document.querySelectorAll("div[data-component-type='s-search-result'] h2 a, div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a"));
+        const index = all.indexOf(amazonTitle);
+        if (index >= 0) {
+          if (amazonTitle.matches("[data-cy='title-recipe-title'] a")) return `div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a >> nth=${index}`;
+          return `div[data-component-type='s-search-result'] h2 a >> nth=${index}`;
+        }
+      }
+      if (el.matches("article a[href], li a[href], [role='listitem'] a[href]")) {
+        const card = el.closest("article, li, [role='listitem']");
+        const title = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        if (card && title) {
+          const linkInCard = card.querySelector("h1 a, h2 a, h3 a, a");
+          if (linkInCard === el) {
+            const text = title.slice(0, 80).replace(/"/g, '\\"');
+            return `a:has-text("${text}")`;
+          }
+        }
+      }
+    } catch (error) {}
+    return null;
+  };
+  const pick = (elements) => elements
+    .map((el) => {
+      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      const aria = el.getAttribute("aria-label") || "";
+      const name = el.getAttribute("name") || "";
+      const id = el.getAttribute("id") || "";
+      const testid = el.getAttribute("data-testid") || "";
+      const role = el.getAttribute("role") || "";
+      const placeholder = el.getAttribute("placeholder") || "";
+      const href = el.getAttribute("href") || "";
+      const title = el.getAttribute("title") || "";
+      const inputType = el.getAttribute("type") || "";
+      const tag = el.tagName.toLowerCase();
+      const scope = detectScope(el);
+      const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+      const visible = !!(
+        rect &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
+      const enabled = !el.hasAttribute("disabled") && el.getAttribute("aria-disabled") !== "true";
+      const selectors = [];
+      if (id) selectors.push(`#${cssEscape(id)}`);
+      if (testid) selectors.push(`[data-testid="${String(testid).replace(/"/g, '\\"')}"]`);
+      if (name && ["input", "textarea", "select"].includes(tag)) {
+        selectors.push(`${tag}[name="${String(name).replace(/"/g, '\\"')}"]`);
+      }
+      const titleLink = titleLinkSelector(el);
+      if (titleLink) selectors.push(titleLink);
+      if (tag === "a" && href) {
+        const safeHref = href.slice(0, 120).replace(/"/g, '\\"');
+        selectors.push(`a[href*="${safeHref}"]`);
+      }
+      if (!(text || aria || name || id || testid || placeholder || title)) return null;
+      return {
+        tag,
+        type: inputType,
+        text: text.slice(0, 120),
+        aria,
+        name,
+        id,
+        testid,
+        role,
+        placeholder,
+        title,
+        href: href.slice(0, 120),
+        scope,
+        visible,
+        enabled,
+        selectors,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 40);
+
+  const interactive = pick(Array.from(document.querySelectorAll("button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]")));
+  const textExcerpt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
+  return {
+    url: window.location.href,
+    title: document.title || "",
+    text_excerpt: textExcerpt,
+    interactive_elements: interactive,
+    page_count: window.history.length || 1,
+  };
+}
+"""
+        payload = await context.page.evaluate(code)
+        try:
+            payload["page_count"] = len(context.context.pages)
+        except Exception:
+            payload["page_count"] = payload.get("page_count", 1)
+        if include_screenshot:
+            screenshot_bytes = await context.page.screenshot(type="jpeg", quality=55)
+            payload["screenshot_base64"] = base64.b64encode(screenshot_bytes).decode("ascii")
+            payload["screenshot_mime_type"] = "image/jpeg"
+        return payload
+
+    async def get_element_value(self, selector: str) -> str | None:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            return await locator.input_value(timeout=1500)
+        except Exception:
+            pass
+        try:
+            value = await locator.evaluate(
+                """
+                (el) => {
+                    if (!(el instanceof Element)) return null;
+                    if ('value' in el && typeof el.value === 'string') return el.value;
+                    return el.getAttribute('value') || el.textContent || null;
+                }
+                """
+            )
+        except Exception:
+            return None
+        if value is None:
+            return None
+        return str(value)
+
+    async def get_select_value(self, selector: str) -> str | None:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            value = await locator.evaluate(
+                """
+                (el) => {
+                    if (!(el instanceof HTMLSelectElement)) {
+                        if ('value' in el && typeof el.value === 'string') return el.value;
+                        return null;
+                    }
+                    return el.value || null;
+                }
+                """
+            )
+        except Exception:
+            return None
+        if value is None:
+            return None
+        return str(value)
+
+    async def get_element_context(self, selector: str) -> dict[str, Any] | None:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            payload = await locator.evaluate(
+                """
+                (el) => {
+                    if (!(el instanceof Element)) return null;
+                    const text = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 160);
+                    return {
+                        text,
+                        title: (el.getAttribute("title") || "").slice(0, 160),
+                        aria: (el.getAttribute("aria-label") || "").slice(0, 160),
+                        href: (el.getAttribute("href") || "").slice(0, 200),
+                        tag: (el.tagName || "").toLowerCase(),
+                    };
+                }
+                """
+            )
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["selector"] = selector
+        return payload
+
+    @staticmethod
+    def _context_match_terms(target_context: dict[str, Any] | None) -> list[str]:
+        if not isinstance(target_context, dict):
+            return []
+        source = " ".join(
+            str(target_context.get(field, "")).lower()
+            for field in ("text", "title", "aria")
+        )
+        terms = re.findall(r"[a-z0-9]+", source)
+        filtered: list[str] = []
+        stop = {
+            "the", "and", "for", "with", "from", "that", "this", "button", "link",
+            "product", "result", "video", "women", "woman", "men", "amazon", "youtube",
+            "india", "official", "watch", "shop", "buy", "latest",
+        }
+        for term in terms:
+            if len(term) < 4 or term in stop or term.isdigit():
+                continue
+            if term not in filtered:
+                filtered.append(term)
+        return filtered[:5]
+
+    async def assess_click_effect(
+        self,
+        selector: str,
+        before_snapshot: dict[str, Any] | None = None,
+        raw_selector: str | None = None,
+        text_hint: str | None = None,
+        target_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = self._active_context()
+        await context.page.wait_for_timeout(250)
+        after_snapshot = await self.inspect_page(include_screenshot=False)
+        before = before_snapshot or {}
+        before_url = str(before.get("url") or "")
+        after_url = str(after_snapshot.get("url") or "")
+        before_title = str(before.get("title") or "")
+        after_title = str(after_snapshot.get("title") or "")
+        before_text = str(before.get("text_excerpt") or "")
+        after_text = str(after_snapshot.get("text_excerpt") or "")
+        before_page_count = int(before.get("page_count") or 1)
+        after_page_count = int(after_snapshot.get("page_count") or 1)
+        intent_text = " ".join(part for part in (selector, raw_selector or "", text_hint or "") if part).lower()
+        target_terms = self._context_match_terms(target_context)
+        after_haystack = " ".join(part for part in (after_url, after_title, after_text) if part).lower()
+        matching_terms = [term for term in target_terms if term in after_haystack]
+        requires_target_match = bool(target_terms) and any(
+            token in intent_text
+            for token in ("result", "product", "video", "title link", "non-sponsored", "s-search-result", "video-title")
+        )
+        expects_search_result_navigation = any(
+            token in intent_text
+            for token in (
+                "s-search-result",
+                "product title",
+                "product card",
+                "non-sponsored product",
+                "second product",
+                "h2 a",
+                "a-link-normal",
+                "title-recipe-title",
+            )
+        )
+
+        if after_page_count > before_page_count:
+            if requires_target_match and len(matching_terms) < min(2, len(target_terms)):
+                return {
+                    "status": "failed",
+                    "detail": "New page/tab opened but destination did not match the clicked item context.",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "passed",
+                "detail": f"New page/tab opened after click ({before_page_count} -> {after_page_count})",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+
+        if before_url != after_url:
+            if requires_target_match and len(matching_terms) < min(2, len(target_terms)):
+                return {
+                    "status": "failed",
+                    "detail": "Navigation happened but destination did not match the clicked item context.",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "passed",
+                "detail": f"URL changed from {before_url or '<empty>'} to {after_url or '<empty>'}",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if before_title != after_title:
+            return {
+                "status": "passed",
+                "detail": f"Title changed from {before_title or '<empty>'} to {after_title or '<empty>'}",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if expects_search_result_navigation and before_url and "/s?" in before_url and (not after_url or "/s?" in after_url):
+            return {
+                "status": "failed",
+                "detail": "Search-result click did not leave the results page or open a new product page/tab.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if before_text != after_text:
+            return {
+                "status": "passed",
+                "detail": "Page text changed after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+
+        locator = context.page.locator(selector).first
+        try:
+            visible = await locator.is_visible()
+        except Exception:
+            visible = False
+        try:
+            enabled = await locator.is_enabled()
+        except Exception:
+            enabled = False
+        if not visible:
+            return {
+                "status": "passed",
+                "detail": "Clicked element is no longer visible after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if not enabled:
+            return {
+                "status": "passed",
+                "detail": "Clicked element became disabled after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # If the element is a non-interactive display element (div, heading,
+        # paragraph, span, etc.) clicking it intentionally produces no
+        # navigation — that is the correct and expected behaviour.
+        try:
+            tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+        except Exception:
+            tag = ""
+        if tag in _DISPLAY_TAGS:
+            return {
+                "status": "passed",
+                "detail": f"Non-interactive display element (<{tag}>) clicked — no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Form input elements (input, textarea) receive focus when clicked.
+        # No page navigation is expected — clicking a search box, text field,
+        # checkbox, or radio button just activates it.  Submit/button inputs
+        # that DO cause navigation would already have been caught above by the
+        # URL/title/text change checks.
+        if tag in {"input", "textarea"}:
+            return {
+                "status": "passed",
+                "detail": f"Form input element (<{tag}>) clicked — focus/activation only, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        return {
+            "status": "failed",
+            "detail": "Click effect not observed: page URL/title/text stayed the same and the element remained visible/enabled.",
+            "selector": selector,
+            "before_url": before_url,
+            "after_url": after_url,
+        }
+
+    async def _collect_click_diagnostics(self, page: Any, selector: str) -> dict[str, Any]:
+        locator = page.locator(selector).first
+        exists = False
+        visible = False
+        enabled = False
+        blocked = False
+        blocker = ""
+        iframe_count = 0
+        try:
+            iframe_count = len(page.frames)
+        except Exception:
+            iframe_count = 0
+        try:
+            exists = await page.locator(selector).count() > 0
+        except Exception:
+            exists = False
+        try:
+            visible = await locator.is_visible()
+        except Exception:
+            visible = False
+        try:
+            enabled = await locator.is_enabled()
+        except Exception:
+            enabled = False
+        try:
+            box = await locator.bounding_box()
+            if box:
+                center_x = box["x"] + (box["width"] / 2)
+                center_y = box["y"] + (box["height"] / 2)
+                probe = await page.evaluate(
+                    """
+                    ({ selector, x, y }) => {
+                      const el = document.elementFromPoint(x, y);
+                      const describe = (node) => {
+                        if (!(node instanceof Element)) return "";
+                        const tag = (node.tagName || "").toLowerCase();
+                        const id = node.id ? `#${node.id}` : "";
+                        const cls = node.className && typeof node.className === "string"
+                          ? "." + node.className.trim().split(/\s+/).slice(0, 3).join(".")
+                          : "";
+                        const text = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+                        return `${tag}${id}${cls}${text ? ` text="${text}"` : ""}`;
+                      };
+                      let target = null;
+                      try {
+                        target = document.querySelector(selector);
+                      } catch (e) {
+                        target = null;
+                      }
+                      const blocked = Boolean(el && target && el !== target && !target.contains(el));
+                      return {
+                        blocked,
+                        blocker: describe(el),
+                      };
+                    }
+                    """,
+                    {"selector": selector, "x": center_x, "y": center_y},
+                )
+                if isinstance(probe, dict):
+                    blocked = bool(probe.get("blocked"))
+                    blocker = str(probe.get("blocker") or "")
+        except Exception:
+            pass
+        return {
+            "selector": selector,
+            "exists": exists,
+            "visible": visible,
+            "enabled": enabled,
+            "blocked": blocked,
+            "blocker": blocker or "unknown",
+            "in_iframe": iframe_count > 1,
+            "iframe_count": iframe_count,
+        }
+
+    @staticmethod
+    def _compact_click_error(exc: Exception) -> str:
+        text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+        return re.sub(r"\s+", " ", text)[:240]
+
     async def _on_dialog(self, run_id: str, dialog: Any) -> None:
         context = self._runs.get(run_id)
         if not context:
@@ -1122,55 +1717,6 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 await dialog.dismiss()
         except Exception:
             pass
-
-    async def _click_text_fallback(self, page: Any, selector: str) -> str | None:
-        label = self._extract_text_label(selector)
-        if not label:
-            return None
-        escaped = label.replace("\\", "\\\\").replace('"', '\\"')
-        candidates = [
-            f"button:text-is(\"{escaped}\")",
-            f"[role='button']:text-is(\"{escaped}\")",
-            f"[role='tab']:text-is(\"{escaped}\")",
-            f"[role='option']:text-is(\"{escaped}\")",
-            f"[role='menuitem']:text-is(\"{escaped}\")",
-            f"a:text-is(\"{escaped}\")",
-            f"button:has-text(\"{escaped}\")",
-            f"[role='button']:has-text(\"{escaped}\")",
-            f"[role='tab']:has-text(\"{escaped}\")",
-            f"[role='option']:has-text(\"{escaped}\")",
-            f"[role='menuitem']:has-text(\"{escaped}\")",
-            f"a:has-text(\"{escaped}\")",
-            f"[aria-label='{escaped}']",
-            f"[aria-label*='{escaped}']",
-        ]
-        for candidate in candidates:
-            try:
-                locator = page.locator(candidate).first
-                if await locator.count() == 0:
-                    continue
-                await locator.click(timeout=1400)
-                return f"Clicked {candidate}"
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _extract_text_label(selector: str) -> str | None:
-        text = selector.strip()
-        text_match = re.match(r"^\s*text\s*=\s*(.+?)\s*$", text, flags=re.IGNORECASE)
-        if text_match:
-            value = text_match.group(1).strip().strip("'\"")
-            return value or None
-        exact_match = re.search(r":text-is\((['\"])(.*?)\1\)", text, flags=re.IGNORECASE)
-        if exact_match:
-            value = exact_match.group(2).strip()
-            return value or None
-        has_text_match = re.search(r":has-text\((['\"])(.*?)\1\)", text, flags=re.IGNORECASE)
-        if has_text_match:
-            value = has_text_match.group(2).strip()
-            return value or None
-        return None
 
     def _active_context(self) -> _PlaywrightRunContext:
         run_id = self._current_run_id.get()
@@ -1329,51 +1875,56 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             )
             result = await self._run_code(code)
             return str(result) if result else message
-        text_label = PlaywrightBrowserMCPClient._extract_text_label(selector)
-        if text_label:
-            escaped = text_label.replace("\\", "\\\\").replace('"', '\\"')
-            fallback_candidates = [
-                f"button:text-is(\"{escaped}\")",
-                f"[role='button']:text-is(\"{escaped}\")",
-                f"[role='tab']:text-is(\"{escaped}\")",
-                f"[role='option']:text-is(\"{escaped}\")",
-                f"[role='menuitem']:text-is(\"{escaped}\")",
-                f"a:text-is(\"{escaped}\")",
-                f"button:has-text(\"{escaped}\")",
-                f"[role='button']:has-text(\"{escaped}\")",
-                f"[role='tab']:has-text(\"{escaped}\")",
-                f"[role='option']:has-text(\"{escaped}\")",
-                f"[role='menuitem']:has-text(\"{escaped}\")",
-                f"a:has-text(\"{escaped}\")",
-                f"[aria-label='{escaped}']",
-                f"[aria-label*='{escaped}']",
-            ]
-            code = (
-                "async (page) => {"
-                f"  const primary = {json.dumps(selector)};"
-                f"  const candidates = {json.dumps(fallback_candidates)};"
-                "  const all = [primary, ...candidates];"
-                "  for (const c of all) {"
-                "    try {"
-                "      const locator = page.locator(c).first();"
-                "      if ((await locator.count()) === 0) continue;"
-                "      await locator.click({ timeout: 1400 });"
-                "      return `Clicked ${c}`;"
-                "    } catch (e) {}"
-                "  }"
-                "  throw new Error(`Unable to click selector: ${primary}`);"
-                "}"
-            )
-            result = await self._run_code(code)
-            return str(result) if result else message
         code = (
             "async (page) => {"
-            f"  await page.locator({json.dumps(selector)}).first().click();"
+            f"  const locator = page.locator({json.dumps(selector)}).first();"
+            "  try { await locator.waitFor({ state: 'visible', timeout: 2200 }); } catch (e) {}"
+            "  try { await locator.scrollIntoViewIfNeeded({ timeout: 1200 }); } catch (e) {}"
+            "  try { await locator.hover({ timeout: 900 }); } catch (e) {}"
+            "  try {"
+            "    await locator.click({ timeout: 2400 });"
+            "  } catch (e1) {"
+            "    try {"
+            "      await locator.click({ timeout: 1800, force: true });"
+            "    } catch (e2) {"
+            "      let tagName = '';"
+            "      try {"
+            "        tagName = await locator.evaluate((el) => {"
+            "          if (!(el instanceof HTMLElement)) {"
+            "            throw new Error('Resolved node is not an HTMLElement');"
+            "          }"
+            "          return (el.tagName || '').toLowerCase();"
+            "        });"
+            "      } catch (e3) {}"
+            "      if (tagName === 'button' || tagName === 'a') {"
+            "        try { await locator.press('Enter', { timeout: 900 }); return " + json.dumps(message) + "; } catch (e4) {}"
+            "        try { await locator.press('Space', { timeout: 900 }); return " + json.dumps(message) + "; } catch (e5) {}"
+            "      }"
+            "      await locator.evaluate((el) => {"
+            "        if (!(el instanceof HTMLElement)) {"
+            "          throw new Error('Resolved node is not an HTMLElement');"
+            "        }"
+            "        el.focus();"
+            "        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));"
+            "      });"
+            "    }"
+            "  }"
             f"  return {json.dumps(message)};"
             "}"
         )
-        await self._run_code(code)
-        return message
+        try:
+            await self._run_code(code)
+            return message
+        except Exception as exc:
+            diagnostics = await self._collect_click_diagnostics_mcp(selector)
+            raise ValueError(
+                f"Click failed for {selector}. "
+                f"selector={diagnostics['selector']}; exists={diagnostics['exists']}; "
+                f"visible={diagnostics['visible']}; enabled={diagnostics['enabled']}; "
+                f"blocked={diagnostics['blocked']}; blocker={diagnostics['blocker']}; "
+                f"in_iframe={diagnostics['in_iframe']}; iframe_count={diagnostics['iframe_count']}; "
+                f"reason={self._compact_click_error(exc)}"
+            ) from exc
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         mode = "after clear" if clear_first else "append"
@@ -2053,6 +2604,420 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception as exc:
             raise ValueError("Unable to decode screenshot data returned from Browser MCP") from exc
 
+    async def inspect_page(self, include_screenshot: bool = True) -> dict[str, Any]:
+        code = (
+            "async (page) => {"
+            "  const cssEscape = (value) => {"
+            "    if (!value) return '';"
+            "    return String(value).replace(/([ #;?%&,.+*~\\\\':\\\"!^$\\\\[\\\\]()=>|/@])/g, '\\\\\\\\$1');"
+            "  };"
+            "  const detectScope = (el) => {"
+            "    const scopes = ["
+            "      ['form', 'form'],"
+            "      [\"[role='search']\", 'search'],"
+            "      ['main, [role=\"main\"]', 'main'],"
+            "      ['nav, [role=\"navigation\"]', 'nav'],"
+            "      ['header', 'header'],"
+            "      ['article, [role=\"article\"]', 'article'],"
+            "      ['aside', 'aside'],"
+            "      ['footer', 'footer'],"
+            "      [\"[role='dialog'], dialog, .modal\", 'dialog'],"
+            "    ];"
+            "    for (const [selector, label] of scopes) {"
+            "      try { if (el.closest(selector)) return label; } catch (error) {}"
+            "    }"
+            "    return 'body';"
+            "  };"
+            "  const titleLinkSelector = (el) => {"
+            "    try {"
+            "      if (!(el instanceof Element)) return null;"
+            "      if (el.matches('a#video-title')) {"
+            "        const all = Array.from(document.querySelectorAll('a#video-title'));"
+            "        const index = all.indexOf(el);"
+            "        if (index >= 0) return `a#video-title >> nth=${index}`;"
+            "      }"
+            "      const amazonTitle = el.matches(\"div[data-component-type='s-search-result'] h2 a\")"
+            "        ? el"
+            "        : el.closest(\"div[data-component-type='s-search-result']\")?.querySelector(\"h2 a, [data-cy='title-recipe-title'] a\");"
+            "      if (amazonTitle) {"
+            "        const all = Array.from(document.querySelectorAll(\"div[data-component-type='s-search-result'] h2 a, div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a\"));"
+            "        const index = all.indexOf(amazonTitle);"
+            "        if (index >= 0) {"
+            "          if (amazonTitle.matches(\"[data-cy='title-recipe-title'] a\")) return `div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a >> nth=${index}`;"
+            "          return `div[data-component-type='s-search-result'] h2 a >> nth=${index}`;"
+            "        }"
+            "      }"
+            "      if (el.matches('article a[href], li a[href], [role=\"listitem\"] a[href]')) {"
+            "        const card = el.closest('article, li, [role=\"listitem\"]');"
+            "        const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 80);"
+            "        if (card && text) {"
+            "          const linkInCard = card.querySelector('h1 a, h2 a, h3 a, a');"
+            "          if (linkInCard === el) return `a:has-text(\"${text.replace(/\"/g, '\\\\\"')}\")`;"
+            "        }"
+            "      }"
+            "    } catch (error) {}"
+            "    return null;"
+            "  };"
+            "  const nodes = Array.from(document.querySelectorAll(\"button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]\"));"
+            "  const interactive = nodes.map((el) => {"
+            "    const tag = (el.tagName || '').toLowerCase();"
+            "    const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 120);"
+            "    const aria = el.getAttribute('aria-label') || '';"
+            "    const name = el.getAttribute('name') || '';"
+            "    const id = el.getAttribute('id') || '';"
+            "    const testid = el.getAttribute('data-testid') || '';"
+            "    const role = el.getAttribute('role') || '';"
+            "    const placeholder = el.getAttribute('placeholder') || '';"
+            "    const href = el.getAttribute('href') || '';"
+            "    const inputType = el.getAttribute('type') || '';"
+            "    const scope = detectScope(el);"
+            "    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;"
+            "    const style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(el) : null;"
+            "    const visible = !!(rect && rect.width > 0 && rect.height > 0 && style && style.visibility !== 'hidden' && style.display !== 'none');"
+            "    const enabled = !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true';"
+            "    const selectors = [];"
+            "    if (id) selectors.push(`#${cssEscape(id)}`);"
+            "    if (testid) selectors.push(`[data-testid=\\\"${String(testid).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
+            "    if (name && ['input', 'textarea', 'select'].includes(tag)) selectors.push(`${tag}[name=\\\"${String(name).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
+            "    const titleLink = titleLinkSelector(el);"
+            "    if (titleLink) selectors.push(titleLink);"
+            "    if (tag === 'a' && href) selectors.push(`a[href*=\\\"${href.slice(0, 120).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
+            "    return { tag, type: inputType, text, aria, name, id, testid, role, placeholder, href: href.slice(0, 120), scope, visible, enabled, selectors };"
+            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder).slice(0, 40);"
+            "  return {"
+            "    url: page.url(),"
+            "    title: await page.title(),"
+            "    text_excerpt: ((document.body?.innerText || '').replace(/\\s+/g, ' ').trim()).slice(0, 3000),"
+            "    interactive_elements: interactive,"
+            "  };"
+            "}"
+        )
+        result = await self._run_code(code)
+        try:
+            payload = json.loads(result)
+        except Exception:
+            payload = {
+                "url": "",
+                "title": "",
+                "text_excerpt": str(result)[:3000],
+                "interactive_elements": [],
+            }
+        if include_screenshot:
+            screenshot_code = (
+                "async (page) => {"
+                "  const bytes = await page.screenshot({ type: 'jpeg', quality: 55 });"
+                "  return bytes.toString('base64');"
+                "}"
+            )
+            try:
+                payload["screenshot_base64"] = await self._run_code(screenshot_code)
+                payload["screenshot_mime_type"] = "image/jpeg"
+            except Exception:
+                payload["screenshot_base64"] = ""
+                payload["screenshot_mime_type"] = "image/jpeg"
+        return payload
+
+    async def get_element_value(self, selector: str) -> str | None:
+        code = (
+            "async (page) => {"
+            f"  const locator = page.locator({json.dumps(selector)}).first();"
+            "  try {"
+            "    const value = await locator.inputValue();"
+            "    return value ?? null;"
+            "  } catch (error) {}"
+            "  try {"
+            "    const fallback = await locator.evaluate((el) => {"
+            "      if (!(el instanceof Element)) return null;"
+            "      if ('value' in el && typeof el.value === 'string') return el.value;"
+            "      return el.getAttribute('value') || el.textContent || null;"
+            "    });"
+            "    return fallback ?? null;"
+            "  } catch (error) {"
+            "    return null;"
+            "  }"
+            "}"
+        )
+        result = await self._run_code(code)
+        if result in {None, "null", ""}:
+            return None
+        return str(result)
+
+    async def get_select_value(self, selector: str) -> str | None:
+        code = (
+            "async (page) => {"
+            f"  const locator = page.locator({json.dumps(selector)}).first();"
+            "  try {"
+            "    const value = await locator.evaluate((el) => {"
+            "      if (!(el instanceof Element)) return null;"
+            "      if (el instanceof HTMLSelectElement) return el.value || null;"
+            "      if ('value' in el && typeof el.value === 'string') return el.value;"
+            "      return null;"
+            "    });"
+            "    return value ?? null;"
+            "  } catch (error) {"
+            "    return null;"
+            "  }"
+            "}"
+        )
+        result = await self._run_code(code)
+        if result in {None, "null", ""}:
+            return None
+        return str(result)
+
+    async def get_element_context(self, selector: str) -> dict[str, Any] | None:
+        code = (
+            "async (page) => {"
+            f"  const locator = page.locator({json.dumps(selector)}).first();"
+            "  try {"
+            "    const payload = await locator.evaluate((el) => {"
+            "      if (!(el instanceof Element)) return null;"
+            "      const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 160);"
+            "      return {"
+            "        text,"
+            "        title: (el.getAttribute('title') || '').slice(0, 160),"
+            "        aria: (el.getAttribute('aria-label') || '').slice(0, 160),"
+            "        href: (el.getAttribute('href') || '').slice(0, 200),"
+            "        tag: (el.tagName || '').toLowerCase(),"
+            "      };"
+            "    });"
+            "    return JSON.stringify(payload);"
+            "  } catch (error) { return 'null'; }"
+            "}"
+        )
+        result = await self._run_code(code)
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["selector"] = selector
+        return payload
+
+    async def assess_click_effect(
+        self,
+        selector: str,
+        before_snapshot: dict[str, Any] | None = None,
+        raw_selector: str | None = None,
+        text_hint: str | None = None,
+        target_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        before = before_snapshot or {}
+        before_url = str(before.get("url") or "")
+        before_title = str(before.get("title") or "")
+        before_text = str(before.get("text_excerpt") or "")
+        before_page_count = int(before.get("page_count") or 1)
+        code = (
+            "async (page) => {"
+            f"  const selector = {json.dumps(selector)};"
+            "  await page.waitForTimeout(250);"
+            "  const locator = page.locator(selector).first();"
+            "  let visible = false;"
+            "  let enabled = false;"
+            "  let tag = '';"
+            "  try { visible = await locator.isVisible(); } catch (error) {}"
+            "  try { enabled = await locator.isEnabled(); } catch (error) {}"
+            "  try { tag = await locator.evaluate('el => el.tagName.toLowerCase()'); } catch (error) {}"
+            "  const textExcerpt = ((document.body?.innerText || '').replace(/\\s+/g, ' ').trim()).slice(0, 3000);"
+            "  return JSON.stringify({"
+            "    url: page.url(),"
+            "    title: await page.title(),"
+            "    text_excerpt: textExcerpt,"
+            "    page_count: 1,"
+            "    visible,"
+            "    enabled,"
+            "    tag"
+            "  });"
+            "}"
+        )
+        result = await self._run_code(code)
+        try:
+            after = json.loads(result)
+        except Exception:
+            after = {"url": "", "title": "", "text_excerpt": "", "visible": True, "enabled": True}
+        after_url = str(after.get("url") or "")
+        after_title = str(after.get("title") or "")
+        after_text = str(after.get("text_excerpt") or "")
+        after_page_count = int(after.get("page_count") or 1)
+        visible = bool(after.get("visible", True))
+        enabled = bool(after.get("enabled", True))
+        element_tag = str(after.get("tag") or "").lower().strip()
+        intent_text = " ".join(part for part in (selector, raw_selector or "", text_hint or "") if part).lower()
+        target_terms = PlaywrightBrowserMCPClient._context_match_terms(target_context)
+        after_haystack = " ".join(part for part in (after_url, after_title, after_text) if part).lower()
+        matching_terms = [term for term in target_terms if term in after_haystack]
+        requires_target_match = bool(target_terms) and any(
+            token in intent_text
+            for token in ("result", "product", "video", "title link", "non-sponsored", "s-search-result", "video-title")
+        )
+        expects_search_result_navigation = any(
+            token in intent_text
+            for token in (
+                "s-search-result",
+                "product title",
+                "product card",
+                "non-sponsored product",
+                "second product",
+                "h2 a",
+                "a-link-normal",
+                "title-recipe-title",
+            )
+        )
+
+        if after_page_count > before_page_count:
+            if requires_target_match and len(matching_terms) < min(2, len(target_terms)):
+                return {
+                    "status": "failed",
+                    "detail": "New page/tab opened but destination did not match the clicked item context.",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "passed",
+                "detail": f"New page/tab opened after click ({before_page_count} -> {after_page_count})",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+
+        if before_url != after_url:
+            if requires_target_match and len(matching_terms) < min(2, len(target_terms)):
+                return {
+                    "status": "failed",
+                    "detail": "Navigation happened but destination did not match the clicked item context.",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "passed",
+                "detail": f"URL changed from {before_url or '<empty>'} to {after_url or '<empty>'}",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if before_title != after_title:
+            return {
+                "status": "passed",
+                "detail": f"Title changed from {before_title or '<empty>'} to {after_title or '<empty>'}",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if expects_search_result_navigation and before_url and "/s?" in before_url and (not after_url or "/s?" in after_url):
+            return {
+                "status": "failed",
+                "detail": "Search-result click did not leave the results page or open a new product page/tab.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if before_text != after_text:
+            return {
+                "status": "passed",
+                "detail": "Page text changed after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if not visible:
+            return {
+                "status": "passed",
+                "detail": "Clicked element is no longer visible after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if not enabled:
+            return {
+                "status": "passed",
+                "detail": "Clicked element became disabled after click",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        if element_tag in _DISPLAY_TAGS:
+            return {
+                "status": "passed",
+                "detail": f"Non-interactive display element (<{element_tag}>) clicked — no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Form input elements (input, textarea) receive focus when clicked.
+        # No page navigation is expected — clicking a search box, text field,
+        # checkbox, or radio button just activates it.
+        if element_tag in {"input", "textarea"}:
+            return {
+                "status": "passed",
+                "detail": f"Form input element (<{element_tag}>) clicked — focus/activation only, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        return {
+            "status": "failed",
+            "detail": "Click effect not observed: page URL/title/text stayed the same and the element remained visible/enabled.",
+            "selector": selector,
+            "before_url": before_url,
+            "after_url": after_url,
+        }
+
+    async def _collect_click_diagnostics_mcp(self, selector: str) -> dict[str, Any]:
+        code = (
+            "async (page) => {"
+            f"  const selector = {json.dumps(selector)};"
+            "  const locator = page.locator(selector).first();"
+            "  let exists = false, visible = false, enabled = false, blocked = false;"
+            "  let blocker = 'unknown';"
+            "  try { exists = (await page.locator(selector).count()) > 0; } catch (e) {}"
+            "  try { visible = await locator.isVisible(); } catch (e) {}"
+            "  try { enabled = await locator.isEnabled(); } catch (e) {}"
+            "  try {"
+            "    const box = await locator.boundingBox();"
+            "    if (box) {"
+            "      const cx = box.x + (box.width / 2);"
+            "      const cy = box.y + (box.height / 2);"
+            "      const probe = await page.evaluate(({ selector, x, y }) => {"
+            "        const el = document.elementFromPoint(x, y);"
+            "        const describe = (node) => {"
+            "          if (!(node instanceof Element)) return '';"
+            "          const tag = (node.tagName || '').toLowerCase();"
+            "          const id = node.id ? '#' + node.id : '';"
+            "          const cls = node.className && typeof node.className === 'string' ? '.' + node.className.trim().split(/\\s+/).slice(0,3).join('.') : '';"
+            "          const text = (node.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80);"
+            "          return tag + id + cls + (text ? ` text=\"${text}\"` : '');"
+            "        };"
+            "        let target = null;"
+            "        try { target = document.querySelector(selector); } catch (e) { target = null; }"
+            "        return { blocked: Boolean(el && target && el !== target && !target.contains(el)), blocker: describe(el) };"
+            "      }, { selector, x: cx, y: cy });"
+            "      blocked = Boolean(probe && probe.blocked);"
+            "      blocker = String((probe && probe.blocker) || 'unknown');"
+            "    }"
+            "  } catch (e) {}"
+            "  return JSON.stringify({ selector, exists, visible, enabled, blocked, blocker, in_iframe: page.frames().length > 1, iframe_count: page.frames().length });"
+            "}"
+        )
+        try:
+            result = await self._run_code(code)
+            payload = json.loads(result)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {
+            "selector": selector,
+            "exists": False,
+            "visible": False,
+            "enabled": False,
+            "blocked": False,
+            "blocker": "unknown",
+            "in_iframe": False,
+            "iframe_count": 0,
+        }
+
     def _active_context(self) -> _MCPPlaywrightRunContext:
         run_id = self._current_run_id.get()
         if not run_id:
@@ -2083,6 +3048,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             return parsed
         if isinstance(parsed, bool):
             return "true" if parsed else "false"
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed)
         return str(parsed)
 
     async def _call_tool(self, context: _MCPPlaywrightRunContext, tool_name: str, arguments: dict[str, Any]) -> Any:

@@ -37,6 +37,26 @@
   flex-wrap: wrap;
 }
 
+.authPanel {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.authTitle {
+  color: var(--ink-900);
+  font-weight: 700;
+}
+
+.authForm {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  width: min(100%, 720px);
+}
+
 .linkButton {
   border: none;
   background: transparent;
@@ -222,6 +242,14 @@
 }
 
 @media (max-width: 720px) {
+  .authPanel {
+    align-items: stretch;
+  }
+
+  .authForm {
+    grid-template-columns: 1fr;
+  }
+
   .newRow {
     grid-template-columns: 1fr;
   }

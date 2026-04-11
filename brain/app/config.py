@@ -5,15 +5,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    llm_mode: Literal["local", "cloud"] = "local"
+    llm_mode: Literal["local", "cloud", "anthropic"] = "local"
     log_level: str = "INFO"
 
-    vllm_base_url: str = "http://localhost:8001/v1"
+    vllm_base_url: str = "http://192.168.0.33:8001/v1"
     vllm_api_key: str = "local-key"
     vllm_model: str = "meta-llama/Llama-3.1-8B-Instruct"
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
 
     brain_api_key: str = ""
 
