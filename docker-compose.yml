@@ -5,7 +5,6 @@ services:
       - "3000"
     environment:
       - NODE_ENV=production
-      - NEXT_PUBLIC_API_BASE_URL=http://localhost
 
   backend:
     build: ./backend
