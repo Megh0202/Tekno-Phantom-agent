@@ -422,3 +422,46 @@ def test_verify_message_line_maps_to_verify_text_step() -> None:
         "match": "contains",
         "value": "Passwords must match",
     }
+
+
+def test_signup_prompt_generates_named_field_steps_in_order() -> None:
+    task = """
+Launch the application and open the link in the browser - https://atozbay-demo.aercjbp.com/signup
+Enter First Name as - Test01
+Enter Surname as - Last01
+Enter email as - Test0101@yopmail.com
+Enter phone as - 91991919919
+
+Click on Next button
+
+Enter Password as - Abcd@1234
+Enter Confirm Password as - Abcd@1234
+
+Click on Create Account Button
+
+Verify the success message - "You have successfully registered"
+
+On the Top Left Corner, Click on First Name of the User
+and Click on Logout link
+"""
+    steps = parse_structured_task_steps(task, max_steps=30)
+
+    assert steps == [
+        {"type": "navigate", "url": "https://atozbay-demo.aercjbp.com/signup"},
+        {"type": "type", "selector": "{{selector.first_name}}", "text": "Test01", "clear_first": True},
+        {"type": "type", "selector": "{{selector.surname}}", "text": "Last01", "clear_first": True},
+        {"type": "type", "selector": "{{selector.email}}", "text": "Test0101@yopmail.com", "clear_first": True},
+        {"type": "type", "selector": "{{selector.phone}}", "text": "91991919919", "clear_first": True},
+        {"type": "click", "selector": "{{selector.next_button}}"},
+        {"type": "type", "selector": "{{selector.password}}", "text": "Abcd@1234", "clear_first": True},
+        {"type": "type", "selector": "{{selector.confirm_password}}", "text": "Abcd@1234", "clear_first": True},
+        {"type": "click", "selector": "{{selector.create_account}}"},
+        {
+            "type": "verify_text",
+            "selector": "text=You have successfully registered",
+            "match": "contains",
+            "value": "You have successfully registered",
+        },
+        {"type": "click", "selector": "{{selector.top_left_corner}}"},
+        {"type": "click", "selector": "{{selector.logout_link}}"},
+    ]

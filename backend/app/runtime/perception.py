@@ -117,12 +117,27 @@ def _selector_stability_rank(sel: str) -> int:
     return 7                                            # everything else
 
 
-def _build_selectors_for_element(item: dict[str, Any]) -> tuple[str, ...]:
+def _selector_uses_duplicate_id(sel: str, duplicate_id_counts: dict[str, int] | None) -> bool:
+    selector = sel.strip()
+    if not selector.startswith("#"):
+        return False
+    selector_id = selector[1:]
+    return int((duplicate_id_counts or {}).get(selector_id, 0)) > 1
+
+
+def _build_selectors_for_element(
+    item: dict[str, Any],
+    duplicate_id_counts: dict[str, int] | None = None,
+) -> tuple[str, ...]:
     """
     Merge DOM-provided selectors with selectors we construct from stable
     attributes, then sort by stability.
     """
-    raw: list[str] = list(item.get("selectors") or [])
+    raw = [
+        str(selector).strip()
+        for selector in (item.get("selectors") or [])
+        if str(selector).strip() and not _selector_uses_duplicate_id(str(selector), duplicate_id_counts)
+    ]
 
     eid        = str(item.get("id", "")).strip()
     testid     = str(item.get("testid", "")).strip()
@@ -134,7 +149,7 @@ def _build_selectors_for_element(item: dict[str, Any]) -> tuple[str, ...]:
     role       = str(item.get("role", "")).strip()
 
     extras: list[str] = []
-    if eid:
+    if eid and int((duplicate_id_counts or {}).get(eid, 0)) <= 1:
         extras.append(f"#{eid}")
     if testid:
         extras.append(f"[data-testid='{testid}']")
@@ -167,6 +182,14 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
     """
     url = str(snapshot.get("url", ""))
     raw_elements: list[Any] = snapshot.get("interactive_elements") or []
+    duplicate_id_counts: dict[str, int] = {}
+    for item in raw_elements:
+        if not isinstance(item, dict):
+            continue
+        eid = str(item.get("id", "")).strip()
+        if not eid:
+            continue
+        duplicate_id_counts[eid] = duplicate_id_counts.get(eid, 0) + 1
 
     elements: list[IndexedElement] = []
     for item in raw_elements:
@@ -175,7 +198,7 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
         if not item.get("visible", True):
             continue  # invisible = not interactable right now
 
-        selectors = _build_selectors_for_element(item)
+        selectors = _build_selectors_for_element(item, duplicate_id_counts)
         elements.append(IndexedElement(
             tag=str(item.get("tag", "")).strip().lower(),
             role=str(item.get("role", "")).strip(),

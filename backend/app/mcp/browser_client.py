@@ -115,6 +115,7 @@ class BrowserMCPClient:
         return
 
     async def navigate(self, url: str) -> str:
+        setattr(self, "_mock_current_url", url)
         await asyncio.sleep(0.1)
         return f"Navigated to {url}"
 
@@ -215,10 +216,19 @@ class BrowserMCPClient:
 
     async def inspect_page(self, include_screenshot: bool = True) -> dict[str, Any]:
         await asyncio.sleep(0.05)
+        current_url = str(getattr(self, "_mock_current_url", "") or "")
+        title = "Mock Browser"
+        text_excerpt = ""
+        if "example.com" in current_url:
+            title = "Example Domain"
+            text_excerpt = "Example Domain"
+        elif "selenium.dev/selenium/web/web-form.html" in current_url:
+            title = "Web form"
+            text_excerpt = "Web form"
         payload = {
-            "url": "",
-            "title": "Mock Browser",
-            "text_excerpt": "",
+            "url": current_url,
+            "title": title,
+            "text_excerpt": text_excerpt,
             "interactive_elements": [],
             "page_count": 1,
         }

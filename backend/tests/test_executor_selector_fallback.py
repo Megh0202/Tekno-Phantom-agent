@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.runtime.executor import AgentExecutor, CandidateConfidence
+from app.runtime.perception import build_element_index, find_best_match
 from app.runtime.selector_memory import InMemorySelectorMemoryStore
 from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
 
@@ -128,6 +129,69 @@ def test_selector_candidates_use_default_email_profile() -> None:
     assert candidates[0] == "input[type='email']"
     assert "input[name='username']" in candidates
     assert "input[type='email']" in candidates
+
+
+def test_selector_candidates_include_signup_alias_defaults() -> None:
+    executor = _executor()
+
+    assert "input[name='name']" in executor._selector_candidates(
+        raw_selector="{{selector.first_name}}",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="Test01",
+    )
+    assert "input[name='surname']" in executor._selector_candidates(
+        raw_selector="{{selector.surname}}",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="Last01",
+    )
+    assert "input[type='tel']" in executor._selector_candidates(
+        raw_selector="{{selector.phone}}",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="91991919919",
+    )
+    assert "input[name='confirm_password']" in executor._selector_candidates(
+        raw_selector="{{selector.confirm_password}}",
+        step_type="type",
+        selector_profile={},
+        test_data={},
+        run_domain=None,
+        text_hint="Abcd@1234",
+    )
+
+
+def test_duplicate_ids_do_not_become_grounded_or_snapshot_primary_selectors() -> None:
+    executor = _executor()
+    snapshot = {
+        "url": "https://atozbay-demo.aercjbp.com/signup",
+        "interactive_elements": [
+            {"tag": "input", "id": "floatingInput", "name": "name", "selectors": ["#floatingInput"], "visible": True, "enabled": True},
+            {"tag": "input", "id": "floatingInput", "name": "surname", "selectors": ["#floatingInput"], "visible": True, "enabled": True},
+            {"tag": "input", "id": "floatingInput", "name": "email", "selectors": ["#floatingInput"], "visible": True, "enabled": True},
+        ],
+    }
+
+    candidates = executor._page_snapshot_selector_candidates(
+        snapshot,
+        "{{selector.surname}}",
+        "type",
+        "Last01",
+    )
+    assert candidates
+    assert candidates[0] == 'input[name="surname"]'
+    assert "#floatingInput" not in candidates[:3]
+
+    perception = find_best_match("surname", "type", build_element_index(snapshot))
+    assert perception is not None
+    assert perception.selector == "input[name='surname']"
 
 
 def test_type_selector_candidates_prioritize_explicit_selector_before_email_aliases() -> None:
@@ -279,6 +343,65 @@ def test_selector_fallback_tries_multiple_candidates() -> None:
     assert "input[name='username']" in attempted
 
 
+def test_selector_fallback_prefers_profile_candidates_before_live_dom_rerank_without_grounding() -> None:
+    executor = _executor(step_timeout_seconds=6)
+
+    class _Browser:
+        async def inspect_page(self, include_screenshot: bool = True) -> dict[str, object]:
+            return {
+                "url": "https://example.com/login",
+                "title": "Login",
+                "text_excerpt": "Email",
+                "interactive_elements": [
+                    {
+                        "tag": "input",
+                        "role": "textbox",
+                        "text": "",
+                        "name": "emailLive",
+                        "id": "live-email",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "form",
+                    }
+                ],
+                "page_count": 1,
+            }
+
+        async def wait_for(
+            self,
+            until: str,
+            ms: int | None = None,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            return f"Waited for {selector}"
+
+    executor._browser = _Browser()
+    attempted: list[str] = []
+
+    async def operation(selector: str) -> str:
+        attempted.append(selector)
+        if selector == "input[type='email']":
+            return f"Typed into {selector} (after clear)"
+        raise ValueError(f"Missing {selector}")
+
+    result = asyncio.run(
+        executor._run_with_selector_fallback(
+            raw_selector="input[type='email']",
+            step_type="type",
+            selector_profile={},
+            test_data={},
+            run_domain=None,
+            operation=operation,
+            text_hint="qa@example.com",
+        )
+    )
+
+    assert result == "Typed into input[type='email'] (after clear)"
+    assert attempted[0] == "input[type='email']"
+    assert "#live-email" not in attempted
+
+
 def test_selector_fallback_error_lists_attempts() -> None:
     executor = _executor(step_timeout_seconds=4)
 
@@ -372,6 +495,33 @@ def test_classify_execution_path_prefers_fast_path_for_simple_type_selector() ->
     assert classification["path"] == "fast"
     assert classification["reason"] == "simple_selector"
     assert classification["primary_selector"] == "#searchInput"
+
+
+def test_classify_execution_path_prefers_grounded_selector_over_alias_slow_path() -> None:
+    executor = _executor()
+    run = RunState(
+        run_id="run-grounded-fast",
+        run_name="Grounded Fast",
+        status=RunStatus.pending,
+        steps=[],
+        selector_profile={},
+        test_data={},
+    )
+    step = StepRuntimeState(
+        index=0,
+        type="click",
+        input={
+            "type": "click",
+            "selector": "{{selector.create_form}}",
+            "_grounded_selector": "#createForm",
+        },
+    )
+
+    classification = executor._classify_execution_path(run, step)
+
+    assert classification["path"] == "fast"
+    assert classification["reason"] == "grounded_selector"
+    assert classification["primary_selector"] == "#createForm"
 
 
 def test_build_step_intent_captures_element_type_target_and_ordinal() -> None:
@@ -952,6 +1102,43 @@ def test_execute_step_switches_to_waiting_for_input_on_selector_failure() -> Non
     assert step.user_input_kind == "selector"
     assert "Please provide a Playwright selector" in (step.user_input_prompt or "")
     assert step.requested_selector_target == "button:has-text('Workflows')"
+
+
+def test_execute_step_continues_to_selector_pipeline_after_page_assertion_failure() -> None:
+    executor = _executor(step_timeout_seconds=4)
+    executor._settings.selector_help_mode = "pause"
+
+    async def _raise_page_assertion(*args, **kwargs):
+        raise ValueError("Page state assertion failed before type: no element matched intent 'phone' on the current page.")
+
+    async def _dispatch_step(run: RunState, raw_step: dict) -> str:
+        raise ValueError("All selector candidates failed: pass 1: input[type='tel'] -> timeout")
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    executor._assert_step_page_state = _raise_page_assertion
+    executor._dispatch_step = _dispatch_step
+    executor._safe_page_snapshot = _noop
+    executor._check_page_health = lambda *args, **kwargs: {"status": "ok", "issues": []}
+    executor._files = SimpleNamespace(
+        write_text_artifact=_noop,
+        write_bytes_artifact=_noop,
+    )
+    executor._capture_failure_screenshot = lambda *args, **kwargs: asyncio.sleep(0)
+
+    run = RunState(run_name="selector-help-run", steps=[])
+    step = StepRuntimeState(
+        index=0,
+        type="type",
+        input={"type": "type", "selector": "{{selector.phone}}", "text": "91991919919"},
+    )
+
+    asyncio.run(executor._execute_step(run, step))
+
+    assert step.status == StepStatus.waiting_for_input
+    assert step.user_input_kind == "selector"
+    assert step.requested_selector_target == "{{selector.phone}}"
 
 
 def test_click_selector_parse_error_still_requests_selector_help() -> None:
@@ -1848,6 +2035,158 @@ def test_grounded_selection_prefers_live_page_match_over_profile_guess() -> None
     )
 
     assert result == "Clicked #create-form-live"
+
+
+def test_grounded_selection_prefers_matching_live_button_over_nav_links() -> None:
+    executor = _executor(step_timeout_seconds=4)
+
+    class _Browser:
+        async def inspect_page(self, include_screenshot: bool = True) -> dict[str, object]:
+            return {
+                "url": "https://example.com/forms",
+                "title": "Forms",
+                "text_excerpt": "Create Form Lists Custom fields Content blocks",
+                "interactive_elements": [
+                    {
+                        "tag": "a",
+                        "role": "link",
+                        "text": "Lists",
+                        "href": "/admin-next/engage/forms/lists",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "main",
+                    },
+                    {
+                        "tag": "a",
+                        "role": "link",
+                        "text": "Custom fields",
+                        "href": "/admin-next/engage/forms/fields",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "main",
+                    },
+                    {
+                        "tag": "button",
+                        "role": "button",
+                        "text": "Create Form",
+                        "name": "createForm",
+                        "id": "create-form-live",
+                        "visible": True,
+                        "enabled": True,
+                        "scope": "main",
+                    },
+                ],
+                "page_count": 1,
+            }
+
+        async def wait_for(
+            self,
+            *,
+            until: str,
+            ms: int,
+            selector: str | None = None,
+            load_state: str | None = None,
+        ) -> str:
+            return "visible"
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._run_with_selector_fallback(
+            raw_selector="{{selector.create_form}}",
+            step_type="click",
+            selector_profile={},
+            test_data={},
+            run_domain="test.vitaone.io",
+            operation=lambda selector: asyncio.sleep(0, result=f"Clicked {selector}"),
+        )
+    )
+
+    assert result == "Clicked #create-form-live"
+
+
+def test_validate_click_post_action_rejects_wrong_target_even_if_navigation_changes() -> None:
+    executor = _executor()
+
+    class _Browser:
+        async def assess_click_effect(
+            self,
+            selector: str,
+            before_snapshot: dict[str, object] | None = None,
+            raw_selector: str | None = None,
+            text_hint: str | None = None,
+            target_context: dict[str, object] | None = None,
+        ) -> dict[str, str]:
+            return {
+                "status": "passed",
+                "detail": "URL changed from /forms to /forms/lists",
+            }
+
+    executor._browser = _Browser()
+
+    with pytest.raises(ValueError, match="Click target mismatch"):
+        asyncio.run(
+            executor._validate_click_post_action(
+                resolved_selector='a[href*="/admin-next/engage/forms/lists"]',
+                raw_selector="{{selector.create_form}}",
+                text_hint=None,
+                before_snapshot={
+                    "page_snapshot": {
+                        "url": "https://test.vitaone.io/admin-next/engage/forms",
+                        "title": "Forms - Engage",
+                    },
+                    "element_context": {
+                        "text": "Lists",
+                        "title": "",
+                        "aria": "",
+                        "href": "/admin-next/engage/forms/lists",
+                    },
+                },
+            )
+        )
+
+
+def test_validate_click_post_action_accepts_sign_in_for_login_button() -> None:
+    executor = _executor()
+
+    class _Browser:
+        async def assess_click_effect(
+            self,
+            selector: str,
+            before_snapshot: dict[str, object] | None = None,
+            raw_selector: str | None = None,
+            text_hint: str | None = None,
+            target_context: dict[str, object] | None = None,
+        ) -> dict[str, str]:
+            return {
+                "status": "passed",
+                "detail": "URL changed from /auth to /dashboard",
+            }
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._validate_click_post_action(
+            resolved_selector='button:has-text("Sign In")',
+            raw_selector="{{selector.login_button}}",
+            text_hint=None,
+            before_snapshot={
+                "page_snapshot": {
+                    "url": "https://example.com/auth",
+                    "title": "Sign in",
+                },
+                "element_context": {
+                    "text": "Sign In",
+                    "title": "",
+                    "aria": "",
+                    "href": "",
+                    "selector": 'button:has-text("Sign In")',
+                },
+            },
+        )
+    )
+
+    assert result == "post_validation=passed (URL changed from /auth to /dashboard)"
 
 
 def test_transition_canvas_click_short_circuits_when_label_is_visible() -> None:

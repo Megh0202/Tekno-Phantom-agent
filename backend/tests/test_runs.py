@@ -271,12 +271,20 @@ def test_selector_submit_retries_blocked_step_immediately() -> None:
     executor = app.state.executor
     run_store = app.state.run_store
 
-    original_dispatch = executor._dispatch_step
+    original_execute = executor.execute
     try:
-        async def _dispatch(run: RunState, raw_step: dict) -> str:
-            return f"Clicked {raw_step['selector']}"
+        async def _execute(run_id: str) -> None:
+            run = run_store.get(run_id)
+            assert run is not None
+            step = run.steps[0]
+            step.status = StepStatus.completed
+            step.message = f"Clicked {step.input['selector']}"
+            step.error = None
+            step.failure_screenshot = None
+            run.status = RunStatus.completed
+            run_store.persist(run)
 
-        executor._dispatch_step = _dispatch
+        executor.execute = _execute
         run = RunState(
             run_name="selector-submit-run",
             status=RunStatus.waiting_for_input,
@@ -309,4 +317,4 @@ def test_selector_submit_retries_blocked_step_immediately() -> None:
         assert step["failure_screenshot"] is None
         assert payload["status"] == "completed"
     finally:
-        executor._dispatch_step = original_dispatch
+        executor.execute = original_execute

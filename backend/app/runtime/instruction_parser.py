@@ -203,6 +203,7 @@ def _normalize_line(raw: str) -> str:
         .strip()
     )
     cleaned = _LINE_PREFIX_RE.sub("", cleaned)
+    cleaned = re.sub(r"^\s*and\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
 
@@ -229,6 +230,10 @@ def _parse_line(
     ):
         return {"type": "navigate", "url": url}
 
+    named_field_entry = _parse_named_field_entry(line)
+    if named_field_entry is not None:
+        return named_field_entry
+
     if any(token in lower for token in ("enter email", "type email", "email -", "email:", "into email", "email field")):
         value = _after_delimiter(line)
         if value:
@@ -251,6 +256,11 @@ def _parse_line(
         }
 
     if "top left" in lower and any(token in lower for token in ("click", "corner")):
+        return {"type": "click", "selector": "{{selector.top_left_corner}}"}
+
+    if "top left corner" in lower and any(
+        token in lower for token in ("first name of the user", "user name", "username of the user", "profile name")
+    ):
         return {"type": "click", "selector": "{{selector.top_left_corner}}"}
 
     if "workflows" in lower and any(token in lower for token in ("change module", "change the module", "navigate", "open", "switch", "go to")):
@@ -584,6 +594,12 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     if not _looks_like_explicit_selector(normalized_target):
         if "log in" in lowered_target or "login" in lowered_target or "sign in" in lowered_target:
             return {"type": "click", "selector": "{{selector.login_button}}"}
+        if "logout" in lowered_target or "log out" in lowered_target or "sign out" in lowered_target:
+            return {"type": "click", "selector": "{{selector.logout_link}}"}
+        if "create account" in lowered_target or "sign up" in lowered_target:
+            return {"type": "click", "selector": "{{selector.create_account}}"}
+        if lowered_target == "next" or "next button" in lowered_target:
+            return {"type": "click", "selector": "{{selector.next_button}}"}
         if "create form" in lowered_target:
             return {"type": "click", "selector": "{{selector.create_form}}"}
         if "create workflow" in lowered_target:
@@ -647,6 +663,35 @@ def _parse_generic_verify_text(line: str) -> dict[str, Any] | None:
     if any(token in lower for token in ("message", "msg", "text", "visible", "shown", "displayed", "appears")):
         return {"type": "verify_text", "selector": _text_selector(value), "match": "contains", "value": value}
 
+    return None
+
+
+def _parse_named_field_entry(line: str) -> dict[str, Any] | None:
+    match = re.match(
+        r"^\s*(?:enter|type)\s+(.+?)\s+as(?:\s*[-:])?\s*(.+?)\s*$",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    field_label = match.group(1).strip().lower()
+    value = _strip_wrapping_quotes(match.group(2).strip())
+    if not value:
+        value = _after_delimiter(line) or _first_quoted(line)
+    if not value:
+        return None
+
+    selector_map = (
+        (("first name", "firstname", "given name"), "{{selector.first_name}}"),
+        (("surname", "last name", "lastname"), "{{selector.surname}}"),
+        (("email", "email address"), "{{selector.email}}"),
+        (("phone", "mobile", "mobile number", "phone number", "contact number"), "{{selector.phone}}"),
+        (("confirm password", "confirm-password", "confirmpassword"), "{{selector.confirm_password}}"),
+        (("password",), "{{selector.password}}"),
+    )
+    for tokens, selector in selector_map:
+        if any(token in field_label for token in tokens):
+            return {"type": "type", "selector": selector, "text": value, "clear_first": True}
     return None
 
 
@@ -859,6 +904,30 @@ def _enforce_login_sequence(
     if password_index is None:
         return steps
 
+    has_registration_flow = any(
+        (
+            step.get("type") == "type"
+            and str(step.get("selector", "")).strip() == "{{selector.confirm_password}}"
+        )
+        or (
+            step.get("type") == "click"
+            and any(
+                token in str(step.get("selector", "")).lower()
+                for token in ("create_account", "sign up")
+            )
+        )
+        or (
+            step.get("type") == "verify_text"
+            and any(
+                token in str(step.get("value", "")).lower()
+                for token in ("registered", "registration", "create account", "account created")
+            )
+        )
+        for step in steps
+    )
+    if has_registration_flow:
+        return steps
+
     post_password_steps = steps[password_index + 1 :]
     needs_authenticated_flow = any(
         (
@@ -948,16 +1017,19 @@ def _enforce_form_create_sequence(
 
     create_sequence: list[dict[str, Any]] = [
         {"type": "click", "selector": "{{selector.create_form_confirm}}"},
+    ]
+    if auto_create_confirm_wait_ms > 0:
         # Wait for the form builder canvas to become visible before attempting
         # any builder interactions (drag, label type, checkbox clicks).
         # selector_visible is more reliable than a fixed timeout.
-        {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.form_canvas_target}}",
-            "ms": max(auto_create_confirm_wait_ms * 6, 2500),
-        },
-    ]
+        create_sequence.append(
+            {
+                "type": "wait",
+                "until": "selector_visible",
+                "selector": "{{selector.form_canvas_target}}",
+                "ms": max(auto_create_confirm_wait_ms * 6, 2500),
+            }
+        )
     merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
     return merged[:max_steps]
 
