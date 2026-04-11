@@ -38,6 +38,7 @@ from app.schemas import (
     PlanGenerateResponse,
     RunCreateRequest,
     RunListResponse,
+    RunResumeRequest,
     RunState,
     RunStatus,
     SuiteRunCreateRequest,
@@ -239,6 +240,28 @@ def _sanitize_plan_steps(
         sanitized.append(normalized_step)
 
     return sanitized
+
+
+def _resolve_start_url(
+    start_url: str | None,
+    steps: list[dict[str, object]],
+) -> str | None:
+    normalized = (start_url or "").strip()
+    if normalized:
+        return normalized
+
+    for step in steps:
+        step_type = str(step.get("type") or "").strip().lower()
+        if step_type != "navigate":
+            continue
+        candidate = str(step.get("url") or "").strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _has_navigate_step(steps: list[dict[str, object]]) -> bool:
+    return any(str(step.get("type") or "").strip().lower() == "navigate" for step in steps)
 
 
 def _ensure_drag_step(task: str, steps: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -633,6 +656,15 @@ def build_app() -> FastAPI:
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
+        resolved_start_url = _resolve_start_url(request.start_url, raw_steps)
+        if request.execution_mode == "plan" and not resolved_start_url and not _has_navigate_step(raw_steps):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Run has no entry URL. Provide start_url or include at least one navigate step "
+                    "before interaction steps."
+                ),
+            )
         if len(raw_steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
@@ -641,7 +673,7 @@ def build_app() -> FastAPI:
         expanded_request = RunCreateRequest.model_validate(
             {
                 "run_name": request.run_name,
-                "start_url": request.start_url,
+                "start_url": resolved_start_url,
                 "prompt": request.prompt,
                 "execution_mode": request.execution_mode,
                 "failure_mode": request.failure_mode,
@@ -680,13 +712,14 @@ def build_app() -> FastAPI:
             [step.model_dump(exclude_none=True) for step in request.steps],
             start_url=request.start_url,
         )
+        resolved_start_url = _resolve_start_url(request.start_url, sanitized_steps)
         validated_request = TestCaseCreateRequest.model_validate(
             {
                 "name": request.name,
                 "description": request.description,
                 "prompt": request.prompt,
                 "parent_folder_id": request.parent_folder_id,
-                "start_url": request.start_url,
+                "start_url": resolved_start_url,
                 "steps": sanitized_steps,
                 "test_data": request.test_data,
                 "selector_profile": request.selector_profile,
@@ -852,13 +885,14 @@ def build_app() -> FastAPI:
             [step.model_dump(exclude_none=True) for step in request.steps],
             start_url=request.start_url,
         )
+        resolved_start_url = _resolve_start_url(request.start_url, sanitized_steps)
         validated_request = TestCaseUpdateRequest.model_validate(
             {
                 "name": request.name,
                 "description": request.description,
                 "prompt": request.prompt,
                 "parent_folder_id": request.parent_folder_id,
-                "start_url": request.start_url,
+                "start_url": resolved_start_url,
                 "steps": sanitized_steps,
                 "test_data": request.test_data,
                 "selector_profile": request.selector_profile,
@@ -1229,6 +1263,75 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Run not found")
         return run
 
+    @app.post("/api/runs/{run_id}/resume", response_model=RunState)
+    async def resume_run(
+        run_id: str,
+        request: RunResumeRequest,
+        background_tasks: BackgroundTasks,
+        _: None = Depends(require_admin_auth),
+    ) -> RunState:
+        run = run_store.get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        resume_index = next(
+            (
+                index
+                for index, step in enumerate(run.steps)
+                if step.status in {StepStatus.failed, StepStatus.waiting_for_input}
+            ),
+            None,
+        )
+
+        if resume_index is None:
+            resume_index = next(
+                (
+                    index
+                    for index, step in enumerate(run.steps)
+                    if step.status in {StepStatus.pending, StepStatus.running}
+                ),
+                None,
+            )
+
+        if resume_index is None:
+            raise HTTPException(status_code=400, detail="No resumable step found for this run")
+
+        raw_steps = [dict(step.input or {}) for step in run.steps]
+        resume_steps = raw_steps[resume_index:]
+        resume_start_url = _resolve_start_url(run.start_url, raw_steps)
+        sanitized_steps = _sanitize_plan_steps(resume_steps, start_url=run.start_url)
+        expanded_steps = _expand_drag_steps(
+            sanitized_steps,
+            max_steps=settings.max_steps_per_run,
+            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
+            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
+        )
+        if not expanded_steps:
+            raise HTTPException(status_code=400, detail="No runnable steps found for resume")
+
+        resume_name = request.run_name or f"{run.run_name} [resume-step-{resume_index + 1}]"
+        resume_request = RunCreateRequest.model_validate(
+            {
+                "run_name": resume_name,
+                "start_url": resume_start_url,
+                "steps": expanded_steps,
+                "test_data": run.test_data,
+                "selector_profile": run.selector_profile,
+                "source_test_case_id": run.source_test_case_id,
+                "resume_from_step_index": resume_index,
+            }
+        )
+
+        resumed = run_store.create(resume_request)
+        background_tasks.add_task(executor.execute, resumed.run_id)
+        LOGGER.info(
+            "Run resume started: new_run_id=%s source_run_id=%s resume_step_index=%s",
+            resumed.run_id,
+            run_id,
+            resume_index,
+        )
+        return resumed
+
     @app.post("/api/runs/{run_id}/recover-selector", response_model=RunState)
     async def recover_run_selector(
         run_id: str,
@@ -1253,6 +1356,7 @@ def build_app() -> FastAPI:
         raw_steps[request.step_index] = target_step
 
         resume_steps = raw_steps[request.step_index:]
+        resume_start_url = _resolve_start_url(run.start_url, raw_steps)
         run_name = request.run_name or f"{run.run_name} [resume-step-{request.step_index + 1}]"
         sanitized_steps = _sanitize_plan_steps(resume_steps, start_url=run.start_url)
         expanded_steps = _expand_drag_steps(
@@ -1264,7 +1368,7 @@ def build_app() -> FastAPI:
         run_request = RunCreateRequest.model_validate(
             {
                 "run_name": run_name,
-                "start_url": run.start_url,
+                "start_url": resume_start_url,
                 "steps": expanded_steps,
                 "test_data": run.test_data,
                 "selector_profile": run.selector_profile,
