@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     llm_mode: Literal["local", "cloud", "anthropic"] = "local"
     log_level: str = "INFO"
 
-    vllm_base_url: str = "http://localhost:8001/v1"
+    vllm_base_url: str = "http://192.168.0.33:8001/v1"
     vllm_api_key: str = "local-key"
     vllm_model: str = "meta-llama/Llama-3.1-8B-Instruct"
 

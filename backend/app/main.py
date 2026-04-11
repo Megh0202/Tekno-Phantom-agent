@@ -13,8 +13,11 @@ from fastapi.responses import FileResponse
 
 from app.brain.http_client import HttpBrainClient
 from app.config import Settings, get_settings
+from app.database import db_session, init_auth_database
 from app.mcp.browser_client import build_browser_client
 from app.mcp.filesystem_client import build_filesystem_client
+from app.routes.auth import router as auth_router
+from app.auth.service import ensure_bootstrap_admin
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
@@ -369,15 +372,27 @@ def build_app() -> FastAPI:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
+    if settings.auth_enabled:
+        init_auth_database()
+        with db_session() as db:
+            ensure_bootstrap_admin(
+                db,
+                email=settings.auth_bootstrap_admin_email,
+                password=settings.auth_bootstrap_admin_password,
+            )
+
     app = FastAPI(title="Tekno Phantom Agent API", version="0.1.0")
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
+        allow_origin_regex=settings.cors_origin_regex or None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    app.include_router(auth_router)
 
     run_store = build_run_store(settings)
     suite_store = build_suite_store(settings)
@@ -432,6 +447,7 @@ def build_app() -> FastAPI:
             "run_store_backend": settings.run_store_backend,
             "max_steps_per_run": settings.max_steps_per_run,
             "admin_auth_required": bool(settings.admin_api_token),
+            "jwt_auth_enabled": settings.auth_enabled,
         }
 
     @app.post("/api/runs", response_model=RunState)

@@ -14,13 +14,21 @@ def _resolve_project_path(path: Path) -> Path:
 class Settings(BaseSettings):
     log_level: str = "INFO"
 
-    brain_base_url: str = "http://localhost:8090"
+    brain_base_url: str = "http://192.168.0.33:8090"
     brain_api_key: str = ""
     brain_timeout_seconds: int = 10
 
     backend_host: str = "0.0.0.0"
     backend_port: int = 8080
-    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.7:3000"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.7:3000,http://192.168.0.33:3000"
+    cors_origin_regex: str = (
+        r"^https?://("
+        r"localhost|127(?:\.\d{1,3}){3}|"
+        r"10(?:\.\d{1,3}){3}|"
+        r"192\.168(?:\.\d{1,3}){2}|"
+        r"172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}"
+        r")(?::\d+)?$"
+    )
     admin_api_token: str = ""
     auth_enabled: bool = True
     auth_database_url: str = "sqlite:///./data/auth.sqlite3"

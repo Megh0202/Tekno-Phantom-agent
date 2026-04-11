@@ -6,6 +6,8 @@ import { useRouter } from "next/navigation";
 import {
   apiFetch as fetch,
   buildApiHeaders,
+  ensureCsrfCookie,
+  getApiBaseUrl,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
 
@@ -117,7 +119,7 @@ type SuiteRunState = {
   report_artifact?: string | null;
 };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
+const API_BASE_URL = getApiBaseUrl();
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
@@ -1334,6 +1336,7 @@ export default function Home() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL, ADMIN_API_TOKEN);
       const response = await fetch(`${API_BASE_URL}/auth/login`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -1374,6 +1377,7 @@ export default function Home() {
     setRequestInfo(null);
     try {
       setIsAuthenticating(true);
+      await ensureCsrfCookie(API_BASE_URL, ADMIN_API_TOKEN);
       const response = await fetch(`${API_BASE_URL}/auth/register`, {
         method: "POST",
         headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
@@ -1399,6 +1403,7 @@ export default function Home() {
   }
 
   async function signOut(): Promise<void> {
+    await ensureCsrfCookie(API_BASE_URL, ADMIN_API_TOKEN);
     await fetch(`${API_BASE_URL}/auth/logout`, {
       method: "POST",
       headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
@@ -2025,4 +2030,3 @@ export default function Home() {
     </div>
   );
 }
-

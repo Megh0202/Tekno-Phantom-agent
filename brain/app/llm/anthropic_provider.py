@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -13,6 +14,8 @@ from app.llm.utils import (
     fallback_plan,
     normalize_plan,
 )
+
+LOGGER = logging.getLogger("tekno.phantom.brain.anthropic")
 
 
 class AnthropicProvider:
@@ -44,32 +47,43 @@ class AnthropicProvider:
     async def summarize(self, content: str) -> str:
         if not self._settings.anthropic_api_key:
             return f"[{self.mode}:{self.model_name}] {content[:220]}"
-        text = await self._messages_call(
-            system="Summarize this automation run in one concise sentence.",
-            user=content[:3000],
-            max_tokens=120,
-        )
-        return text.strip() or "Run finished."
+        try:
+            text = await self._messages_call(
+                system="Summarize this automation run in one concise sentence.",
+                user=content[:3000],
+                max_tokens=120,
+            )
+            return text.strip() or "Run finished."
+        except Exception as exc:
+            LOGGER.warning("Anthropic summarize failed: %s", exc)
+            return f"[{self.mode}:{self.model_name}] {content[:220]}"
 
     async def plan_task(self, task: str, max_steps: int) -> dict[str, Any]:
         if not self._settings.anthropic_api_key:
             return fallback_plan(task, max_steps)
 
-        text = await self._messages_call(
-            system=(
-                "You are a web automation planner. "
-                "Return ONLY strict JSON with keys: run_name, start_url, steps. "
-                "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
-                "Cover every explicit user instruction in order when max_steps allows. "
-                "Do not invent extra requirements not present in the task."
-            ),
-            user=(
-                f"Task: {task}\n"
-                f"Max steps: {max_steps}\n"
-                "Return compact valid JSON only."
-            ),
-            max_tokens=1800,
-        )
+        try:
+            text = await self._messages_call(
+                system=(
+                    "You are a web automation planner. "
+                    "Return ONLY strict JSON with keys: run_name, start_url, steps. "
+                    "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                    "Cover every explicit user instruction in order when max_steps allows. "
+                    "Do not invent extra requirements not present in the task."
+                ),
+                user=(
+                    f"Task: {task}\n"
+                    f"Max steps: {max_steps}\n"
+                    "Return compact valid JSON only."
+                ),
+                max_tokens=1800,
+            )
+        except Exception as exc:
+            LOGGER.warning("Anthropic plan_task failed: %s", exc)
+            result = fallback_plan(task, max_steps)
+            result["raw_llm_response"] = None
+            result["planner_error"] = str(exc)
+            return result
 
         if text.strip():
             try:
@@ -98,28 +112,32 @@ class AnthropicProvider:
             return []
 
         hint_clause = build_element_hint_clause(element_hint)
-        text = await self._messages_call(
-            system=(
-                "You repair failed web automation selectors. "
-                "Return ONLY strict JSON like {\"selectors\":[\"...\"]}. "
-                "Prefer Playwright-compatible CSS/text selectors grounded in the provided DOM summary. "
-                "Use page.interactive_elements as the primary grounding source (tags, roles, ids, names, placeholders, text, aria labels, href, scope). "
-                + (f"IMPORTANT: The target element identity is known: {hint_clause} — prioritise matching these attributes. " if hint_clause else "")
-                + "Do not rely only on page URL or title."
-            ),
-            user=json.dumps(
-                {
-                    "step_type": step_type,
-                    "failed_selector": failed_selector,
-                    "error_message": error_message,
-                    "text_hint": text_hint or "",
-                    "element_hint": element_hint or {},
-                    "page": page,
-                    "max_candidates": max_candidates,
-                }
-            ),
-            max_tokens=240,
-        )
+        try:
+            text = await self._messages_call(
+                system=(
+                    "You repair failed web automation selectors. "
+                    "Return ONLY strict JSON like {\"selectors\":[\"...\"]}. "
+                    "Prefer Playwright-compatible CSS/text selectors grounded in the provided DOM summary. "
+                    "Use page.interactive_elements as the primary grounding source (tags, roles, ids, names, placeholders, text, aria labels, href, scope). "
+                    + (f"IMPORTANT: The target element identity is known: {hint_clause} — prioritise matching these attributes. " if hint_clause else "")
+                    + "Do not rely only on page URL or title."
+                ),
+                user=json.dumps(
+                    {
+                        "step_type": step_type,
+                        "failed_selector": failed_selector,
+                        "error_message": error_message,
+                        "text_hint": text_hint or "",
+                        "element_hint": element_hint or {},
+                        "page": page,
+                        "max_candidates": max_candidates,
+                    }
+                ),
+                max_tokens=240,
+            )
+        except Exception as exc:
+            LOGGER.warning("Anthropic suggest_selectors failed: %s", exc)
+            return []
         return extract_selector_list(text, max_candidates)
 
     async def _messages_call(self, system: str, user: str, max_tokens: int) -> str:
