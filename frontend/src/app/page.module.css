@@ -98,6 +98,23 @@
   font-size: 13px;
 }
 
+.authBox {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.authGrid {
+  display: grid;
+  gap: 8px;
+}
+
+.authActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .metaLine {
   margin-top: 4px;
   color: var(--ink-500);
@@ -349,7 +366,7 @@
 
 .treeNodeRow {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto auto auto auto;
+  grid-template-columns: 22px 20px minmax(0, 1fr) auto auto auto auto;
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -361,6 +378,13 @@
   gap: 8px;
   align-items: center;
   min-width: 0;
+}
+
+.folderSelectCheckbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  justify-self: center;
 }
 
 .expandButton {
@@ -772,7 +796,7 @@
 
   .treeNodeRow,
   .treeNodeRowTest {
-    grid-template-columns: 22px minmax(0, 1fr);
+    grid-template-columns: 22px 20px minmax(0, 1fr);
     row-gap: 6px;
   }
 

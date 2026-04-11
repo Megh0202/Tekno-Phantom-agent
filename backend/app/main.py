@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -13,8 +15,10 @@ from fastapi.responses import FileResponse
 
 from app.brain.http_client import HttpBrainClient
 from app.config import Settings, get_settings
+from app.database import init_auth_database
 from app.mcp.browser_client import build_browser_client
 from app.mcp.filesystem_client import build_filesystem_client
+from app.routes import auth_router
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
@@ -35,10 +39,13 @@ from app.schemas import (
     RunCreateRequest,
     RunListResponse,
     RunState,
+    RunStatus,
     SuiteRunCreateRequest,
     SuiteRunListResponse,
     SuiteRunState,
     StepImportResponse,
+    StepSelectorHelpRequest,
+    StepStatus,
     SelectorRecoveryRequest,
     TestCaseCreateRequest,
     TestCaseListResponse,
@@ -65,7 +72,7 @@ def _extract_bearer_token(authorization: str | None) -> str | None:
     token = authorization[len(prefix) :].strip()
     return token or None
 
-
+           
 def _sanitize_plan_steps(
     steps: list[dict[str, object]],
     *,
@@ -89,6 +96,17 @@ def _sanitize_plan_steps(
         if len(selector) >= 2 and selector[0] == selector[-1] and selector[0] in {"'", '"', "`"}:
             selector = selector[1:-1].strip()
         return selector
+
+    def _normalize_target(raw: object) -> dict[str, str] | None:
+        if not isinstance(raw, dict):
+            return None
+        allowed_fields = ("kind", "role", "text", "label", "placeholder", "context")
+        normalized: dict[str, str] = {}
+        for field in allowed_fields:
+            value = _clean_text(raw.get(field))
+            if value:
+                normalized[field] = value
+        return normalized or None
 
     def _looks_like_explicit_selector(value: str) -> bool:
         lowered = value.lower()
@@ -147,6 +165,11 @@ def _sanitize_plan_steps(
 
         normalized_step = dict(step)
         normalized_step["type"] = step_type
+        target = _normalize_target(normalized_step.get("target"))
+        if target is not None:
+            normalized_step["target"] = target
+        else:
+            normalized_step.pop("target", None)
 
         if step_type in {"click", "type", "select", "verify_text", "wait", "handle_popup"}:
             if "selector" in normalized_step:
@@ -154,7 +177,7 @@ def _sanitize_plan_steps(
 
         if step_type == "click":
             selector = _to_click_selector(normalized_step.get("selector"))
-            if not selector:
+            if not selector and target is None:
                 continue
             if selector.lower() in generic_click_targets:
                 continue
@@ -163,7 +186,7 @@ def _sanitize_plan_steps(
         if step_type == "type":
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             text_value = _clean_text(normalized_step.get("text"))
-            if not selector or not text_value:
+            if (not selector and target is None) or not text_value:
                 continue
             normalized_step["selector"] = selector
             normalized_step["text"] = text_value
@@ -172,7 +195,7 @@ def _sanitize_plan_steps(
         if step_type == "select":
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             value = _clean_text(normalized_step.get("value"))
-            if not selector or not value:
+            if (not selector and target is None) or not value:
                 continue
             normalized_step["selector"] = selector
             normalized_step["value"] = value
@@ -182,11 +205,11 @@ def _sanitize_plan_steps(
             if raw_value in {"example", "example domain"} and has_explicit_start_url and not is_example_site:
                 continue
             selector = _to_text_wait_selector(normalized_step.get("selector"))
-            if selector.lower() in {"body", "html", "main", "h1", "h2", "h3"}:
+            if not is_example_site and selector.lower() in {"body", "html", "main", "h1", "h2", "h3"}:
                 value_text = _clean_text(normalized_step.get("value"))
                 if value_text:
                     selector = f"text={value_text}"
-            if not selector:
+            if not selector and target is None:
                 continue
             normalized_step["selector"] = selector
 
@@ -318,6 +341,15 @@ def _expand_drag_steps(
     """
     expanded: list[dict[str, object]] = []
 
+    known_field_source_aliases = {
+        "short_answer_source",
+        "{{selector.short_answer_source}}",
+        "email_field_source",
+        "{{selector.email_field_source}}",
+        "dropdown_field_source",
+        "{{selector.dropdown_field_source}}",
+    }
+
     for step in steps:
         if len(expanded) >= max_steps:
             break
@@ -338,7 +370,14 @@ def _expand_drag_steps(
             and str(prev.get("selector") or "").strip() == source_selector
         )
 
-        if auto_drag_pre_click_enabled and not prev_is_same_click and len(expanded) < max_steps:
+        skip_pre_click_for_alias = source_selector.strip().lower() in known_field_source_aliases
+
+        if (
+            auto_drag_pre_click_enabled
+            and not skip_pre_click_for_alias
+            and not prev_is_same_click
+            and len(expanded) < max_steps
+        ):
             expanded.append({"type": "click", "selector": source_selector})
 
         if len(expanded) < max_steps:
@@ -365,6 +404,148 @@ def build_admin_auth_dependency(settings: Settings):
     return require_admin_auth
 
 
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _plan_trace_dir(settings: Settings) -> Path:
+    trace_dir = settings.artifact_root / f"plan-{_utc_stamp()}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return trace_dir
+
+
+def _write_plan_trace(trace_dir: Path, trace: dict[str, object]) -> None:
+    (trace_dir / "plan-trace.json").write_text(
+        json.dumps(trace, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _is_enterprise_prompt(task: str) -> bool:
+    lowered = task.lower()
+    return any(
+        token in lowered
+        for token in (
+            "vita",
+            "workflow",
+            "workflows",
+            "form canvas",
+            "short answer",
+            "status",
+            "transition",
+            "editor",
+        )
+    )
+
+
+def _validate_generated_plan(task: str, normalized_steps: list[dict[str, object]]) -> dict[str, object]:
+    errors: list[str] = []
+    missing_steps: list[str] = []
+    rejection_reasons: list[str] = []
+    lowered_task = task.lower()
+    step_types = [str(step.get("type") or "").strip().lower() for step in normalized_steps]
+    is_enterprise = _is_enterprise_prompt(task)
+
+    if not normalized_steps:
+        errors.append("Planner response was dropped during normalization or produced no runnable steps.")
+        rejection_reasons.append("Normalized plan is empty after dropping invalid steps.")
+
+    if "wait" in lowered_task and "wait" not in step_types:
+        errors.append("Prompt requested a wait step, but no wait step was generated.")
+        missing_steps.append("wait step")
+        rejection_reasons.append("Missing required wait step from the user prompt.")
+
+    if "verify" in lowered_task and not any(step_type.startswith("verify_") for step_type in step_types):
+        errors.append("Prompt requested verify/verification behavior, but no verify step was generated.")
+        missing_steps.append("verify step")
+        rejection_reasons.append("Missing requested verification step.")
+
+    if ("login" in lowered_task or "sign in" in lowered_task) and "password" in lowered_task:
+        if not any(
+            step_type == "type" and "password" in str(step.get("selector") or "").lower()
+            for step, step_type in zip(normalized_steps, step_types)
+        ):
+            missing_steps.append("password entry")
+            rejection_reasons.append("Missing password entry for login workflow.")
+        if not any(
+            step_type == "click" and any(token in str(step.get("selector") or "").lower() for token in ("login", "sign in"))
+            for step, step_type in zip(normalized_steps, step_types)
+        ):
+            missing_steps.append("login submit click")
+            rejection_reasons.append("Missing login submit click.")
+
+    if "drag" in lowered_task and "drag" not in step_types:
+        missing_steps.append("drag step")
+        rejection_reasons.append("Missing drag step for drag-and-drop workflow.")
+
+    if any(token in lowered_task for token in ("form name", "enter form name")) and "type" not in step_types:
+        missing_steps.append("form fill step")
+        rejection_reasons.append("Missing form fill step for the requested workflow.")
+
+    if any(token in lowered_task for token in ("verify", "is visible", "visible in the editor")):
+        verify_steps = [step for step, step_type in zip(normalized_steps, step_types) if step_type == "verify_text"]
+        if not verify_steps:
+            missing_steps.append("specific verification target")
+            rejection_reasons.append("Missing verification step with a specific target.")
+        else:
+            has_specific_target = any(
+                str(step.get("selector") or "").strip()
+                and str(step.get("selector") or "").strip().lower() not in {"h1", "body"}
+                for step in verify_steps
+            )
+            if not has_specific_target:
+                missing_steps.append("specific verification target")
+                rejection_reasons.append("Verification target is too generic for the requested check.")
+
+    if any(token in lowered_task for token in ("extract", "return the details", "return details")):
+        errors.append("Extraction/output requests are not supported by the current planner contract.")
+        rejection_reasons.append("Unsupported extraction/output request in prompt.")
+
+    return {
+        "valid": not errors and not missing_steps and not rejection_reasons,
+        "errors": errors,
+        "missing_steps": missing_steps,
+        "rejection_reasons": rejection_reasons,
+        "is_enterprise_prompt": is_enterprise,
+    }
+
+
+def _build_structured_plan_attempt(
+    request: PlanGenerateRequest,
+    *,
+    max_steps: int,
+    settings: Settings,
+) -> dict[str, object] | None:
+    parsed_steps = parse_structured_task_steps(
+        request.task,
+        max_steps=max_steps,
+        auto_login_wait_ms=settings.auto_login_wait_ms,
+        auto_create_confirm_wait_ms=settings.auto_create_confirm_wait_ms,
+        default_wait_ms=settings.default_wait_ms,
+        structured_selector_wait_ms=settings.structured_selector_wait_ms,
+        structured_options_wait_ms=settings.structured_options_wait_ms,
+    )
+    if not parsed_steps:
+        return None
+
+    normalized_steps = _sanitize_plan_steps(parsed_steps, start_url=request.start_url)
+    normalized_steps = _ensure_drag_step(request.task, normalized_steps)
+    validation = _validate_generated_plan(request.task, normalized_steps)
+    return {
+        "source": "structured_parser",
+        "planning_task": request.task,
+        "payload": {
+            "run_name": "prompt-steps-run",
+            "start_url": request.start_url,
+            "steps": parsed_steps,
+        },
+        "normalized_steps": normalized_steps,
+        "validation": validation,
+        "run_name": "prompt-steps-run",
+        "start_url": request.start_url,
+    }
+
+
 def build_app() -> FastAPI:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
@@ -378,6 +559,10 @@ def build_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    if settings.auth_enabled:
+        init_auth_database()
+        app.include_router(auth_router)
 
     run_store = build_run_store(settings)
     suite_store = build_suite_store(settings)
@@ -403,6 +588,12 @@ def build_app() -> FastAPI:
         file_client,
     )
     require_admin_auth = build_admin_auth_dependency(settings)
+    app.state.settings = settings
+    app.state.run_store = run_store
+    app.state.test_case_store = test_case_store
+    app.state.suite_store = suite_store
+    app.state.executor = executor
+    app.state.suite_executor = suite_executor
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
@@ -432,6 +623,7 @@ def build_app() -> FastAPI:
             "run_store_backend": settings.run_store_backend,
             "max_steps_per_run": settings.max_steps_per_run,
             "admin_auth_required": bool(settings.admin_api_token),
+            "jwt_auth_enabled": settings.auth_enabled,
         }
 
     @app.post("/api/runs", response_model=RunState)
@@ -441,20 +633,23 @@ def build_app() -> FastAPI:
         _: None = Depends(require_admin_auth),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
-        raw_steps = _sanitize_plan_steps(raw_steps, start_url=request.start_url)
-        expanded_steps = _expand_drag_steps(
-            raw_steps,
-            max_steps=settings.max_steps_per_run,
-            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
-            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
-        )
+        if len(raw_steps) > settings.max_steps_per_run:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
+            )
         expanded_request = RunCreateRequest.model_validate(
             {
                 "run_name": request.run_name,
                 "start_url": request.start_url,
-                "steps": expanded_steps,
+                "prompt": request.prompt,
+                "execution_mode": request.execution_mode,
+                "failure_mode": request.failure_mode,
+                "steps": raw_steps,
                 "test_data": request.test_data,
                 "selector_profile": request.selector_profile,
+                "source_test_case_id": request.source_test_case_id,
+                "resume_from_step_index": request.resume_from_step_index,
             }
         )
 
@@ -497,7 +692,7 @@ def build_app() -> FastAPI:
                 "selector_profile": request.selector_profile,
             }
         )
-        test_case = test_case_store.create(validated_request)
+        test_case = test_case_store.create(validated_request, user_id=1)
         return test_case
 
     @app.post("/api/test-folders", response_model=FolderState)
@@ -507,7 +702,7 @@ def build_app() -> FastAPI:
     ) -> FolderState:
         if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
             raise HTTPException(status_code=404, detail="Parent folder not found")
-        folder = test_case_store.create_folder(request)
+        folder = test_case_store.create_folder(request, user_id=1)
         return folder
 
     @app.get("/api/test-folders", response_model=FolderListResponse)
@@ -709,21 +904,11 @@ def build_app() -> FastAPI:
                 "selector_profile": test_case.selector_profile,
             }
         )
-        sanitized_steps = _sanitize_plan_steps(
-            [step.model_dump(exclude_none=True) for step in run_request.steps],
-            start_url=run_request.start_url,
-        )
-        expanded_steps = _expand_drag_steps(
-            sanitized_steps,
-            max_steps=settings.max_steps_per_run,
-            auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
-            auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
-        )
         expanded_run_request = RunCreateRequest.model_validate(
             {
                 "run_name": run_request.run_name,
                 "start_url": run_request.start_url,
-                "steps": expanded_steps,
+                "steps": [step.model_dump(exclude_none=True) for step in run_request.steps],
                 "test_data": run_request.test_data,
                 "selector_profile": run_request.selector_profile,
             }
@@ -733,6 +918,25 @@ def build_app() -> FastAPI:
         LOGGER.info("Run created from test case: %s (test_case_id=%s)", run.run_id, test_case_id)
         return run
 
+    @app.post("/api/runs/{run_id}/steps/{step_id}/selector", response_model=RunState)
+    async def submit_step_selector(
+        run_id: str,
+        step_id: str,
+        request: StepSelectorHelpRequest,
+        _: None = Depends(require_admin_auth),
+    ) -> RunState:
+        try:
+            run = executor.apply_manual_selector_hint(run_id, step_id, request.selector)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run or step not found")
+        await executor.execute(run.run_id)
+        refreshed = run_store.get(run.run_id)
+        if refreshed is None:
+            raise HTTPException(status_code=404, detail="Run not found after selector retry")
+        return refreshed
+
     @app.post("/api/plan", response_model=PlanGenerateResponse)
     async def generate_plan(
         request: PlanGenerateRequest,
@@ -740,31 +944,45 @@ def build_app() -> FastAPI:
     ) -> PlanGenerateResponse:
         max_steps = request.max_steps or settings.max_steps_per_run
         max_steps = min(max_steps, settings.max_steps_per_run)
-        parsed_steps = parse_structured_task_steps(
-            request.task,
+        trace_dir = _plan_trace_dir(settings)
+        trace: dict[str, object] = {
+            "task": request.task,
+            "attempts": [],
+            "structured_attempt": None,
+            "normalized_plan": None,
+            "validation": None,
+        }
+
+        structured_attempt = _build_structured_plan_attempt(
+            request,
             max_steps=max_steps,
-            auto_login_wait_ms=settings.auto_login_wait_ms,
-            auto_create_confirm_wait_ms=settings.auto_create_confirm_wait_ms,
-            default_wait_ms=settings.default_wait_ms,
-            structured_selector_wait_ms=settings.structured_selector_wait_ms,
-            structured_options_wait_ms=settings.structured_options_wait_ms,
+            settings=settings,
         )
-        if parsed_steps:
-            parsed_steps = _sanitize_plan_steps(parsed_steps, start_url=None)
-            validated = RunCreateRequest.model_validate(
-                {
-                    "run_name": "prompt-steps-run",
-                    "start_url": None,
-                    "steps": parsed_steps,
-                    "test_data": request.test_data,
-                    "selector_profile": request.selector_profile,
-                }
-            )
-            return PlanGenerateResponse(
-                run_name=validated.run_name,
-                start_url=validated.start_url,
-                steps=validated.steps[:max_steps],
-            )
+        if structured_attempt is not None:
+            trace["structured_attempt"] = structured_attempt
+            structured_validation = structured_attempt["validation"]
+            if bool(structured_validation.get("valid")):
+                try:
+                    validated = RunCreateRequest.model_validate(
+                        {
+                            "run_name": structured_attempt["run_name"],
+                            "start_url": structured_attempt["start_url"],
+                            "steps": structured_attempt["normalized_steps"],
+                            "test_data": request.test_data,
+                            "selector_profile": request.selector_profile,
+                        }
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"Invalid structured plan: {exc}") from exc
+
+                trace["normalized_plan"] = [step.model_dump(exclude_none=True) for step in validated.steps]
+                trace["validation"] = structured_validation
+                _write_plan_trace(trace_dir, trace)
+                return PlanGenerateResponse(
+                    run_name=validated.run_name,
+                    start_url=validated.start_url,
+                    steps=validated.steps[:max_steps],
+                )
 
         planning_task = (
             f"{request.task}\n\n"
@@ -801,59 +1019,93 @@ def build_app() -> FastAPI:
                 "Prefer these selectors for matching fields."
             )
 
-        try:
-            payload = await brain_client.plan_task(planning_task, max_steps=max_steps)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Brain plan generation failed: {exc}") from exc
+        last_validation: dict[str, object] | None = None
+        for attempt_index in range(2):
+            attempt_task = planning_task
+            if attempt_index == 0 and structured_attempt is not None:
+                last_validation = structured_attempt["validation"]
+            if attempt_index == 1 and last_validation is not None:
+                feedback = " ".join(
+                    list(last_validation.get("errors", []))
+                    + list(last_validation.get("missing_steps", []))
+                    + list(last_validation.get("rejection_reasons", []))
+                ).strip()
+                attempt_task = (
+                    f"{planning_task}\n\n"
+                    "Validation feedback from the previous rejected plan:\n"
+                    f"{feedback or 'The previous plan did not satisfy the prompt requirements.'}"
+                )
+                if bool(last_validation.get("is_enterprise_prompt")):
+                    attempt_task = (
+                        f"{attempt_task}\n\n"
+                        "Enterprise planning requirements:\n"
+                        "- Cover all requested workflow actions.\n"
+                        "- Include required data entry and a specific verification target.\n"
+                    )
 
-        try:
-            normalized_steps = normalize_plan_steps(
-                payload.get("steps"),
-                max_steps=max_steps,
-                default_wait_ms=settings.planner_default_wait_ms,
-            )
-            normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
-            normalized_steps = _ensure_drag_step(request.task, normalized_steps)
-            normalized_steps = _expand_drag_steps(
-                normalized_steps,
-                max_steps=max_steps,
-                auto_drag_pre_click_enabled=settings.auto_drag_pre_click_enabled,
-                auto_drag_post_wait_ms=settings.auto_drag_post_wait_ms,
-            )
-            if not normalized_steps:
-                normalized_steps = build_recovery_steps(
-                    request.task,
+            try:
+                payload = await brain_client.plan_task(attempt_task, max_steps=max_steps)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Brain plan generation failed: {exc}") from exc
+
+            try:
+                normalized_steps = normalize_plan_steps(
+                    payload.get("steps"),
                     max_steps=max_steps,
-                    load_state_wait_ms=settings.recovery_load_state_wait_ms,
-                    timeout_wait_ms=settings.planner_default_wait_ms,
+                    default_wait_ms=settings.planner_default_wait_ms,
                 )
-            if not normalized_steps:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "Could not generate runnable steps from this prompt. "
-                        "Please include a URL and clearer element targets."
-                    ),
-                )
-            validated = RunCreateRequest.model_validate(
+                normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
+                normalized_steps = _ensure_drag_step(request.task, normalized_steps)
+                validation = _validate_generated_plan(request.task, normalized_steps)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
+
+            trace["attempts"].append(
                 {
-                    "run_name": payload.get("run_name", "ai-generated-run"),
-                    "start_url": payload.get("start_url"),
-                    "steps": normalized_steps,
-                    "test_data": request.test_data,
-                    "selector_profile": request.selector_profile,
+                    "source": "llm_planner",
+                    "planning_task": attempt_task,
+                    "payload": payload,
+                    "normalized_steps": normalized_steps,
+                    "validation": validation,
                 }
             )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
+            last_validation = validation
 
-        trimmed_steps = validated.steps[:max_steps]
-        return PlanGenerateResponse(
-            run_name=validated.run_name,
-            start_url=validated.start_url,
-            steps=trimmed_steps,
+            if not validation["valid"]:
+                continue
+
+            try:
+                validated = RunCreateRequest.model_validate(
+                    {
+                        "run_name": payload.get("run_name", "ai-generated-run"),
+                        "start_url": payload.get("start_url"),
+                        "steps": normalized_steps,
+                        "test_data": request.test_data,
+                        "selector_profile": request.selector_profile,
+                    }
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
+
+            trace["normalized_plan"] = [step.model_dump(exclude_none=True) for step in validated.steps]
+            trace["validation"] = validation
+            _write_plan_trace(trace_dir, trace)
+            return PlanGenerateResponse(
+                run_name=validated.run_name,
+                start_url=validated.start_url,
+                steps=validated.steps[:max_steps],
+            )
+
+        trace["validation"] = last_validation
+        _write_plan_trace(trace_dir, trace)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Generated plan failed validation after one retry.",
+                "validation_errors": list((last_validation or {}).get("errors", []))
+                + list((last_validation or {}).get("missing_steps", []))
+                + list((last_validation or {}).get("rejection_reasons", [])),
+            },
         )
 
     @app.post("/api/suite-runs", response_model=SuiteRunState)

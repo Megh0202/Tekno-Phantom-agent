@@ -44,6 +44,13 @@ class SuiteExecutor:
 
         suite_run.status = SuiteRunStatus.running
         suite_run.started_at = utc_now()
+        LOGGER.info(
+            "Suite run %s: starting '%s' with %d test(s) (max_parallel=%d)",
+            suite_run_id,
+            suite_run.suite_name,
+            len(suite_run.tests),
+            suite_run.max_parallel,
+        )
         self._suite_store.persist(suite_run)
 
         max_parallel = max(1, min(suite_run.max_parallel, 10))
@@ -63,6 +70,7 @@ class SuiteExecutor:
                 refreshed.status = SuiteRunStatus.failed if any_failed else SuiteRunStatus.completed
             refreshed.finished_at = utc_now()
             refreshed.summary = self._build_summary(refreshed)
+            LOGGER.info("Suite run %s: finished with status=%s", suite_run_id, refreshed.status.value)
             await self._write_suite_report(refreshed)
             self._suite_store.persist(refreshed)
         except Exception:
@@ -94,6 +102,7 @@ class SuiteExecutor:
 
         target.status = SuiteRunStatus.running
         target.started_at = utc_now()
+        LOGGER.info("Suite run %s: starting test_case_id=%s name=%r", suite_run_id, test_case_id, target.name)
         self._suite_store.persist(suite_run)
 
         test_case = self._test_case_store.get(test_case_id)
@@ -128,9 +137,14 @@ class SuiteExecutor:
             target.summary = completed_run.summary
             target.report_artifact = completed_run.report_artifact
             target.error = completed_run.summary if target.status == SuiteRunStatus.failed else None
+            LOGGER.info(
+                "Suite run %s: test_case_id=%s finished status=%s",
+                suite_run_id, test_case_id, target.status.value,
+            )
         except Exception as exc:
             target.status = SuiteRunStatus.failed
             target.error = str(exc)
+            LOGGER.exception("Suite run %s: test_case_id=%s raised an exception", suite_run_id, test_case_id)
         finally:
             target.finished_at = utc_now()
             self._suite_store.persist(suite_run)

@@ -38,6 +38,23 @@ def test_normalize_verify_text_maps_text_to_value() -> None:
     assert steps[0]["match"] == "contains"
 
 
+def test_normalize_verify_text_maps_message_and_builds_text_selector() -> None:
+    steps = normalize_plan_steps(
+        [
+            {
+                "type": "verify_text",
+                "message": "Passwords must match",
+            }
+        ],
+        max_steps=10,
+    )
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "verify_text"
+    assert steps[0]["selector"] == "text=Passwords must match"
+    assert steps[0]["value"] == "Passwords must match"
+
+
 def test_normalize_alias_types() -> None:
     steps = normalize_plan_steps(
         [
@@ -110,3 +127,45 @@ def test_normalize_drag_step_alias() -> None:
     assert steps[0]["type"] == "drag"
     assert steps[0]["source_selector"] == "[draggable='true']:has-text('Short answer')"
     assert steps[0]["target_selector"] == ".form-canvas"
+
+
+def test_normalize_click_semantic_target_preserves_target_and_derives_seed_selector() -> None:
+    steps = normalize_plan_steps(
+        [
+            {
+                "type": "click",
+                "target": {
+                    "kind": "button",
+                    "text": "Search",
+                    "context": "header actions",
+                },
+            }
+        ],
+        max_steps=10,
+    )
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "click"
+    assert steps[0]["target"]["text"] == "Search"
+    assert "Search" in steps[0]["selector"]
+
+
+def test_normalize_type_semantic_target_uses_placeholder_when_selector_missing() -> None:
+    steps = normalize_plan_steps(
+        [
+            {
+                "type": "type",
+                "target": {
+                    "kind": "input",
+                    "placeholder": "Search Amazon.in",
+                },
+                "text": "wireless headphones",
+            }
+        ],
+        max_steps=10,
+    )
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "type"
+    assert steps[0]["target"]["placeholder"] == "Search Amazon.in"
+    assert "placeholder" in steps[0]["selector"]

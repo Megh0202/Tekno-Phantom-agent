@@ -5,13 +5,18 @@ from typing import Any
 
 
 ACTION_TYPE_KEYS = ("type", "action", "step_type", "name", "tool")
-_VERIFY_VISIBLE_TEXT_RE = re.compile(
-    r"^\s*(?:verify|check|assert)\s+(.+?)\s+(?:is|should be)\s+(?:visible|displayed)\s*$",
-    flags=re.IGNORECASE,
-)
-_TYPE_INTO_TEXT_RE = re.compile(
-    r"^\s*(?:type|enter|input|fill)\s+(.+?)\s+(?:into|in)\s+(.+?)\s*$",
-    flags=re.IGNORECASE,
+
+
+_VERIFY_VALUE_FIELDS = (
+    "value",
+    "text",
+    "expected",
+    "contains",
+    "expected_text",
+    "expected_value",
+    "message",
+    "msg",
+    "assert_text",
 )
 
 
@@ -28,7 +33,7 @@ def normalize_plan_steps(
     for raw_step in raw_steps:
         step: dict[str, Any] | None = None
         if isinstance(raw_step, dict):
-            step = _normalize_step(raw_step, default_wait_ms=default_wait_ms)
+            step = _normalize_step(raw_step)
         elif isinstance(raw_step, str):
             step = _normalize_string_step(raw_step, default_wait_ms=default_wait_ms)
         if step is None:
@@ -58,18 +63,9 @@ def build_recovery_steps(
     return steps[: max(1, max_steps)]
 
 
-def _normalize_step(raw_step: dict[str, Any], *, default_wait_ms: int = 1000) -> dict[str, Any] | None:
+def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
     step_type = _normalize_type(_get_step_type(raw_step))
     if not step_type:
-        inferred_text = (
-            _as_str(raw_step.get("instruction"))
-            or _as_str(raw_step.get("step"))
-            or _as_str(raw_step.get("description"))
-            or _as_str(raw_step.get("text"))
-            or _as_str(raw_step.get("value"))
-        )
-        if inferred_text:
-            return _normalize_string_step(inferred_text, default_wait_ms=default_wait_ms)
         return None
 
     if step_type == "navigate":
@@ -87,38 +83,56 @@ def _normalize_step(raw_step: dict[str, Any], *, default_wait_ms: int = 1000) ->
 
     if step_type == "click":
         selector = _pick_selector(raw_step)
-        if not selector:
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="click")
+        if not selector and not target:
             return None
-        return {"type": "click", "selector": selector}
+        step = {"type": "click", "selector": selector or ""}
+        if target:
+            step["target"] = target
+        return step
 
     if step_type == "type":
         selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="type")
         text = (
             _as_str(raw_step.get("text"))
             or _as_str(raw_step.get("value"))
             or _as_str(raw_step.get("input"))
             or _as_str(raw_step.get("query"))
         )
-        if not selector or text is None:
+        if (not selector and not target) or text is None:
             return None
-        return {
+        step = {
             "type": "type",
-            "selector": selector,
+            "selector": selector or "",
             "text": text,
             "clear_first": bool(raw_step.get("clear_first", True)),
         }
+        if target:
+            step["target"] = target
+        return step
 
     if step_type == "select":
         selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="select")
         value = (
             _as_str(raw_step.get("value"))
             or _as_str(raw_step.get("option"))
             or _as_str(raw_step.get("text"))
             or _as_str(raw_step.get("choice"))
         )
-        if not selector or value is None:
+        if (not selector and not target) or value is None:
             return None
-        return {"type": "select", "selector": selector, "value": value}
+        step = {"type": "select", "selector": selector or "", "value": value}
+        if target:
+            step["target"] = target
+        return step
 
     if step_type == "drag":
         source_selector = _pick_drag_source_selector(raw_step)
@@ -201,14 +215,14 @@ def _normalize_step(raw_step: dict[str, Any], *, default_wait_ms: int = 1000) ->
         return step
 
     if step_type == "verify_text":
+        value = extract_verify_text_value(raw_step)
         selector = _pick_selector(raw_step)
-        value = (
-            _as_str(raw_step.get("value"))
-            or _as_str(raw_step.get("text"))
-            or _as_str(raw_step.get("expected"))
-            or _as_str(raw_step.get("contains"))
-        )
-        if not selector or value is None:
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="verify_text")
+        if not selector and value:
+            selector = _to_text_selector(value)
+        if (not selector and not target) or value is None:
             return None
         match = (
             _as_str(raw_step.get("match"))
@@ -219,12 +233,15 @@ def _normalize_step(raw_step: dict[str, Any], *, default_wait_ms: int = 1000) ->
         match = _normalize_match(match)
         if match not in {"exact", "contains", "regex"}:
             match = "contains"
-        return {
+        step = {
             "type": "verify_text",
-            "selector": selector,
+            "selector": selector or "",
             "match": match,
             "value": value,
         }
+        if target:
+            step["target"] = target
+        return step
 
     if step_type == "verify_image":
         step: dict[str, Any] = {"type": "verify_image"}
@@ -265,34 +282,10 @@ def _normalize_string_step(raw_step: str, *, default_wait_ms: int = 1000) -> dic
         if selector:
             return {"type": "click", "selector": selector}
 
-    type_into_match = _TYPE_INTO_TEXT_RE.match(text)
-    if type_into_match:
-        raw_value = _extract_quoted_text(type_into_match.group(1)) or type_into_match.group(1).strip()
-        raw_selector = type_into_match.group(2).strip()
-        selector = _to_text_selector(raw_selector)
-        if selector and raw_value:
-            return {
-                "type": "type",
-                "selector": selector,
-                "text": raw_value,
-                "clear_first": True,
-            }
-
     if any(token in lower for token in ("verify", "assert", "check")):
-        visible_match = _VERIFY_VISIBLE_TEXT_RE.match(text)
-        if visible_match:
-            target = visible_match.group(1).strip()
-            selector = _to_text_selector(target)
-            if selector:
-                return {
-                    "type": "wait",
-                    "until": "selector_visible",
-                    "selector": selector,
-                    "ms": max(default_wait_ms * 2, 1000),
-                }
         quoted = _extract_quoted_text(text)
         if quoted:
-            return {"type": "verify_text", "selector": "h1", "match": "contains", "value": quoted}
+            return {"type": "verify_text", "selector": f"text={quoted}", "match": "contains", "value": quoted}
 
     return None
 
@@ -404,6 +397,59 @@ def _pick_selector(raw_step: dict[str, Any]) -> str | None:
         or _as_str(raw_step.get("name"))
     )
     return _to_text_selector(target)
+
+
+def _normalize_semantic_target(raw_step: dict[str, Any]) -> dict[str, Any] | None:
+    raw_target = raw_step.get("target")
+    candidate: dict[str, Any] = {}
+    if isinstance(raw_target, dict):
+        for key in ("kind", "role", "text", "label", "placeholder", "context"):
+            value = _as_str(raw_target.get(key))
+            if value:
+                candidate[key] = value
+
+    field_aliases = {
+        "kind": ("target_kind", "element_type"),
+        "role": ("target_role",),
+        "text": ("target_text", "element_text"),
+        "label": ("target_label",),
+        "placeholder": ("target_placeholder",),
+        "context": ("target_context",),
+    }
+    for key, aliases in field_aliases.items():
+        if key in candidate:
+            continue
+        for alias in aliases:
+            value = _as_str(raw_step.get(alias))
+            if value:
+                candidate[key] = value
+                break
+    return candidate or None
+
+
+def _selector_seed_from_target(target: dict[str, Any], *, step_type: str) -> str | None:
+    text = _as_str(target.get("text"))
+    label = _as_str(target.get("label"))
+    placeholder = _as_str(target.get("placeholder"))
+    role = _as_str(target.get("role"))
+    kind = _as_str(target.get("kind"))
+
+    if placeholder and step_type in {"type", "select"}:
+        return f"input[placeholder*='{placeholder}'], textarea[placeholder*='{placeholder}']"
+    if label and step_type in {"type", "select"}:
+        return f"label:has-text('{label}') input, label:has-text('{label}') textarea, [aria-label*='{label}']"
+    visible_text = text or label
+    if not visible_text:
+        return None
+    if step_type == "click":
+        if role:
+            return f"[role='{role}']:has-text('{visible_text}')"
+        if kind == "link":
+            return f"a:has-text('{visible_text}')"
+        return f"button:has-text('{visible_text}')"
+    if step_type == "verify_text":
+        return f"text={visible_text}"
+    return None
 
 
 def _pick_drag_source_selector(raw_step: dict[str, Any]) -> str | None:
@@ -529,6 +575,26 @@ def _extract_quoted_text(text: str) -> str | None:
         return None
     candidate = match.group(1).strip()
     return candidate or None
+
+
+def extract_verify_text_value(raw_step: dict[str, Any]) -> str | None:
+    for field in _VERIFY_VALUE_FIELDS:
+        value = _as_str(raw_step.get(field))
+        if value:
+            return value
+
+    target = _as_str(raw_step.get("target_text")) or _as_str(raw_step.get("label"))
+    if target and not _looks_like_selector(target):
+        return target
+
+    selector = _as_str(raw_step.get("selector")) or _as_str(raw_step.get("locator"))
+    if selector:
+        selector_text = _extract_quoted_text(selector)
+        if selector.startswith("text="):
+            return selector.split("=", 1)[1].strip() or None
+        if selector_text and not _looks_like_selector(selector_text):
+            return selector_text
+    return None
 
 
 def _as_str(value: Any) -> str | None:

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Annotated, Any, Literal, Union
 from uuid import uuid4
 
@@ -15,6 +16,7 @@ def utc_now() -> datetime:
 class RunStatus(str, Enum):
     pending = "pending"
     running = "running"
+    waiting_for_input = "waiting_for_input"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -31,9 +33,28 @@ class SuiteRunStatus(str, Enum):
 class StepStatus(str, Enum):
     pending = "pending"
     running = "running"
+    waiting_for_input = "waiting_for_input"
     completed = "completed"
     failed = "failed"
+    skipped = "skipped"
     cancelled = "cancelled"
+
+
+class SemanticTarget(BaseModel):
+    kind: str | None = None
+    role: str | None = None
+    text: str | None = None
+    label: str | None = None
+    placeholder: str | None = None
+    context: str | None = None
+
+    @field_validator("kind", "role", "text", "label", "placeholder", "context")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class NavigateStep(BaseModel):
@@ -43,20 +64,35 @@ class NavigateStep(BaseModel):
 
 class ClickStep(BaseModel):
     type: Literal["click"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("click step requires selector or target")
 
 
 class TypeStep(BaseModel):
     type: Literal["type"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     text: str
     clear_first: bool = True
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("type step requires selector or target")
 
 
 class SelectStep(BaseModel):
     type: Literal["select"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     value: str
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("select step requires selector or target")
 
 
 class DragStep(BaseModel):
@@ -91,9 +127,14 @@ class HandlePopupStep(BaseModel):
 
 class VerifyTextStep(BaseModel):
     type: Literal["verify_text"]
-    selector: str
+    selector: str = ""
+    target: SemanticTarget | None = None
     match: Literal["exact", "contains", "regex"] = "contains"
     value: str
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("verify_text step requires selector or target")
 
 
 class VerifyImageStep(BaseModel):
@@ -126,9 +167,19 @@ JsonScalar = str | int | float | bool | None
 class RunCreateRequest(BaseModel):
     run_name: str = "agent-run"
     start_url: str | None = None
-    steps: list[ActionStep] = Field(min_length=1)
+    prompt: str = ""
+    execution_mode: Literal["plan", "autonomous"] = "plan"
+    failure_mode: Literal["stop", "continue"] = "stop"
+    steps: list[ActionStep] = Field(default_factory=list)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
+    source_test_case_id: str | None = None
+    resume_from_step_index: int | None = Field(default=None, ge=0)
+
+    @field_validator("prompt")
+    @classmethod
+    def normalize_prompt(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("steps")
     @classmethod
@@ -136,6 +187,18 @@ class RunCreateRequest(BaseModel):
         if len(value) > 500:
             raise ValueError("steps cannot exceed 500")
         return value
+
+    @field_validator("execution_mode")
+    @classmethod
+    def normalize_execution_mode(cls, value: str) -> str:
+        return value.strip().lower()
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.execution_mode == "autonomous":
+            if not self.prompt:
+                raise ValueError("prompt is required when execution_mode=autonomous")
+        elif not self.steps:
+            raise ValueError("steps must contain at least one action when execution_mode=plan")
 
     @field_validator("test_data", mode="before")
     @classmethod
@@ -192,6 +255,7 @@ class RunCreateRequest(BaseModel):
 class PlanGenerateRequest(BaseModel):
     task: str = Field(min_length=1, max_length=5000)
     max_steps: int | None = Field(default=None, ge=1, le=500)
+    start_url: str | None = None
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
 
@@ -405,6 +469,7 @@ class TestCaseState(BaseModel):
     name: str
     description: str = ""
     prompt: str = ""
+    user_id: int
     parent_folder_id: str | None = None
     start_url: str | None = None
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
@@ -419,6 +484,7 @@ class TestCaseSummary(BaseModel):
     name: str
     description: str = ""
     prompt: str = ""
+    user_id: int
     parent_folder_id: str | None = None
     start_url: str | None = None
     step_count: int = 0
@@ -454,6 +520,7 @@ class FolderCreateRequest(BaseModel):
 class FolderState(BaseModel):
     folder_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
+    user_id: int
     parent_folder_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -461,6 +528,59 @@ class FolderState(BaseModel):
 
 class FolderListResponse(BaseModel):
     items: list[FolderState]
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value: str) -> str:
+        return value.strip()
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip()
+
+
+class ProjectState(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    description: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectListResponse(BaseModel):
+    items: list[ProjectState]
 
 
 class StepRuntimeState(BaseModel):
@@ -474,14 +594,23 @@ class StepRuntimeState(BaseModel):
     message: str | None = None
     error: str | None = None
     failure_screenshot: str | None = None
+    user_input_kind: str | None = None
+    user_input_prompt: str | None = None
+    requested_selector_target: str | None = None
+    provided_selector: str | None = None
 
 
 class RunState(BaseModel):
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     run_name: str
     start_url: str | None = None
+    prompt: str = ""
+    execution_mode: Literal["plan", "autonomous"] = "plan"
+    failure_mode: Literal["stop", "continue"] = "stop"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
+    source_test_case_id: str | None = None
+    resume_from_step_index: int | None = None
     status: RunStatus = RunStatus.pending
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
@@ -502,8 +631,8 @@ class CancelRunResponse(BaseModel):
 
 class SelectorRecoveryRequest(BaseModel):
     step_index: int = Field(ge=0)
+    field: Literal["selector", "source_selector", "target_selector"]
     selector: str = Field(min_length=1, max_length=2000)
-    field: Literal["selector", "source_selector", "target_selector"] = "selector"
     run_name: str | None = Field(default=None, max_length=120)
 
     @field_validator("selector")
@@ -513,6 +642,92 @@ class SelectorRecoveryRequest(BaseModel):
         if not normalized:
             raise ValueError("selector cannot be blank")
         return normalized
+
+    @field_validator("run_name")
+    @classmethod
+    def normalize_run_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class StepSelectorHelpRequest(BaseModel):
+    selector: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("selector")
+    @classmethod
+    def normalize_selector(cls, value: str) -> str:
+        normalized = value.strip()
+        locator_match = re.search(
+            r"(?:await\s+)?page\.locator\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if locator_match:
+            normalized = locator_match.group(2).strip()
+        get_by_text_match = re.search(
+            r"(?:await\s+)?page\.get_by_text\(\s*([\"'])(.*?)\1(?:\s*,\s*exact\s*=\s*(True|False|true|false))?\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_text_match:
+            text_value = get_by_text_match.group(2).strip()
+            exact_flag = (get_by_text_match.group(3) or "").lower()
+            if exact_flag == "true":
+                escaped = text_value.replace("\\", "\\\\").replace('"', '\\"')
+                normalized = f':text-is("{escaped}")'
+            else:
+                normalized = f"text={text_value}"
+        get_by_placeholder_match = re.search(
+            r"(?:await\s+)?page\.get_by_placeholder\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_placeholder_match:
+            placeholder_value = get_by_placeholder_match.group(2).strip().replace("'", "\\'")
+            normalized = f"input[placeholder*='{placeholder_value}'], textarea[placeholder*='{placeholder_value}']"
+        get_by_label_match = re.search(
+            r"(?:await\s+)?page\.get_by_label\(\s*([\"'])(.*?)\1\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_label_match:
+            label_value = get_by_label_match.group(2).strip().replace("'", "\\'")
+            normalized = (
+                f"input[aria-label*='{label_value}'], textarea[aria-label*='{label_value}'], "
+                f"select[aria-label*='{label_value}'], label:has-text('{label_value}') input"
+            )
+        get_by_role_match = re.search(
+            r"(?:await\s+)?page\.get_by_role\(\s*([\"'])(.*?)\1(?:\s*,\s*name\s*=\s*([\"'])(.*?)\3)?\s*\)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if get_by_role_match:
+            role_value = get_by_role_match.group(2).strip().lower()
+            name_value = (get_by_role_match.group(4) or "").strip().replace("'", "\\'")
+            if role_value == "textbox":
+                if name_value:
+                    normalized = (
+                        f"input[placeholder*='{name_value}'], textarea[placeholder*='{name_value}'], "
+                        f"input[aria-label*='{name_value}'], textarea[aria-label*='{name_value}'], "
+                        f"label:has-text('{name_value}') input"
+                    )
+                else:
+                    normalized = "input, textarea, [role='textbox']"
+            elif name_value:
+                normalized = f"[role='{role_value}']:has-text('{name_value}')"
+            else:
+                normalized = f"[role='{role_value}']"
+        if normalized.startswith("//") or normalized.startswith("(//"):
+            normalized = f"xpath={normalized}"
+        if not normalized:
+            raise ValueError("selector cannot be blank")
+        return normalized
+
+
+class RunResumeRequest(BaseModel):
+    run_name: str | None = Field(default=None, max_length=120)
 
     @field_validator("run_name")
     @classmethod
