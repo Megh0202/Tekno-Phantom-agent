@@ -60,6 +60,11 @@ npm.cmd run dev
 
 Open `http://localhost:3000`.
 
+### 5) Docker Compose
+
+Copy `.env.example` to `.env` before running Docker so the backend and brain services receive the expected settings.
+For the frontend, Docker Compose passes `NEXT_PUBLIC_*` values at build time from the same root `.env`; leaving `NEXT_PUBLIC_API_BASE_URL` blank keeps the UI on same-origin requests through nginx.
+
 ## API Endpoints
 - `GET /health`
 - `GET /api/config`

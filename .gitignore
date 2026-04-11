@@ -36,6 +36,7 @@ dist/
 .env
 .env.*
 !.env.example
+!frontend/.env.example
 frontend/.env.local
 
 # Local data/artifacts

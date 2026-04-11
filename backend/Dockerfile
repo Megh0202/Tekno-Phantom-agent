@@ -5,6 +5,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+RUN mkdir -p /app/data /app/artifacts
+
 COPY pyproject.toml ./
 COPY app ./app
 COPY run_server.py ./run_server.py
