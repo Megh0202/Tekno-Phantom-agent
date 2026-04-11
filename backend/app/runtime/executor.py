@@ -664,7 +664,17 @@ class AgentExecutor:
         try:
             await self._browser.start_run(run_id)
 
-            if is_new_run and run.start_url:
+            should_navigate_to_start = False
+            if run.start_url:
+                if is_new_run:
+                    should_navigate_to_start = True
+                else:
+                    snapshot = await self._safe_page_snapshot()
+                    current_url = str((snapshot or {}).get("url") or "").strip().lower()
+                    if current_url in {"", "about:blank", "chrome://newtab/", "edge://newtab/"}:
+                        should_navigate_to_start = True
+
+            if should_navigate_to_start and run.start_url:
                 await asyncio.wait_for(
                     self._browser.navigate(run.start_url),
                     timeout=self._settings.step_timeout_seconds,

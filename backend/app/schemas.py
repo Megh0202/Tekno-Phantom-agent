@@ -629,6 +629,18 @@ class CancelRunResponse(BaseModel):
     status: RunStatus
 
 
+class RunResumeRequest(BaseModel):
+    run_name: str | None = Field(default=None, max_length=120)
+
+    @field_validator("run_name")
+    @classmethod
+    def normalize_run_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class SelectorRecoveryRequest(BaseModel):
     step_index: int = Field(ge=0)
     field: Literal["selector", "source_selector", "target_selector"]
@@ -724,18 +736,6 @@ class StepSelectorHelpRequest(BaseModel):
         if not normalized:
             raise ValueError("selector cannot be blank")
         return normalized
-
-
-class RunResumeRequest(BaseModel):
-    run_name: str | None = Field(default=None, max_length=120)
-
-    @field_validator("run_name")
-    @classmethod
-    def normalize_run_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
 
 
 class SuiteRunCreateRequest(BaseModel):
