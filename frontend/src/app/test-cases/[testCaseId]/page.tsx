@@ -58,13 +58,12 @@ function hasResolvedLiveConfig(config: AgentConfig): boolean {
 function resolveApiBaseUrl(): string {
   const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
   if (typeof window === "undefined") {
-    return configured || "http://localhost:8080";
+    return configured ? configured.replace(/\/$/, "") : "";
   }
 
   const browserHost = window.location.hostname.trim();
-  const browserProtocol = window.location.protocol === "https:" ? "https:" : "http:";
   if (!configured) {
-    return `${browserProtocol}//${browserHost}:8080`;
+    return window.location.origin.replace(/\/$/, "");
   }
 
   try {
