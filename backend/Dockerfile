@@ -12,6 +12,8 @@ COPY app ./app
 COPY run_server.py ./run_server.py
 
 RUN pip install --no-cache-dir .
+# RUN playwright install chromium
+RUN playwright install --with-deps chromium
 
 EXPOSE 8000
 

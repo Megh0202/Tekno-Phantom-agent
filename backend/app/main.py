@@ -13,11 +13,13 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from app.auth.dependencies import build_api_auth_dependency
 from app.brain.http_client import HttpBrainClient
 from app.config import Settings, get_settings
 from app.database import init_auth_database
 from app.mcp.browser_client import build_browser_client
 from app.mcp.filesystem_client import build_filesystem_client
+from app.models.user import User
 from app.routes import auth_router
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
@@ -444,6 +446,14 @@ def _write_plan_trace(trace_dir: Path, trace: dict[str, object]) -> None:
     )
 
 
+def _actor_user_id(actor: User | None) -> int:
+    return int(actor.id) if actor is not None else 1
+
+
+def _can_access_owned_resource(actor: User | None, owner_id: int) -> bool:
+    return actor is None or int(actor.id) == int(owner_id)
+
+
 def _is_enterprise_prompt(task: str) -> bool:
     lowered = task.lower()
     return any(
@@ -611,6 +621,7 @@ def build_app() -> FastAPI:
         file_client,
     )
     require_admin_auth = build_admin_auth_dependency(settings)
+    require_api_access = build_api_auth_dependency(settings)
     app.state.settings = settings
     app.state.run_store = run_store
     app.state.test_case_store = test_case_store
@@ -699,10 +710,12 @@ def build_app() -> FastAPI:
     @app.post("/api/test-cases", response_model=TestCaseState)
     async def create_test_case(
         request: TestCaseCreateRequest,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> TestCaseState:
-        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
-            raise HTTPException(status_code=404, detail="Parent folder not found")
+        if request.parent_folder_id:
+            parent_folder = test_case_store.get_folder(request.parent_folder_id)
+            if not parent_folder or not _can_access_owned_resource(actor, parent_folder.user_id):
+                raise HTTPException(status_code=404, detail="Parent folder not found")
         if len(request.steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
@@ -725,31 +738,35 @@ def build_app() -> FastAPI:
                 "selector_profile": request.selector_profile,
             }
         )
-        test_case = test_case_store.create(validated_request, user_id=1)
+        test_case = test_case_store.create(validated_request, user_id=_actor_user_id(actor))
         return test_case
 
     @app.post("/api/test-folders", response_model=FolderState)
     async def create_test_folder(
         request: FolderCreateRequest,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> FolderState:
-        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
-            raise HTTPException(status_code=404, detail="Parent folder not found")
-        folder = test_case_store.create_folder(request, user_id=1)
+        if request.parent_folder_id:
+            parent_folder = test_case_store.get_folder(request.parent_folder_id)
+            if not parent_folder or not _can_access_owned_resource(actor, parent_folder.user_id):
+                raise HTTPException(status_code=404, detail="Parent folder not found")
+        folder = test_case_store.create_folder(request, user_id=_actor_user_id(actor))
         return folder
 
     @app.get("/api/test-folders", response_model=FolderListResponse)
-    async def list_test_folders() -> FolderListResponse:
-        return FolderListResponse(items=test_case_store.list_folders())
+    async def list_test_folders(actor: User | None = Depends(require_api_access)) -> FolderListResponse:
+        folders = [item for item in test_case_store.list_folders() if _can_access_owned_resource(actor, item.user_id)]
+        return FolderListResponse(items=folders)
 
     @app.delete("/api/test-folders/{folder_id}", status_code=204)
     async def delete_test_folder(
         folder_id: str,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> None:
         folders = test_case_store.list_folders()
         folder_by_id = {folder.folder_id: folder for folder in folders}
-        if folder_id not in folder_by_id:
+        target_folder = folder_by_id.get(folder_id)
+        if target_folder is None or not _can_access_owned_resource(actor, target_folder.user_id):
             raise HTTPException(status_code=404, detail="Folder not found")
 
         child_map: dict[str, list[str]] = {}
@@ -776,7 +793,7 @@ def build_app() -> FastAPI:
         test_cases = test_case_store.list()
         for test_case in test_cases:
             parent_id = (test_case.parent_folder_id or "").strip()
-            if parent_id in seen:
+            if parent_id in seen and _can_access_owned_resource(actor, test_case.user_id):
                 test_case_store.delete(test_case.test_case_id)
 
         for target_id in reversed(folder_ids_to_delete):
@@ -854,13 +871,17 @@ def build_app() -> FastAPI:
         )
 
     @app.get("/api/test-cases", response_model=TestCaseListResponse)
-    async def list_test_cases() -> TestCaseListResponse:
-        return TestCaseListResponse(items=test_case_store.list())
+    async def list_test_cases(actor: User | None = Depends(require_api_access)) -> TestCaseListResponse:
+        cases = [item for item in test_case_store.list() if _can_access_owned_resource(actor, item.user_id)]
+        return TestCaseListResponse(items=cases)
 
     @app.get("/api/test-cases/{test_case_id}", response_model=TestCaseState)
-    async def get_test_case(test_case_id: str) -> TestCaseState:
+    async def get_test_case(
+        test_case_id: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> TestCaseState:
         test_case = test_case_store.get(test_case_id)
-        if not test_case:
+        if not test_case or not _can_access_owned_resource(actor, test_case.user_id):
             raise HTTPException(status_code=404, detail="Test case not found")
         return test_case
 
@@ -868,13 +889,15 @@ def build_app() -> FastAPI:
     async def update_test_case(
         test_case_id: str,
         request: TestCaseUpdateRequest,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> TestCaseState:
         current = test_case_store.get(test_case_id)
-        if not current:
+        if not current or not _can_access_owned_resource(actor, current.user_id):
             raise HTTPException(status_code=404, detail="Test case not found")
-        if request.parent_folder_id and not test_case_store.get_folder(request.parent_folder_id):
-            raise HTTPException(status_code=404, detail="Parent folder not found")
+        if request.parent_folder_id:
+            parent_folder = test_case_store.get_folder(request.parent_folder_id)
+            if not parent_folder or not _can_access_owned_resource(actor, parent_folder.user_id):
+                raise HTTPException(status_code=404, detail="Parent folder not found")
         if len(request.steps) > settings.max_steps_per_run:
             raise HTTPException(
                 status_code=400,
@@ -913,8 +936,11 @@ def build_app() -> FastAPI:
     @app.delete("/api/test-cases/{test_case_id}", status_code=204)
     async def delete_test_case(
         test_case_id: str,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> None:
+        existing = test_case_store.get(test_case_id)
+        if not existing or not _can_access_owned_resource(actor, existing.user_id):
+            raise HTTPException(status_code=404, detail="Test case not found")
         deleted = test_case_store.delete(test_case_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Test case not found")
@@ -923,10 +949,10 @@ def build_app() -> FastAPI:
     async def run_test_case(
         test_case_id: str,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> RunState:
         test_case = test_case_store.get(test_case_id)
-        if not test_case:
+        if not test_case or not _can_access_owned_resource(actor, test_case.user_id):
             raise HTTPException(status_code=404, detail="Test case not found")
 
         run_request = RunCreateRequest.model_validate(

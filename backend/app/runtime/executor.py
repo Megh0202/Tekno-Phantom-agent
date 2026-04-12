@@ -675,10 +675,14 @@ class AgentExecutor:
                         should_navigate_to_start = True
 
             if should_navigate_to_start and run.start_url:
-                await asyncio.wait_for(
-                    self._browser.navigate(run.start_url),
-                    timeout=self._settings.step_timeout_seconds,
-                )
+                try:
+                    await asyncio.wait_for(
+                        self._browser.navigate(run.start_url),
+                        timeout=self._settings.step_timeout_seconds,
+                    )
+                except Exception as exc:
+                    await self._record_startup_navigation_failure(run, exc)
+                    return
 
             has_step_failure = False
             if run.execution_mode == "autonomous" and run.prompt:
@@ -719,6 +723,36 @@ class AgentExecutor:
             if not preserve_browser_session:
                 await self._write_html_report(run)
             self._run_store.clear_cancel(run_id)
+
+    async def _record_startup_navigation_failure(self, run: RunState, exc: Exception) -> None:
+        compact = self._compact_error(exc)
+        if not compact.endswith("(step_type=navigate)"):
+            compact = f"{compact} (step_type=navigate)"
+
+        startup_step = StepRuntimeState(
+            index=0,
+            type="navigate",
+            input={"type": "navigate", "url": run.start_url or ""},
+            status=StepStatus.failed,
+            message="Initial navigation failed",
+            error=compact,
+            started_at=utc_now(),
+            ended_at=utc_now(),
+        )
+        for existing_step in run.steps:
+            existing_step.index += 1
+        run.steps.insert(0, startup_step)
+        await self._capture_failure_screenshot(run.run_id, startup_step)
+
+        run.status = RunStatus.failed
+        run.summary = f"Initial navigation to {run.start_url or 'the start URL'} failed: {compact}"
+        self._run_store.persist(run)
+        LOGGER.error(
+            "Run %s failed during startup navigation to %s: %s",
+            run.run_id,
+            run.start_url or "",
+            compact,
+        )
 
     async def _execute_existing_steps(self, run: RunState) -> bool:
         has_step_failure = False

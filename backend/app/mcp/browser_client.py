@@ -325,6 +325,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             context = await browser.new_context()
             page = await context.new_page()
             page.set_default_timeout(self._settings.playwright_default_timeout_ms)
+            page.set_default_navigation_timeout(self._settings.playwright_default_timeout_ms)
 
             run_context = _PlaywrightRunContext(
                 playwright=playwright,
@@ -369,7 +370,32 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def navigate(self, url: str) -> str:
         context = self._active_context()
-        await context.page.goto(url, wait_until="domcontentloaded")
+        navigation_timeout_ms = max(self._settings.playwright_default_timeout_ms, 0)
+        try:
+            await context.page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=navigation_timeout_ms,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Navigation to %s timed out waiting for domcontentloaded; retrying with commit. error=%s",
+                url,
+                self._compact_click_error(exc),
+            )
+            fallback_timeout_ms = max(navigation_timeout_ms, 15000)
+            await context.page.goto(
+                url,
+                wait_until="commit",
+                timeout=fallback_timeout_ms,
+            )
+            try:
+                await context.page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=min(fallback_timeout_ms, 4000),
+                )
+            except Exception:
+                pass
         return f"Navigated to {url}"
 
     async def click(self, selector: str) -> str:
