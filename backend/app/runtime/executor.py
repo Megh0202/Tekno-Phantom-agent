@@ -801,9 +801,9 @@ class AgentExecutor:
             if step.status in {StepStatus.completed, StepStatus.skipped}:
                 continue
             if step.status == StepStatus.waiting_for_input:
-                run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
-                break
+                has_step_failure = True
+                continue
             if self._run_store.is_cancelled(run.run_id):
                 step.status = StepStatus.cancelled
                 run.status = RunStatus.cancelled
@@ -828,9 +828,9 @@ class AgentExecutor:
             )
             self._run_store.persist(run)
             if step.status == StepStatus.waiting_for_input:
-                run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
-                break
+                has_step_failure = True
+                continue
             if step.status == StepStatus.failed:
                 has_step_failure = True
                 if self._should_continue_after_failure(run):
@@ -903,9 +903,9 @@ class AgentExecutor:
                 }
             )
             if step.status == StepStatus.waiting_for_input:
-                run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
-                break
+                has_step_failure = True
+                continue
             if step.status == StepStatus.failed:
                 has_step_failure = True
                 if self._should_continue_after_failure(run):
