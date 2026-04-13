@@ -1,15 +1,15 @@
-﻿:root {
-  --bg-sand: #f6f1e8;
-  --bg-paper: #fffdf8;
-  --ink-900: #1f2933;
-  --ink-700: #364250;
-  --ink-500: #5e6b78;
-  --line: #d6d9df;
-  --accent-cyan: #0d9488;
-  --accent-orange: #ea580c;
+:root {
+  --bg-base: #f0f4f8;
+  --bg-surface: #ffffff;
+  --ink-900: #0d1b2a;
+  --ink-700: #1e3252;
+  --ink-500: #5e7291;
+  --line: rgba(13, 27, 42, 0.1);
+  --accent-blue: #1a56db;
+  --accent-navy: #0f2d6b;
   --accent-yellow: #f59e0b;
-  --success: #15803d;
-  --danger: #b91c1c;
+  --success: #059669;
+  --danger: #dc2626;
 }
 
 * {
@@ -27,9 +27,9 @@ body {
 
 body {
   background:
-    radial-gradient(circle at 15% 10%, rgba(13, 148, 136, 0.16), transparent 35%),
-    radial-gradient(circle at 85% 0%, rgba(234, 88, 12, 0.16), transparent 30%),
-    linear-gradient(180deg, var(--bg-sand) 0%, #efe6d6 100%);
+    radial-gradient(ellipse at 20% 0%, rgba(26, 86, 219, 0.07), transparent 50%),
+    radial-gradient(ellipse at 80% 5%, rgba(15, 45, 107, 0.06), transparent 45%),
+    linear-gradient(180deg, #f0f4f8 0%, #e8eef6 100%);
   color: var(--ink-900);
   font-family: var(--font-space-grotesk), "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;

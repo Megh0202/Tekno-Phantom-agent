@@ -733,6 +733,75 @@ export default function Home() {
     }
   }
 
+  function parseCsvSteps(text: string): string[] {
+    const rows = text.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    if (rows.length === 0) return [];
+
+    // Detect delimiter: tab or comma
+    const delim = rows[0].includes("\t") ? "\t" : ",";
+
+    // Parse a single CSV cell (handles double-quoted values)
+    function parseCell(raw: string): string {
+      const s = raw.trim();
+      if (s.startsWith('"') && s.endsWith('"')) {
+        return s.slice(1, -1).replace(/""/g, '"').trim();
+      }
+      return s;
+    }
+
+    // Split a row respecting quoted commas
+    function splitRow(row: string): string[] {
+      if (delim === "\t") return row.split("\t").map(parseCell);
+      const cells: string[] = [];
+      let cur = "";
+      let inQ = false;
+      for (let i = 0; i < row.length; i++) {
+        const ch = row[i];
+        if (ch === '"') {
+          if (inQ && row[i + 1] === '"') { cur += '"'; i++; }
+          else inQ = !inQ;
+        } else if (ch === "," && !inQ) {
+          cells.push(parseCell(cur)); cur = "";
+        } else {
+          cur += ch;
+        }
+      }
+      cells.push(parseCell(cur));
+      return cells;
+    }
+
+    const firstRow = splitRow(rows[0]);
+
+    // Find which column contains step text.
+    // Prefer a column whose header matches common names.
+    const headerKeywords = ["step", "action", "description", "instruction", "task", "test"];
+    let stepColIndex = 0;
+    const lowerHeaders = firstRow.map((h) => h.toLowerCase());
+    const headerMatch = lowerHeaders.findIndex((h) => headerKeywords.some((kw) => h.includes(kw)));
+
+    let dataRows = rows;
+    if (headerMatch !== -1) {
+      stepColIndex = headerMatch;
+      dataRows = rows.slice(1); // skip header row
+    } else {
+      // If first row looks like a header (no leading digit), skip it
+      const firstCell = firstRow[0];
+      if (firstCell && !/^\d/.test(firstCell) && rows.length > 1) {
+        const secondRow = splitRow(rows[1]);
+        const secondCell = secondRow[0] ?? "";
+        // Only skip if second row looks like actual step content
+        if (/^\d/.test(secondCell) || secondCell.length > firstCell.length) {
+          dataRows = rows.slice(1);
+        }
+      }
+    }
+
+    return dataRows
+      .map((row) => splitRow(row)[stepColIndex] ?? "")
+      .map((cell) => cell.replace(/^\d+[\).\s-]+/, "").trim())
+      .filter(Boolean);
+  }
+
   async function importStepsFromFile(): Promise<void> {
     setRequestError(null);
     setRequestInfo(null);
@@ -742,6 +811,39 @@ export default function Home() {
       return;
     }
 
+    const isCsv = importFile.name.toLowerCase().endsWith(".csv");
+
+    // --- Client-side CSV parsing (no backend needed) ---
+    if (isCsv) {
+      try {
+        setIsImporting(true);
+        const text = await importFile.text();
+        const steps = parseCsvSteps(text);
+
+        if (steps.length === 0) {
+          setRequestError("No steps found in the CSV file. Make sure the file has one step per row.");
+          return;
+        }
+
+        const promptText = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+        setPrompt(promptText);
+        setImportedPlan(null);
+        setPlanPreview(null);
+        setPlanSignature("");
+        if (!testCaseName.trim()) {
+          setTestCaseName(importFile.name.replace(/\.[^.]+$/, ""));
+        }
+        setRequestInfo(`Imported ${steps.length} step${steps.length !== 1 ? "s" : ""} from ${importFile.name} into the prompt.`);
+      } catch (error) {
+        const rawMessage = error instanceof Error ? error.message : "Failed to read CSV file";
+        setRequestError(rawMessage);
+      } finally {
+        setIsImporting(false);
+      }
+      return;
+    }
+
+    // --- Backend path for XLSX ---
     try {
       setIsImporting(true);
       const formData = new FormData();
@@ -771,8 +873,15 @@ export default function Home() {
       if (!normalizedName) {
         setTestCaseName(imported.run_name);
       }
+
+      // Populate the prompt field with the imported step text
+      const promptText = buildPromptFallbackFromSteps(imported.steps);
+      if (promptText) {
+        setPrompt(promptText);
+      }
+
       setRequestInfo(
-        `Imported ${imported.imported_count} steps from ${imported.source_filename}. Running now will use imported steps.`,
+        `Imported ${imported.imported_count} steps from ${imported.source_filename} into the prompt.`,
       );
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : "Failed to import steps file";
@@ -1286,8 +1395,32 @@ export default function Home() {
           throw new Error("Could not map failed runtime step to its saved test step.");
         }
 
-        const updatedStep = { ...(steps[stepIndexToPatch] as Record<string, unknown>) };
-        updatedStep[stepField] = selectorValue;
+        const originalStepRow = steps[stepIndexToPatch] as Record<string, unknown>;
+        const originalSelectorValue = typeof originalStepRow[stepField] === "string"
+          ? (originalStepRow[stepField] as string)
+          : "";
+
+        // Determine whether the original selector is a {{selector.KEY}} template.
+        // If yes → update selector_profile (so the template keeps working) instead of
+        // overwriting the step's selector field with a raw value.
+        const templateMatch = /^\{\{\s*selector\.([a-zA-Z0-9_.-]+)\s*\}\}$/.exec(originalSelectorValue.trim());
+        const updatedProfile = { ...(detail.selector_profile ?? {}) };
+
+        let updatedStep: Record<string, unknown>;
+        if (templateMatch) {
+          // Keep the template in the step — prepend the new selector into the profile key
+          const profileKey = templateMatch[1];
+          const existing: string[] = Array.isArray(updatedProfile[profileKey])
+            ? [...(updatedProfile[profileKey] as string[])]
+            : [];
+          if (!existing.includes(selectorValue)) {
+            updatedProfile[profileKey] = [selectorValue, ...existing];
+          }
+          updatedStep = { ...originalStepRow }; // step unchanged — template still resolves via profile
+        } else {
+          // Literal selector — patch the step directly
+          updatedStep = { ...originalStepRow, [stepField]: selectorValue };
+        }
         steps[stepIndexToPatch] = updatedStep;
 
         const updateResponse = await fetch(`${API_BASE_URL}/api/test-cases/${currentRunSourceTestCaseId}`, {
@@ -1301,7 +1434,7 @@ export default function Home() {
             start_url: detail.start_url ?? null,
             steps,
             test_data: detail.test_data ?? {},
-            selector_profile: detail.selector_profile ?? {},
+            selector_profile: updatedProfile,
           }),
         });
         if (!updateResponse.ok) {

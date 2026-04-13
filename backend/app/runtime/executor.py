@@ -110,31 +110,72 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "input[autocomplete='new-password']",
     ],
     "first_name": [
+        "input[name='firstName']",
+        "input[name='first_name']",
+        "input[id='firstName']",
+        "input[id='first_name']",
         "input[name='name']",
         "input[id='name']",
-        "input[placeholder*='First Name']",
-        "input[placeholder*='first name']",
-        "input[aria-label*='First Name']",
+        # Placeholder-based — must NOT be inside a phone-widget wrapper
+        "input[placeholder='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
+        "input[placeholder*='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
+        "input[placeholder*='first name']:not(.iti__tel-input):not(.PhoneInputInput)",
+        "input[aria-label*='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
         "label:has-text('First Name') + input",
         "label:has-text('First Name') ~ input",
     ],
     "surname": [
         "input[name='surname']",
+        "input[name='lastName']",
+        "input[name='last_name']",
         "input[id='surname']",
+        "input[id='lastName']",
+        "input[placeholder='Surname']",
         "input[placeholder*='Surname']",
+        "input[placeholder='Last Name']",
         "input[placeholder*='Last Name']",
         "input[aria-label*='Surname']",
+        "input[aria-label*='Last Name']",
         "label:has-text('Surname') + input",
         "label:has-text('Surname') ~ input",
+        "label:has-text('Last Name') + input",
+        "label:has-text('Last Name') ~ input",
+    ],
+    "email": [
+        "input[type='email']",
+        "input[name='email']",
+        "input[id='email']",
+        "input[autocomplete='email']",
+        "input[placeholder='Email Address']",
+        "input[placeholder*='Email']",
+        "input[aria-label*='Email']",
+        "label:has-text('Email') + input",
+        "label:has-text('Email') ~ input",
     ],
     "phone": [
+        # Named / typed attributes (most reliable)
         "input[name='phone']",
         "input[name='mobile']",
         "input[name='phone_number']",
+        "input[name='phoneNumber']",
+        "input[id='phone']",
+        "input[id='mobile']",
         "input[type='tel']",
         "input[autocomplete='tel']",
+        # intl-tel-input library (flag + code picker) — the actual number input
+        "input.iti__tel-input",
+        ".iti input[type='tel']",
+        ".iti input[type='text']",
+        ".iti__flag-container ~ input",
+        # react-phone-number-input
+        "input.PhoneInputInput",
+        ".PhoneInput input",
+        # react-phone-input-2
+        "input.form-control[placeholder]",
+        # Generic placeholder fallback
         "input[placeholder*='Phone']",
         "input[placeholder*='Mobile']",
+        "input[placeholder*='phone']",
     ],
     "next_button": [
         "button:has-text('Next')",
@@ -1566,7 +1607,13 @@ class AgentExecutor:
                     break
             root_cause_str = " <- ".join(cause_chain)
 
-            if self._should_request_selector_help(step, exc) and self._selector_help_mode() == "pause":
+            if (
+                self._should_request_selector_help(step, exc)
+                and self._selector_help_mode() == "pause"
+                # If the user already provided a selector and it still fails, mark the
+                # step as failed and let execution continue — do not re-pause indefinitely.
+                and step.provided_selector is None
+            ):
                 LOGGER.warning(
                     "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
                     run.run_id, step.index + 1, len(run.steps), step.type,
@@ -1951,6 +1998,9 @@ class AgentExecutor:
 
         step.input["selector"] = selector
         step.input["_selector_help_original"] = requested_selector
+        # Preserve the original selector target so the API can update selector_profile
+        # after a successful retry (keyed by _recovery_selector_key in step.input).
+        step.input["_recovery_selector_key"] = requested_selector
         step.provided_selector = selector
         step.status = StepStatus.pending
         step.started_at = None
@@ -4576,10 +4626,18 @@ class AgentExecutor:
         if selector_text.startswith(("#", ".", "[", "/", "xpath=", "text=", "input", "button", "select", "textarea", "a:", "a[", "div", "span")):
             return []
 
-        combined = " ".join(
-            part for part in (raw_selector, text_hint or "") if part
-        ).lower()
-        combined = combined.replace("{{selector.", "").replace("}}", "")
+        # For dynamic label:has-text('Field Name') selectors, extract the label text
+        # so that meaningful keywords like "organization" or "date" are used rather
+        # than the noise words "label", "has", "text".
+        _label_text_match = re.search(r"label:has-text\(['\"](.+?)['\"]\)", selector_text, re.IGNORECASE)
+        if _label_text_match:
+            _base = _label_text_match.group(1)
+            combined = " ".join(part for part in (_base, text_hint or "") if part).lower()
+        else:
+            combined = " ".join(
+                part for part in (raw_selector, text_hint or "") if part
+            ).lower()
+            combined = combined.replace("{{selector.", "").replace("}}", "")
         combined = combined.replace("_", " ").replace("-", " ")
         keywords = [
             word for word in re.findall(r"[a-z0-9]+", combined)

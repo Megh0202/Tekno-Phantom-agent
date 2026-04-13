@@ -995,6 +995,43 @@ def build_app() -> FastAPI:
         refreshed = run_store.get(run.run_id)
         if refreshed is None:
             raise HTTPException(status_code=404, detail="Run not found after selector retry")
+
+        # Persist the working user-provided selector to the test case's selector_profile
+        # so future runs automatically use it without requiring manual input.
+        succeeded_step = next((s for s in refreshed.steps if s.step_id == step_id), None)
+        if (
+            succeeded_step is not None
+            and succeeded_step.status == StepStatus.completed
+            and succeeded_step.provided_selector
+            and refreshed.source_test_case_id
+        ):
+            recovery_key = succeeded_step.input.get("_recovery_selector_key") if succeeded_step.input else None
+            if isinstance(recovery_key, str) and recovery_key.strip():
+                # Extract profile key if selector was a template like {{selector.KEY}}
+                template_match = re.fullmatch(r"\{\{\s*selector\.([a-zA-Z0-9_.-]+)\s*\}\}", recovery_key.strip())
+                profile_key = template_match.group(1) if template_match else None
+
+                if not profile_key:
+                    # For non-template selectors, normalise the raw selector text into a key
+                    profile_key = re.sub(r"[^a-z0-9_]", "_", recovery_key.strip().lower())[:64].strip("_") or None
+
+                if profile_key:
+                    test_case = test_case_store.get(refreshed.source_test_case_id)
+                    if test_case is not None:
+                        updated_profile = dict(test_case.selector_profile)
+                        existing = list(updated_profile.get(profile_key, []))
+                        new_selector = succeeded_step.provided_selector
+                        if new_selector not in existing:
+                            updated_profile[profile_key] = [new_selector] + existing
+                            test_case.selector_profile = updated_profile
+                            test_case_store.persist(test_case)
+                            LOGGER.info(
+                                "Persisted user selector %r to test case %s selector_profile[%r]",
+                                new_selector,
+                                refreshed.source_test_case_id,
+                                profile_key,
+                            )
+
         return refreshed
 
     @app.post("/api/plan", response_model=PlanGenerateResponse)

@@ -169,7 +169,7 @@ class RunCreateRequest(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "stop"
+    failure_mode: Literal["stop", "continue"] = "continue"
     steps: list[ActionStep] = Field(default_factory=list)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
@@ -606,7 +606,7 @@ class RunState(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "stop"
+    failure_mode: Literal["stop", "continue"] = "continue"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
     source_test_case_id: str | None = None

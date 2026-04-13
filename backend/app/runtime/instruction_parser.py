@@ -234,6 +234,39 @@ def _parse_line(
     if named_field_entry is not None:
         return named_field_entry
 
+    # ── Registration / account-creation field handlers ─────────────────────────
+    # These must come BEFORE the generic form-builder handlers below so that
+    # lines like "first name: John" or "enter phone +91 ..." go to the correct
+    # registration-form selector and not to the form-builder label selector.
+
+    if any(token in lower for token in (
+        "first name:", "firstname:", "first name -", "firstname -",
+        "enter first name", "type first name", "given name:", "given name -",
+    )) and not any(token in lower for token in ("label", "form label", "lable")):
+        value = _extract_field_value(line, "given name", "first name", "firstname")
+        if value:
+            return {"type": "type", "selector": "{{selector.first_name}}", "text": value, "clear_first": True}
+
+    if any(token in lower for token in (
+        "surname:", "surname -", "last name:", "last name -",
+        "lastname:", "lastname -", "enter surname", "type surname",
+        "enter last name", "type last name",
+    )):
+        value = _extract_field_value(line, "surname", "last name", "lastname")
+        if value:
+            return {"type": "type", "selector": "{{selector.surname}}", "text": value, "clear_first": True}
+
+    if any(token in lower for token in (
+        "phone:", "phone -", "phone number:", "phone number -",
+        "mobile:", "mobile -", "mobile number:", "mobile number -",
+        "contact number:", "contact number -",
+        "enter phone", "type phone", "enter mobile", "type mobile",
+        "enter phone number", "type phone number",
+    )):
+        value = _extract_field_value(line, "phone number", "mobile number", "contact number", "phone", "mobile")
+        if value:
+            return {"type": "type", "selector": "{{selector.phone}}", "text": value, "clear_first": True}
+
     if any(token in lower for token in ("enter email", "type email", "email -", "email:", "into email", "email field")):
         value = _after_delimiter(line)
         if value:
@@ -489,12 +522,17 @@ def _parse_line(
             "target_selector": "{{selector.form_canvas_target}}",
         }
 
+    # "label" / "lable" here refers to the form-BUILDER label field, NOT a
+    # registration-form "First Name" input.  "first name" was previously
+    # included here by mistake — it is now handled by the registration-field
+    # block above, so we intentionally exclude it from this condition.
     if (
-        any(token in lower for token in ("label", "lable", "first name"))
+        any(token in lower for token in ("label", "lable"))
+        and "first name" not in lower
         and any(token in lower for token in ("enter", "type"))
         and not ("value as" in lower and "option" in lower)
     ):
-        value = quoted or "First Name"
+        value = quoted or "Label"
         if "option" in lower:
             return {"type": "type", "selector": "{{selector.dropdown_option_label}}", "text": value, "clear_first": True}
         return {"type": "type", "selector": "{{selector.form_label}}", "text": value, "clear_first": True}
@@ -529,6 +567,12 @@ def _parse_line(
         wait_ms = _extract_wait_ms(line)
         return {"type": "wait", "until": "timeout", "ms": wait_ms or max(default_wait_ms, 0)}
 
+    # General "Field Name: value" / "Field Name - value" handler for any application.
+    # Runs last so all specific handlers above take priority.
+    general_field = _parse_general_field_value(line)
+    if general_field is not None:
+        return general_field
+
     return None
 
 
@@ -548,9 +592,86 @@ def _extract_url(text: str) -> str | None:
 
 
 def _after_delimiter(text: str) -> str | None:
-    parts = re.split(r"\s[-:]\s", text, maxsplit=1)
+    # Accept " : ", " - " (spaces on both sides) OR ": " (no space before colon)
+    parts = re.split(r"(?:\s[-:]\s|(?<=\S):\s)", text, maxsplit=1)
     value = parts[1].strip() if len(parts) > 1 else ""
     return value or _first_quoted(text)
+
+
+def _extract_field_value(line: str, *keywords: str) -> str | None:
+    """
+    Extract the value after a known field keyword.
+
+    Handles all common prompt formats:
+      - "first name: John"          (colon, no leading space)
+      - "first name - John"         (dash with spaces)
+      - "enter first name John"     (keyword then bare value)
+      - "first name John Doe"       (bare)
+      - "first name 'John'"         (quoted)
+    Returns None if no non-empty value is found.
+    """
+    lower_line = line.lower()
+    for kw in keywords:
+        idx = lower_line.find(kw.lower())
+        if idx < 0:
+            continue
+        after = line[idx + len(kw):].strip()
+        # Strip leading delimiters: colon, dash, equals, spaces
+        after = re.sub(r"^[\s:=\-]+", "", after).strip()
+        if after:
+            return _strip_wrapping_quotes(after) or after
+    return _first_quoted(line)
+
+
+_FIELD_NAME_TO_SELECTOR: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("first name", "firstname", "given name"), "{{selector.first_name}}"),
+    (("surname", "last name", "lastname", "family name"), "{{selector.surname}}"),
+    (("email address", "email"), "{{selector.email}}"),
+    (("phone number", "phone no", "mobile number", "mobile no", "contact number", "phone", "mobile"), "{{selector.phone}}"),
+    (("confirm password", "confirm-password", "confirmpassword", "retype password", "repeat password"), "{{selector.confirm_password}}"),
+    (("password",), "{{selector.password}}"),
+    (("username", "user name"), "{{selector.username}}"),
+    (("next",), "{{selector.next_button}}"),
+)
+
+# Words in a field name that indicate it's an action instruction, not a data field
+_GENERAL_FIELD_EXCLUSIONS: frozenset[str] = frozenset({
+    "click", "navigate", "open", "visit", "go", "launch",
+    "enter", "type", "fill", "verify", "assert", "check",
+    "wait", "drag", "drop", "select", "choose", "http",
+    "save", "submit", "cancel", "close", "scroll", "reload",
+})
+
+# Matches "Field Name: value" or "Field Name - value" for arbitrary web form fields
+_GENERAL_FIELD_ENTRY_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9 ']{1,60}?)(?::\s*|\s+-\s+)(.+?)\s*$"
+)
+
+
+def _auto_label_selector(field_name: str) -> str:
+    """Generate a best-guess CSS selector for an arbitrary form field by its label text."""
+    clean = field_name.strip()
+    esc = clean.replace("'", "\\'")
+    return f"label:has-text('{esc}') input"
+
+
+def _field_name_to_profile_selector(raw: str) -> str | None:
+    """
+    Translate a plain-English field name (e.g. 'first name field') to a selector.
+
+    Returns a profile template like ``{{selector.first_name}}`` for known fields,
+    or a dynamic ``label:has-text(...)`` CSS selector for unknown fields so that
+    every field name produces a usable selector rather than being silently dropped.
+    """
+    cleaned = re.sub(r"\b(field|input|box|area|textbox)\b", "", raw.lower()).strip(" .,")
+    if not cleaned:
+        return None
+    for tokens, selector in _FIELD_NAME_TO_SELECTOR:
+        if any(token == cleaned or cleaned.startswith(token) for token in tokens):
+            return selector
+    # Unknown field — generate a dynamic label-based selector so the executor
+    # can attempt label:has-text() + keyword-based fallbacks.
+    return _auto_label_selector(cleaned.title())
 
 
 def _parse_explicit_type(line: str) -> dict[str, Any] | None:
@@ -560,10 +681,16 @@ def _parse_explicit_type(line: str) -> dict[str, Any] | None:
     raw_value = match.group(1).strip()
     raw_selector = match.group(2).strip()
     text = _first_quoted(raw_value) or _strip_wrapping_quotes(raw_value)
-    selector = _normalize_selector_text(raw_selector)
-    if not text or not selector:
+    raw_sel_clean = _normalize_selector_text(raw_selector)
+    if not text or not raw_sel_clean:
         return None
-    return {"type": "type", "selector": selector, "text": text, "clear_first": True}
+    # Map plain English field names to profile selectors so "type John into first name field"
+    # doesn't land a raw text string as the CSS selector.
+    if not _looks_like_explicit_selector(raw_sel_clean):
+        profile_sel = _field_name_to_profile_selector(raw_sel_clean)
+        if profile_sel:
+            return {"type": "type", "selector": profile_sel, "text": text, "clear_first": True}
+    return {"type": "type", "selector": raw_sel_clean, "text": text, "clear_first": True}
 
 
 def _parse_explicit_drag(line: str) -> dict[str, Any] | None:
@@ -692,7 +819,42 @@ def _parse_named_field_entry(line: str) -> dict[str, Any] | None:
     for tokens, selector in selector_map:
         if any(token in field_label for token in tokens):
             return {"type": "type", "selector": selector, "text": value, "clear_first": True}
-    return None
+    # Unknown field — generate a dynamic label-based selector so the step is
+    # not silently dropped (was returning None before this change).
+    selector = _auto_label_selector(field_label.strip().title())
+    return {"type": "type", "selector": selector, "text": value, "clear_first": True}
+
+
+def _parse_general_field_value(line: str) -> dict[str, Any] | None:
+    """
+    Handle ``"Field Name: value"`` and ``"Field Name - value"`` patterns for
+    arbitrary web form fields on **any** application.
+
+    This is the last-resort parser — it runs after all specific handlers, so it
+    only fires for field names that weren't already matched (e.g. "Organization
+    Name", "Date of Birth", "Zip Code", "Country", etc.).
+    """
+    match = _GENERAL_FIELD_ENTRY_RE.match(line.strip())
+    if not match:
+        return None
+    field_name = match.group(1).strip()
+    value = _strip_wrapping_quotes(match.group(2).strip())
+    if not field_name or not value or len(field_name) < 2:
+        return None
+    lower_field = field_name.lower()
+    # Exclude lines whose "field" portion contains action/instruction keywords
+    field_words = set(re.findall(r"[a-z]+", lower_field))
+    if field_words & _GENERAL_FIELD_EXCLUSIONS:
+        return None
+    # Exclude lines where the value looks like a URL or another instruction
+    lower_value = value.lower().lstrip()
+    if lower_value.startswith(("http", "www.", "click", "navigate", "open", "//")):
+        return None
+    # Map known fields to profile selectors; unknown fields get a dynamic selector
+    profile_sel = _field_name_to_profile_selector(field_name)
+    if profile_sel:
+        return {"type": "type", "selector": profile_sel, "text": value, "clear_first": True}
+    return {"type": "type", "selector": _auto_label_selector(field_name), "text": value, "clear_first": True}
 
 
 def _extract_wait_ms(text: str) -> int | None:

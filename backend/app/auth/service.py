@@ -64,7 +64,13 @@ def rotate_refresh_session(
     if record is None:
         raise AuthError("invalid refresh token")
     now = utc_now()
-    if record.revoked_at is not None or record.expires_at <= now:
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    revoked_at = record.revoked_at
+    if revoked_at is not None and revoked_at.tzinfo is None:
+        revoked_at = revoked_at.replace(tzinfo=timezone.utc)
+    if revoked_at is not None or expires_at <= now:
         raise AuthError("refresh token expired")
 
     user = db.get(User, record.user_id)
