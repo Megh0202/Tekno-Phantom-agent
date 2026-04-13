@@ -1104,6 +1104,43 @@ def test_execute_step_switches_to_waiting_for_input_on_selector_failure() -> Non
     assert step.requested_selector_target == "button:has-text('Workflows')"
 
 
+def test_execute_existing_steps_does_not_block_on_waiting_for_input_step() -> None:
+    executor = _executor(step_timeout_seconds=4)
+    run = RunState(
+        run_name="selector-help-continue-run",
+        steps=[
+            StepRuntimeState(
+                index=0,
+                type="click",
+                input={"type": "click", "selector": "button:has-text('Workflows')"},
+                status=StepStatus.waiting_for_input,
+                user_input_kind="selector",
+                requested_selector_target="button:has-text('Workflows')",
+            ),
+            StepRuntimeState(
+                index=1,
+                type="wait",
+                input={"type": "wait", "until": "timeout", "ms": 50},
+                status=StepStatus.pending,
+            ),
+        ],
+    )
+    executor._run_store = _RunStore(run)
+
+    async def _execute_step(current_run: RunState, step: StepRuntimeState) -> None:
+        step.status = StepStatus.completed
+        step.message = f"Executed step {step.index}"
+
+    executor._execute_step = _execute_step  # type: ignore[method-assign]
+
+    has_step_failure = asyncio.run(executor._execute_existing_steps(run))
+
+    assert has_step_failure is True
+    assert run.steps[0].status == StepStatus.waiting_for_input
+    assert run.steps[1].status == StepStatus.completed
+    assert run.steps[1].message == "Executed step 1"
+
+
 def test_execute_step_continues_to_selector_pipeline_after_page_assertion_failure() -> None:
     executor = _executor(step_timeout_seconds=4)
     executor._settings.selector_help_mode = "pause"
