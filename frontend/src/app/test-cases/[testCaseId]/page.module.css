@@ -4,14 +4,14 @@
   padding: 20px 18px 32px;
   display: grid;
   gap: 14px;
-  --line: rgba(13, 27, 42, 0.1);
-  --ink-900: #0d1b2a;
-  --ink-700: #1e3252;
-  --ink-500: #5e7291;
-  --surface: #ffffff;
-  --accent: #1a56db;
-  --accent-dark: #1341b8;
-  --focus: rgba(26, 86, 219, 0.18);
+  --line: rgba(255, 255, 255, 0.1);
+  --ink-900: #ffffff;
+  --ink-700: #e0e0e0;
+  --ink-500: #999999;
+  --surface: #111111;
+  --accent: #FFB300;
+  --accent-dark: #e6a100;
+  --focus: rgba(255, 179, 0, 0.2);
 }
 
 .header {
@@ -20,8 +20,8 @@
   padding: 14px 16px;
   background: var(--surface);
   box-shadow:
-    0 1px 3px rgba(13, 27, 42, 0.05),
-    0 8px 20px rgba(13, 27, 42, 0.04);
+    0 1px 3px rgba(0, 0, 0, 0.3),
+    0 8px 20px rgba(0, 0, 0, 0.2);
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -31,7 +31,7 @@
 
 .header h1 {
   margin-top: 4px;
-  color: var(--ink-900);
+  color: #ffffff;
   font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.02em;
@@ -52,7 +52,7 @@
 }
 
 .authTitle {
-  color: var(--ink-900);
+  color: #FFB300;
   font-weight: 700;
   font-size: 14px;
 }
@@ -67,7 +67,7 @@
 .linkButton {
   border: none;
   background: transparent;
-  color: var(--accent-dark);
+  color: #FFB300;
   text-decoration: underline;
   cursor: pointer;
   padding: 0;
@@ -76,7 +76,7 @@
 }
 
 .linkButton:hover {
-  color: var(--accent);
+  color: #ffc933;
 }
 
 .panel {
@@ -85,8 +85,8 @@
   padding: 16px;
   background: var(--surface);
   box-shadow:
-    0 1px 3px rgba(13, 27, 42, 0.05),
-    0 8px 20px rgba(13, 27, 42, 0.04);
+    0 1px 3px rgba(0, 0, 0, 0.3),
+    0 8px 20px rgba(0, 0, 0, 0.2);
   display: grid;
   gap: 12px;
 }
@@ -112,13 +112,13 @@
 }
 
 .tabButton:hover {
-  color: var(--ink-700);
-  background: rgba(13, 27, 42, 0.04);
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .tabActive {
-  color: var(--accent-dark);
-  border-bottom: 2px solid var(--accent);
+  color: #FFB300;
+  border-bottom: 2px solid #FFB300;
   background: transparent;
   border-radius: 0;
 }
@@ -140,10 +140,10 @@
 .fieldLabel textarea,
 .newRow input {
   width: 100%;
-  border: 1px solid rgba(13, 27, 42, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 10px;
-  background: #fafbfc;
-  color: var(--ink-900);
+  background: #1a1a1a;
+  color: #ffffff;
   padding: 10px 13px;
   font-size: 14px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -153,9 +153,9 @@
 .fieldLabel textarea:focus,
 .newRow input:focus {
   outline: none;
-  border-color: rgba(26, 86, 219, 0.5);
+  border-color: rgba(255, 179, 0, 0.5);
   box-shadow: 0 0 0 3px var(--focus);
-  background: #ffffff;
+  background: #1f1f1f;
 }
 
 .testsPane {
@@ -173,16 +173,16 @@
 }
 
 .stepItem {
-  border: 1px solid rgba(13, 27, 42, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
-  background: #fafbfc;
+  background: #1a1a1a;
   padding: 10px 12px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .stepItem:hover {
-  border-color: rgba(26, 86, 219, 0.18);
-  box-shadow: 0 2px 8px rgba(13, 27, 42, 0.05);
+  border-color: rgba(255, 179, 0, 0.25);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 .stepTopRow {
@@ -201,7 +201,7 @@
 
 .stepText {
   line-height: 1.4;
-  color: var(--ink-900);
+  color: #ffffff;
   font-size: 14px;
 }
 
@@ -220,47 +220,48 @@
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  border: 1px solid rgba(13, 27, 42, 0.12);
-  background: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: #222222;
   color: var(--ink-700);
   transition: all 0.15s ease;
 }
 
 .stepActionButton:hover {
-  background: #f1f5f9;
-  border-color: rgba(13, 27, 42, 0.2);
+  background: #2a2a2a;
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
 }
 
 .stepActionPrimary {
-  background: linear-gradient(145deg, #1a56db, #1341b8);
-  border-color: rgba(26, 86, 219, 0.5);
-  color: #ffffff;
-  box-shadow: 0 1px 3px rgba(26, 86, 219, 0.2);
+  background: linear-gradient(145deg, #FFB300, #e6a100);
+  border-color: rgba(255, 179, 0, 0.5);
+  color: #000000;
+  box-shadow: 0 1px 3px rgba(255, 179, 0, 0.2);
 }
 
 .stepActionPrimary:hover {
-  background: linear-gradient(145deg, #2563eb, #1a56db);
-  box-shadow: 0 3px 10px rgba(26, 86, 219, 0.3);
+  background: linear-gradient(145deg, #ffc933, #FFB300);
+  box-shadow: 0 3px 10px rgba(255, 179, 0, 0.35);
   transform: translateY(-1px);
 }
 
 .stepActionDanger {
-  border-color: rgba(220, 38, 38, 0.25);
-  background: rgba(254, 226, 226, 0.5);
-  color: #dc2626;
+  border-color: rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
 }
 
 .stepActionDanger:hover {
-  background: rgba(254, 202, 202, 0.7);
-  border-color: rgba(220, 38, 38, 0.4);
+  background: rgba(239, 68, 68, 0.2);
+  border-color: rgba(239, 68, 68, 0.5);
 }
 
 .stepEditInput {
   width: 100%;
-  border: 1px solid rgba(13, 27, 42, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 10px;
-  background: #fafbfc;
-  color: var(--ink-900);
+  background: #1a1a1a;
+  color: #ffffff;
   padding: 8px 11px;
   font-size: 14px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -268,9 +269,9 @@
 
 .stepEditInput:focus {
   outline: none;
-  border-color: rgba(26, 86, 219, 0.5);
+  border-color: rgba(255, 179, 0, 0.5);
   box-shadow: 0 0 0 3px var(--focus);
-  background: #ffffff;
+  background: #1f1f1f;
 }
 
 .newRow {
@@ -291,47 +292,48 @@
 }
 
 .primaryButton {
-  background: linear-gradient(145deg, #1a56db, #1341b8);
-  border-color: rgba(26, 86, 219, 0.5);
-  color: #ffffff;
-  box-shadow: 0 1px 3px rgba(26, 86, 219, 0.25);
+  background: linear-gradient(145deg, #FFB300, #e6a100);
+  border-color: rgba(255, 179, 0, 0.5);
+  color: #000000;
+  box-shadow: 0 1px 3px rgba(255, 179, 0, 0.3);
 }
 
 .primaryButton:hover:not(:disabled) {
-  background: linear-gradient(145deg, #2563eb, #1a56db);
+  background: linear-gradient(145deg, #ffc933, #FFB300);
   transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(26, 86, 219, 0.32);
+  box-shadow: 0 4px 14px rgba(255, 179, 0, 0.4);
 }
 
 .secondaryButton {
-  background: #ffffff;
-  border-color: rgba(13, 27, 42, 0.15);
+  background: #1a1a1a;
+  border-color: rgba(255, 255, 255, 0.15);
   color: var(--ink-700);
-  box-shadow: 0 1px 2px rgba(13, 27, 42, 0.05);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 .secondaryButton:hover:not(:disabled) {
-  background: #f8fafc;
-  border-color: rgba(13, 27, 42, 0.22);
+  background: #222222;
+  border-color: rgba(255, 179, 0, 0.3);
+  color: #FFB300;
   transform: translateY(-1px);
-  box-shadow: 0 3px 10px rgba(13, 27, 42, 0.08);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
 }
 
 .primaryButton:disabled,
 .secondaryButton:disabled {
-  opacity: 0.55;
+  opacity: 0.4;
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
 }
 
 .errorText {
-  color: #dc2626;
+  color: #ef4444;
   font-size: 14px;
 }
 
 .infoText {
-  color: #047857;
+  color: #22c55e;
   font-size: 14px;
 }
 

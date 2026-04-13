@@ -6561,14 +6561,16 @@ class AgentExecutor:
   <title>Test Run Report - {escape(run.run_name)}</title>
   <style>
     :root {{
-      --bg: #f6f8fb;
-      --card: #ffffff;
-      --border: #dbe2ea;
-      --text: #1f2a37;
-      --muted: #6b7280;
-      --pass: #15803d;
-      --fail: #dc2626;
-      --skip: #ca8a04;
+      --bg: #000000;
+      --card: #111111;
+      --border: rgba(255, 255, 255, 0.1);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text: #ffffff;
+      --muted: #999999;
+      --accent: #FFB300;
+      --pass: #22c55e;
+      --fail: #ef4444;
+      --skip: #FFB300;
     }}
     body {{
       margin: 0;
@@ -6581,18 +6583,23 @@ class AgentExecutor:
       max-width: 980px;
       margin: 0 auto;
       background: var(--card);
-      border: 1px solid var(--border);
+      border: 1px solid var(--border-strong);
       border-radius: 12px;
       overflow: hidden;
-      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
     }}
     .header {{
       padding: 16px 20px 10px;
       border-bottom: 1px solid var(--border);
+      background: radial-gradient(circle at 10% -20%, rgba(255, 179, 0, 0.06), transparent 50%), var(--card);
     }}
     h1 {{
       margin: 0;
       font-size: 20px;
+      color: #ffffff;
+    }}
+    h1 span {{
+      color: var(--accent);
     }}
     .meta {{
       margin-top: 6px;
@@ -6605,13 +6612,13 @@ class AgentExecutor:
       gap: 8px;
       padding: 12px 20px;
       border-bottom: 1px solid var(--border);
-      background: #fafcff;
+      background: #0d0d0d;
     }}
     .metric {{
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 8px 10px;
-      background: #ffffff;
+      background: #1a1a1a;
     }}
     .metric-label {{
       color: var(--muted);
@@ -6623,16 +6630,16 @@ class AgentExecutor:
       margin-top: 4px;
       font-size: 18px;
       font-weight: 700;
-      color: var(--text);
+      color: #ffffff;
     }}
     .metric-pass .metric-value {{
-      color: #166534;
+      color: #22c55e;
     }}
     .metric-fail .metric-value {{
-      color: #991b1b;
+      color: #ef4444;
     }}
     .metric-skip .metric-value {{
-      color: #854d0e;
+      color: #FFB300;
     }}
     details {{
       border-top: 1px solid var(--border);
@@ -6649,12 +6656,17 @@ class AgentExecutor:
       align-items: center;
       padding: 14px 20px;
       user-select: none;
+      transition: background 0.15s ease;
+    }}
+    summary:hover {{
+      background: rgba(255, 179, 0, 0.04);
     }}
     summary::-webkit-details-marker {{
       display: none;
     }}
     .summary-title {{
       font-weight: 600;
+      color: #ffffff;
     }}
     .status-cell {{
       display: inline-flex;
@@ -6670,16 +6682,16 @@ class AgentExecutor:
       letter-spacing: 0.02em;
     }}
     .run-passed {{
-      background: #dcfce7;
-      color: #166534;
+      background: rgba(34, 197, 94, 0.15);
+      color: #22c55e;
     }}
     .run-failed {{
-      background: #fee2e2;
-      color: #991b1b;
+      background: rgba(239, 68, 68, 0.15);
+      color: #ef4444;
     }}
     .run-skipped {{
-      background: #fef9c3;
-      color: #854d0e;
+      background: rgba(255, 179, 0, 0.15);
+      color: #FFB300;
     }}
     .arrow {{
       color: var(--muted);
@@ -6691,6 +6703,7 @@ class AgentExecutor:
     }}
     .seconds {{
       font-weight: 600;
+      color: var(--accent);
     }}
     .steps {{
       margin: 0;
@@ -6700,14 +6713,18 @@ class AgentExecutor:
       gap: 8px;
     }}
     .step-item {{
-      border: 1px solid var(--border);
+      border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 10px;
       padding: 10px 12px;
       display: grid;
       gap: 8px;
       grid-template-columns: 18px minmax(180px, 1fr) minmax(80px, auto) minmax(80px, auto);
       align-items: center;
-      background: #fbfdff;
+      background: #151515;
+      transition: border-color 0.15s ease;
+    }}
+    .step-item:hover {{
+      border-color: rgba(255, 179, 0, 0.2);
     }}
     .tick {{
       font-size: 15px;
@@ -6715,16 +6732,17 @@ class AgentExecutor:
       line-height: 1;
     }}
     .step-passed {{
-      color: var(--pass);
+      color: #22c55e;
     }}
     .step-failed {{
-      color: var(--fail);
+      color: #ef4444;
     }}
     .step-skipped {{
-      color: var(--skip);
+      color: #FFB300;
     }}
     .step-name {{
       font-size: 14px;
+      color: #e0e0e0;
     }}
     .step-status,
     .step-time {{
@@ -6738,6 +6756,10 @@ class AgentExecutor:
       color: var(--muted);
       font-size: 12px;
     }}
+    .step-detail a {{
+      color: var(--accent);
+      text-decoration: underline;
+    }}
     @media (max-width: 820px) {{
       .overall {{
         grid-template-columns: repeat(2, minmax(120px, 1fr));
@@ -6748,7 +6770,7 @@ class AgentExecutor:
 <body>
   <main class="report">
     <section class="header">
-      <h1>Test Execution Report</h1>
+      <h1>Test <span>Execution</span> Report</h1>
       <div class="meta">Run ID: {escape(run.run_id)}</div>
     </section>
     <section class="overall">
