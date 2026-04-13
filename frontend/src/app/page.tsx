@@ -1731,7 +1731,6 @@ export default function Home() {
       <header className={styles.hero}>
         <div className={styles.heroLeft}>
           <p className={styles.kicker}>Tekno Phantom</p>
-          <h1>Tekno Phantom</h1>
           <p className={styles.subtitle}>
             Prompt in, result out. Describe your browser task in plain language and Tekno Phantom
             will plan and execute it automatically.
