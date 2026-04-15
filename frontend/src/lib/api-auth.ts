@@ -7,6 +7,47 @@ type BuildApiHeadersOptions = {
 
 type ApiFetchOptions = RequestInit & BuildApiHeadersOptions;
 
+export function resolveApiBaseUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
+  if (typeof window === "undefined") {
+    return configured ? configured.replace(/\/$/, "") : "";
+  }
+
+  const browserHost = window.location.hostname.trim();
+  if (!configured) {
+    return window.location.origin.replace(/\/$/, "");
+  }
+
+  try {
+    const url = new URL(configured);
+    const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+    const configuredIsLoopback = loopbackHosts.has(url.hostname);
+    const browserIsLoopback = loopbackHosts.has(browserHost);
+    if (configuredIsLoopback !== browserIsLoopback) {
+      url.hostname = browserHost;
+      return url.toString().replace(/\/$/, "");
+    }
+    return configured.replace(/\/$/, "");
+  } catch {
+    return configured.replace(/\/$/, "");
+  }
+}
+
+export function resolveLiveViewerUrl(apiBaseUrl: string): string {
+  const fallbackOrigin = typeof window !== "undefined" ? window.location.origin : "";
+  const base = apiBaseUrl || fallbackOrigin;
+  if (!base) {
+    return "/viewer/vnc.html?autoconnect=1&resize=remote&reconnect=1";
+  }
+
+  try {
+    const origin = new URL(base).origin;
+    return new URL("/viewer/vnc.html?autoconnect=1&resize=remote&reconnect=1", origin).toString();
+  } catch {
+    return `${base.replace(/\/$/, "")}/viewer/vnc.html?autoconnect=1&resize=remote&reconnect=1`;
+  }
+}
+
 function getCookie(name: string): string {
   if (typeof document === "undefined") return "";
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

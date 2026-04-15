@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     playwright_headless: bool = True
     playwright_default_timeout_ms: int = 15000
     playwright_slow_mo_ms: int = 0
+    browser_viewer_enabled: bool = False
+    viewer_display_start: int = 99
+    viewer_display_end: int = 140
+    viewer_vnc_port_start: int = 5900
+    viewer_vnc_port_end: int = 5941
+    viewer_screen_geometry: str = "1440x960x24"
+    viewer_startup_timeout_seconds: int = 12
+    viewer_keepalive_seconds: int = 45
+    viewer_static_root: Path = Path("/usr/share/novnc")
     drag_use_fixed_coords: bool = True
     drag_target_x_offset: int = 260
     drag_target_y_offset: int = 180
@@ -116,6 +125,7 @@ class Settings(BaseSettings):
         self.run_store_db_path = _resolve_project_path(self.run_store_db_path)
         self.selector_memory_db_path = _resolve_project_path(self.selector_memory_db_path)
         self.artifact_root = _resolve_project_path(self.artifact_root)
+        self.viewer_static_root = _resolve_project_path(self.viewer_static_root)
 
     @property
     def cors_origin_list(self) -> list[str]:

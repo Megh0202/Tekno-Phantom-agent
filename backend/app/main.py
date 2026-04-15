@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
+from html import escape
 import json
 import logging
 import re
 import sys
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.auth.dependencies import build_api_auth_dependency
 from app.brain.http_client import HttpBrainClient
@@ -30,6 +34,7 @@ from app.runtime.suite_store import build_suite_store
 from app.runtime.step_importer import StepImportError, parse_step_rows_from_upload
 from app.runtime.store import build_run_store
 from app.runtime.test_case_store import build_test_case_store
+from app.runtime.viewer_session import ViewerSessionManager
 from app.schemas import (
     CancelSuiteRunResponse,
     CancelRunResponse,
@@ -450,6 +455,14 @@ def _actor_user_id(actor: User | None) -> int:
     return int(actor.id) if actor is not None else 1
 
 
+def _run_owner_id(actor: User | None) -> int:
+    return int(actor.id) if actor is not None else 0
+
+
+def _viewer_supported(settings: Settings) -> bool:
+    return settings.browser_mode == "playwright" and settings.browser_viewer_enabled and not settings.playwright_headless
+
+
 def _can_access_owned_resource(actor: User | None, owner_id: int) -> bool:
     return actor is None or int(actor.id) == int(owner_id)
 
@@ -602,7 +615,8 @@ def build_app() -> FastAPI:
     test_case_store = build_test_case_store(settings)
     selector_memory = build_selector_memory_store(settings)
     brain_client = HttpBrainClient(settings)
-    browser_client = build_browser_client(settings)
+    viewer_sessions = ViewerSessionManager(settings) if _viewer_supported(settings) else None
+    browser_client = build_browser_client(settings, viewer_sessions=viewer_sessions)
     file_client = build_filesystem_client(settings)
     executor = AgentExecutor(
         settings,
@@ -628,10 +642,43 @@ def build_app() -> FastAPI:
     app.state.suite_store = suite_store
     app.state.executor = executor
     app.state.suite_executor = suite_executor
+    app.state.viewer_sessions = viewer_sessions
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
+        if viewer_sessions is not None:
+            await viewer_sessions.aclose()
         await file_client.aclose()
+
+    def prepare_run_viewer(run: RunState) -> RunState:
+        if viewer_sessions is None:
+            run.viewer_token = None
+            run.viewer_url = None
+            run.viewer_status = None
+            run.viewer_last_error = None
+            return run
+        info = viewer_sessions.prepare_run(run.run_id, token=run.viewer_token)
+        if info is None:
+            run.viewer_token = None
+            run.viewer_url = None
+            run.viewer_status = None
+            run.viewer_last_error = None
+            return run
+        run.viewer_token = info.token
+        run.viewer_url = info.viewer_url
+        run.viewer_status = info.status
+        run.viewer_last_error = info.error
+        return run
+
+    def validate_viewer_access(run_id: str, token: str | None) -> tuple[RunState, str]:
+        run = run_store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        expected = (run.viewer_token or "").strip()
+        provided = (token or "").strip()
+        if not expected or provided != expected:
+            raise HTTPException(status_code=404, detail="Viewer session not found")
+        return run, expected
 
     @app.get("/health")
     async def health() -> dict:
@@ -664,7 +711,7 @@ def build_app() -> FastAPI:
     async def create_run(
         request: RunCreateRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> RunState:
         raw_steps = [step.model_dump(exclude_none=True) for step in request.steps]
         resolved_start_url = _resolve_start_url(request.start_url, raw_steps)
@@ -702,7 +749,9 @@ def build_app() -> FastAPI:
                 detail=f"Step count exceeds max_steps_per_run={settings.max_steps_per_run}",
             )
 
-        run = run_store.create(expanded_request)
+        run = run_store.create(expanded_request, user_id=_run_owner_id(actor))
+        prepare_run_viewer(run)
+        run_store.persist(run)
         background_tasks.add_task(executor.execute, run.run_id)
         LOGGER.info("Run created: %s", run.run_id)
         return run
@@ -973,7 +1022,9 @@ def build_app() -> FastAPI:
                 "selector_profile": run_request.selector_profile,
             }
         )
-        run = run_store.create(expanded_run_request)
+        run = run_store.create(expanded_run_request, user_id=int(test_case.user_id))
+        prepare_run_viewer(run)
+        run_store.persist(run)
         background_tasks.add_task(executor.execute, run.run_id)
         LOGGER.info("Run created from test case: %s (test_case_id=%s)", run.run_id, test_case_id)
         return run
@@ -983,8 +1034,11 @@ def build_app() -> FastAPI:
         run_id: str,
         step_id: str,
         request: StepSelectorHelpRequest,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> RunState:
+        existing = run_store.get(run_id)
+        if existing is None or not _can_access_owned_resource(actor, existing.user_id):
+            raise HTTPException(status_code=404, detail="Run or step not found")
         try:
             run = executor.apply_manual_selector_hint(run_id, step_id, request.selector)
         except ValueError as exc:
@@ -1316,13 +1370,15 @@ def build_app() -> FastAPI:
         return CancelSuiteRunResponse(suite_run_id=suite_run_id, status=suite_run.status)
 
     @app.get("/api/runs", response_model=RunListResponse)
-    async def list_runs() -> RunListResponse:
-        return RunListResponse(items=run_store.list())
+    async def list_runs(actor: User | None = Depends(require_api_access)) -> RunListResponse:
+        return RunListResponse(
+            items=[item for item in run_store.list() if _can_access_owned_resource(actor, item.user_id)]
+        )
 
     @app.get("/api/runs/{run_id}", response_model=RunState)
-    async def get_run(run_id: str) -> RunState:
+    async def get_run(run_id: str, actor: User | None = Depends(require_api_access)) -> RunState:
         run = run_store.get(run_id)
-        if not run:
+        if not run or not _can_access_owned_resource(actor, run.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
         return run
 
@@ -1331,10 +1387,10 @@ def build_app() -> FastAPI:
         run_id: str,
         request: RunResumeRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> RunState:
         run = run_store.get(run_id)
-        if not run:
+        if not run or not _can_access_owned_resource(actor, run.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
 
         resume_index = next(
@@ -1385,7 +1441,10 @@ def build_app() -> FastAPI:
             }
         )
 
-        resumed = run_store.create(resume_request)
+        resumed = run_store.create(resume_request, user_id=run.user_id)
+        resumed.viewer_token = run.viewer_token
+        prepare_run_viewer(resumed)
+        run_store.persist(resumed)
         background_tasks.add_task(executor.execute, resumed.run_id)
         LOGGER.info(
             "Run resume started: new_run_id=%s source_run_id=%s resume_step_index=%s",
@@ -1400,10 +1459,10 @@ def build_app() -> FastAPI:
         run_id: str,
         request: SelectorRecoveryRequest,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_admin_auth),
+        actor: User | None = Depends(require_api_access),
     ) -> RunState:
         run = run_store.get(run_id)
-        if not run:
+        if not run or not _can_access_owned_resource(actor, run.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
 
         if request.step_index >= len(run.steps):
@@ -1438,7 +1497,10 @@ def build_app() -> FastAPI:
             }
         )
 
-        recovered = run_store.create(run_request)
+        recovered = run_store.create(run_request, user_id=run.user_id)
+        recovered.viewer_token = run.viewer_token
+        prepare_run_viewer(recovered)
+        run_store.persist(recovered)
         background_tasks.add_task(executor.execute, recovered.run_id)
         LOGGER.info(
             "Run selector recovery started (resume): new_run_id=%s source_run_id=%s step_index=%s field=%s",
@@ -1450,9 +1512,13 @@ def build_app() -> FastAPI:
         return recovered
 
     @app.get("/api/runs/{run_id}/artifacts/{artifact_name:path}")
-    async def get_run_artifact(run_id: str, artifact_name: str) -> FileResponse:
+    async def get_run_artifact(
+        run_id: str,
+        artifact_name: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> FileResponse:
         run = run_store.get(run_id)
-        if not run:
+        if not run or not _can_access_owned_resource(actor, run.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
 
         run_dir = (settings.artifact_root / run_id).resolve()
@@ -1465,11 +1531,304 @@ def build_app() -> FastAPI:
         return FileResponse(artifact_path)
 
     @app.post("/api/runs/{run_id}/cancel", response_model=CancelRunResponse)
-    async def cancel_run(run_id: str, _: None = Depends(require_admin_auth)) -> CancelRunResponse:
+    async def cancel_run(
+        run_id: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> CancelRunResponse:
+        current = run_store.get(run_id)
+        if not current or not _can_access_owned_resource(actor, current.user_id):
+            raise HTTPException(status_code=404, detail="Run not found")
         run = run_store.mark_cancelled(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return CancelRunResponse(run_id=run_id, status=run.status)
+
+    @app.get("/viewer/run/{run_id}")
+    async def open_run_viewer(run_id: str, token: str) -> HTMLResponse:
+        run, validated_token = validate_viewer_access(run_id, token)
+        websocket_path = f"/api/runs/{run_id}/viewer/ws?token={quote(validated_token, safe='')}"
+        iframe_src = (
+            "/viewer/vnc.html"
+            f"?autoconnect=1&resize=remote&reconnect=0&path={quote(websocket_path, safe='')}"
+        )
+        status_url = f"/viewer/run/{run_id}/status?token={quote(validated_token, safe='')}"
+        run_name = escape(run.run_name)
+        html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Browser - {run_name}</title>
+    <style>
+      :root {{
+        color-scheme: dark;
+        --bg: #111111;
+        --panel: #1a1a1a;
+        --line: rgba(255,255,255,0.08);
+        --ink: #f4f4f4;
+        --muted: #b4b4b4;
+        --accent: #ffb300;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        background: radial-gradient(circle at top, rgba(255,179,0,0.08), transparent 30%), var(--bg);
+        color: var(--ink);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      .shell {{
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }}
+      .bar {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(20,20,20,0.94);
+      }}
+      .title {{
+        font-size: 15px;
+        font-weight: 700;
+      }}
+      .meta {{
+        color: var(--muted);
+        font-size: 13px;
+      }}
+      .viewer-wrap {{
+        position: relative;
+        min-height: calc(100vh - 60px);
+      }}
+      iframe {{
+        width: 100%;
+        height: calc(100vh - 60px);
+        border: 0;
+        display: block;
+        background: #000;
+      }}
+      .notice {{
+        position: absolute;
+        right: 18px;
+        top: 18px;
+        padding: 10px 14px;
+        border: 1px solid rgba(255,179,0,0.22);
+        border-radius: 12px;
+        background: rgba(20,20,20,0.88);
+        color: var(--muted);
+        font-size: 13px;
+      }}
+      .done {{
+        display: none;
+        min-height: calc(100vh - 60px);
+        place-items: center;
+        padding: 28px;
+      }}
+      .doneCard {{
+        width: min(100%, 560px);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+        padding: 28px;
+        text-align: center;
+      }}
+      .doneCard h1 {{
+        margin: 0 0 10px;
+        font-size: 28px;
+      }}
+      .doneCard p {{
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.55;
+      }}
+      .doneCard a {{
+        display: inline-block;
+        margin-top: 18px;
+        color: #111111;
+        background: var(--accent);
+        padding: 10px 16px;
+        text-decoration: none;
+        border-radius: 10px;
+        font-weight: 700;
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="bar">
+        <div>
+          <div class="title">{run_name}</div>
+          <div class="meta">Run ID: {escape(run.run_id)}</div>
+        </div>
+        <div class="meta" id="status-text">Connecting live browser...</div>
+      </div>
+      <div class="viewer-wrap" id="viewer-wrap">
+        <iframe id="viewer-frame" src="{iframe_src}" title="Live Browser"></iframe>
+        <div class="notice" id="notice">Viewer stays open briefly after the run ends.</div>
+      </div>
+      <div class="done" id="done">
+        <div class="doneCard">
+          <h1 id="done-title">Run Finished</h1>
+          <p id="done-copy">The live browser session has ended. You can return to the dashboard to review the report.</p>
+          <a href="/">Back to Dashboard</a>
+        </div>
+      </div>
+    </div>
+    <script>
+      const statusUrl = {json.dumps(status_url)};
+      const viewerWrap = document.getElementById("viewer-wrap");
+      const viewerFrame = document.getElementById("viewer-frame");
+      const done = document.getElementById("done");
+      const statusText = document.getElementById("status-text");
+      const doneTitle = document.getElementById("done-title");
+      const doneCopy = document.getElementById("done-copy");
+      const notice = document.getElementById("notice");
+
+      function showDone(title, copy) {{
+        if (viewerWrap) viewerWrap.style.display = "none";
+        if (done) done.style.display = "grid";
+        if (doneTitle) doneTitle.textContent = title;
+        if (doneCopy) doneCopy.textContent = copy;
+      }}
+
+      async function pollStatus() {{
+        try {{
+          const response = await fetch(statusUrl, {{ cache: "no-store" }});
+          if (!response.ok) {{
+            showDone("Viewer Ended", "This live browser session is no longer available.");
+            return;
+          }}
+          const payload = await response.json();
+          const runStatus = payload.run_status || "running";
+          const viewerStatus = payload.viewer_status || "starting";
+          const keepaliveSeconds = payload.viewer_keepalive_seconds || 0;
+
+          if (statusText) {{
+            if (viewerStatus === "closing_soon") {{
+              statusText.textContent = "Run " + runStatus + ". Viewer will close shortly.";
+            }} else if (viewerStatus === "ready") {{
+              statusText.textContent = "Run " + runStatus + ". Live browser connected.";
+            }} else if (viewerStatus === "starting") {{
+              statusText.textContent = "Starting live browser...";
+            }} else {{
+              statusText.textContent = "Run " + runStatus + ". Viewer " + viewerStatus + ".";
+            }}
+          }}
+
+          if (notice) {{
+            notice.textContent = viewerStatus === "closing_soon"
+              ? "Run finished. This viewer will stay open for about " + keepaliveSeconds + " seconds."
+              : "Viewer stays open briefly after the run ends.";
+          }}
+
+          if (viewerStatus === "closed") {{
+            showDone("Run Finished", "The live browser stayed open briefly after completion and has now closed cleanly.");
+            return;
+          }}
+          if (viewerStatus === "failed") {{
+            showDone("Viewer Stopped", payload.viewer_last_error || "The live browser session stopped unexpectedly.");
+            return;
+          }}
+        }} catch (_error) {{
+          showDone("Viewer Ended", "The live browser status could not be refreshed.");
+          return;
+        }}
+        window.setTimeout(pollStatus, 1200);
+      }}
+
+      window.setTimeout(pollStatus, 800);
+    </script>
+  </body>
+</html>"""
+        return HTMLResponse(html)
+
+    @app.get("/viewer/run/{run_id}/status")
+    async def get_run_viewer_status(run_id: str, token: str) -> JSONResponse:
+        run, _ = validate_viewer_access(run_id, token)
+        return JSONResponse(
+            {
+                "run_id": run.run_id,
+                "run_name": run.run_name,
+                "run_status": run.status.value,
+                "viewer_status": run.viewer_status,
+                "viewer_last_error": run.viewer_last_error,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "viewer_keepalive_seconds": max(int(settings.viewer_keepalive_seconds), 0),
+            }
+        )
+
+    @app.websocket("/api/runs/{run_id}/viewer/ws")
+    async def run_viewer_websocket(websocket: WebSocket, run_id: str) -> None:
+        token = websocket.query_params.get("token")
+        try:
+            validate_viewer_access(run_id, token)
+        except HTTPException:
+            await websocket.close(code=4404)
+            return
+
+        if viewer_sessions is None:
+            await websocket.close(code=4404)
+            return
+        session = viewer_sessions.get_session(run_id)
+        if session is None or session.status != "ready":
+            await websocket.close(code=1013)
+            return
+
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", session.vnc_port)
+        except OSError:
+            await websocket.close(code=1011)
+            return
+
+        await websocket.accept()
+
+        async def client_to_vnc() -> None:
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                    payload = message.get("bytes")
+                    if payload is None:
+                        text_payload = message.get("text")
+                        if text_payload is None:
+                            continue
+                        payload = text_payload.encode("utf-8")
+                    writer.write(payload)
+                    await writer.drain()
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+        async def vnc_to_client() -> None:
+            try:
+                while True:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    await websocket.send_bytes(chunk)
+            finally:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+
+        tasks = {
+            asyncio.create_task(client_to_vnc()),
+            asyncio.create_task(vnc_to_client()),
+        }
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            with contextlib.suppress(Exception):
+                await task
+
+    app.mount(
+        "/viewer",
+        StaticFiles(directory=str(settings.viewer_static_root), html=True, check_dir=False),
+        name="viewer",
+    )
 
     return app
 

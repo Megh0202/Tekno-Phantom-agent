@@ -17,6 +17,7 @@ services:
       - ./.env
     expose:
       - "8000"
+      - "6080"
     environment:
       BACKEND_PORT: 8000
       BRAIN_BASE_URL: http://brain:5000

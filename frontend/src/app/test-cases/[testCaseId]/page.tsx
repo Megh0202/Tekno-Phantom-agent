@@ -7,11 +7,19 @@ import {
   apiFetch as fetch,
   buildApiHeaders,
   ensureCsrfCookie,
+  resolveApiBaseUrl,
+  resolveLiveViewerUrl,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
 
 type JsonObject = Record<string, unknown>;
 type TestTab = "description" | "tests" | "attachments";
+
+type RunLaunchResponse = {
+  run_id: string;
+  run_name: string;
+  viewer_url?: string | null;
+};
 
 type TestCaseState = {
   test_case_id: string;
@@ -55,33 +63,8 @@ function hasResolvedLiveConfig(config: AgentConfig): boolean {
   );
 }
 
-function resolveApiBaseUrl(): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
-  if (typeof window === "undefined") {
-    return configured ? configured.replace(/\/$/, "") : "";
-  }
-
-  const browserHost = window.location.hostname.trim();
-  if (!configured) {
-    return window.location.origin.replace(/\/$/, "");
-  }
-
-  try {
-    const url = new URL(configured);
-    const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
-    const configuredIsLoopback = loopbackHosts.has(url.hostname);
-    const browserIsLoopback = loopbackHosts.has(browserHost);
-    if (configuredIsLoopback !== browserIsLoopback) {
-      url.hostname = browserHost;
-      return url.toString().replace(/\/$/, "");
-    }
-    return configured.replace(/\/$/, "");
-  } catch {
-    return configured.replace(/\/$/, "");
-  }
-}
-
 const API_BASE_URL = resolveApiBaseUrl();
+const LIVE_VIEWER_URL = resolveLiveViewerUrl(API_BASE_URL);
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 
 function formatApiDetail(detail: unknown): string {
@@ -192,6 +175,7 @@ export default function TestCaseDetailsPage() {
   const [activeTab, setActiveTab] = useState<TestTab>("tests");
   const [requestError, setRequestError] = useState<string | null>(null);
   const [requestInfo, setRequestInfo] = useState<string | null>(null);
+  const [latestViewerUrl, setLatestViewerUrl] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
@@ -447,7 +431,8 @@ export default function TestCaseDetailsPage() {
       if (!response.ok) {
         throw new Error(await parseError(response));
       }
-      const run = (await response.json()) as { run_id: string; run_name: string };
+      const run = (await response.json()) as RunLaunchResponse;
+      setLatestViewerUrl(run.viewer_url ?? null);
       setRequestInfo(`Run started: ${run.run_id} (${run.run_name})`);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "Failed to run test case");
@@ -560,6 +545,14 @@ export default function TestCaseDetailsPage() {
           <button type="button" className={styles.secondaryButton} onClick={() => void loadTestCase()}>
             Refresh
           </button>
+          <a
+            className={styles.secondaryButton}
+            href={latestViewerUrl || LIVE_VIEWER_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open Live Browser
+          </a>
           <button
             type="button"
             className={styles.secondaryButton}

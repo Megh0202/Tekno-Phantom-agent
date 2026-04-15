@@ -609,6 +609,11 @@ class RunState(BaseModel):
     failure_mode: Literal["stop", "continue"] = "continue"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
+    user_id: int = 0
+    viewer_token: str | None = None
+    viewer_url: str | None = None
+    viewer_status: str | None = None
+    viewer_last_error: str | None = None
     source_test_case_id: str | None = None
     resume_from_step_index: int | None = None
     status: RunStatus = RunStatus.pending

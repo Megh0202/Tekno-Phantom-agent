@@ -1,7 +1,8 @@
 from __future__ import annotations
-from pathlib import Path
 import asyncio
+import contextlib
 from contextvars import ContextVar
+from pathlib import Path
 from dataclasses import dataclass
 from html import escape
 import json
@@ -672,6 +673,7 @@ class AgentExecutor:
         self._files = file_client
         self._selector_memory = selector_memory_store
         self._run_context: dict[str, dict[str, Any]] = {}
+        self._viewer_shutdown_tasks: dict[str, asyncio.Task[None]] = {}
         self._step_trace_context: ContextVar[dict[str, Any] | None] = ContextVar(
             "executor_step_trace_context",
             default=None,
@@ -703,7 +705,9 @@ class AgentExecutor:
         preserve_browser_session = False
 
         try:
-            await self._browser.start_run(run_id)
+            await self._browser.start_run(run)
+            self._sync_run_viewer_state(run)
+            self._run_store.persist(run)
 
             should_navigate_to_start = False
             if run.start_url:
@@ -754,16 +758,77 @@ class AgentExecutor:
         except Exception as exc:
             run.status = RunStatus.failed
             run.summary = f"Run failed unexpectedly ({type(exc).__name__}): {exc!r}"
+            if run.viewer_url and run.viewer_status in {None, "starting", "ready"}:
+                run.viewer_status = "failed"
+                run.viewer_last_error = self._compact_error(exc)
             self._run_store.persist(run)
             LOGGER.exception("Run %s failed unexpectedly", run_id)
         finally:
+            run.finished_at = utc_now()
             if not preserve_browser_session:
-                await self._browser.close_run(run_id)
-                run.finished_at = utc_now()
+                if self._should_delay_viewer_shutdown(run):
+                    run.viewer_status = "closing_soon"
+                    self._schedule_viewer_shutdown(run.run_id)
+                else:
+                    await self._browser.close_run(run_id)
+                    self._mark_run_viewer_closed(run)
             self._run_store.persist(run)
             if not preserve_browser_session:
                 await self._write_html_report(run)
             self._run_store.clear_cancel(run_id)
+
+    def _sync_run_viewer_state(self, run: RunState) -> None:
+        session = self._browser.get_viewer_session(run.run_id)
+        if session is None:
+            return
+        run.viewer_token = session.token
+        run.viewer_url = session.viewer_url
+        run.viewer_status = session.status
+        run.viewer_last_error = session.error
+
+    @staticmethod
+    def _mark_run_viewer_closed(run: RunState) -> None:
+        if not run.viewer_url:
+            return
+        run.viewer_status = "closed"
+
+    def _should_delay_viewer_shutdown(self, run: RunState) -> bool:
+        delay_seconds = max(int(getattr(self._settings, "viewer_keepalive_seconds", 0)), 0)
+        if delay_seconds <= 0:
+            return False
+        if not run.viewer_url:
+            return False
+        if run.viewer_status not in {"ready", "closing_soon"}:
+            return False
+        return run.status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}
+
+    def _schedule_viewer_shutdown(self, run_id: str) -> None:
+        existing = self._viewer_shutdown_tasks.pop(run_id, None)
+        if existing is not None:
+            existing.cancel()
+
+        task = asyncio.create_task(self._shutdown_viewer_after_grace_period(run_id))
+        self._viewer_shutdown_tasks[run_id] = task
+
+        def _cleanup_task(completed: asyncio.Task[None]) -> None:
+            current = self._viewer_shutdown_tasks.get(run_id)
+            if current is completed:
+                self._viewer_shutdown_tasks.pop(run_id, None)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.result()
+
+        task.add_done_callback(_cleanup_task)
+
+    async def _shutdown_viewer_after_grace_period(self, run_id: str) -> None:
+        delay_seconds = max(int(getattr(self._settings, "viewer_keepalive_seconds", 0)), 0)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        await self._browser.close_run(run_id)
+        run = self._run_store.get(run_id)
+        if run is None:
+            return
+        self._mark_run_viewer_closed(run)
+        self._run_store.persist(run)
 
     async def _record_startup_navigation_failure(self, run: RunState, exc: Exception) -> None:
         compact = self._compact_error(exc)

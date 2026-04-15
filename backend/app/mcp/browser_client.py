@@ -5,6 +5,7 @@ import base64
 import json
 import io
 import logging
+import os
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.runtime.viewer_session import ViewerSessionInfo, ViewerSessionManager
+from app.schemas import RunState
 
 # HTML tags that are purely for display and are not interactive.
 # Clicking these elements intentionally produces no navigation,
@@ -108,11 +111,14 @@ class BrowserMCPClient:
     Mock browser adapter used as safe default for local development.
     """
 
-    async def start_run(self, run_id: str) -> None:
+    async def start_run(self, run: RunState) -> None:
         return
 
     async def close_run(self, run_id: str) -> None:
         return
+
+    def get_viewer_session(self, run_id: str) -> ViewerSessionInfo | None:
+        return None
 
     async def navigate(self, url: str) -> str:
         setattr(self, "_mock_current_url", url)
@@ -297,13 +303,15 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     Real browser adapter powered by Playwright.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, viewer_sessions: ViewerSessionManager | None = None) -> None:
         self._settings = settings
+        self._viewer_sessions = viewer_sessions
         self._runs: dict[str, _PlaywrightRunContext] = {}
         self._lock = asyncio.Lock()
         self._current_run_id: ContextVar[str | None] = ContextVar("browser_run_id", default=None)
 
-    async def start_run(self, run_id: str) -> None:
+    async def start_run(self, run: RunState) -> None:
+        run_id = run.run_id
         async with self._lock:
             existing = self._runs.get(run_id)
             if existing:
@@ -316,11 +324,22 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                     "run `python -m playwright install chromium`."
                 )
 
+            launch_env: dict[str, str] | None = None
+            viewer_session = None
+            if self._viewer_sessions is not None:
+                viewer_session = await self._viewer_sessions.ensure_session(run_id, token=run.viewer_token)
+                if viewer_session is not None:
+                    if viewer_session.status != "ready":
+                        raise RuntimeError(viewer_session.error or "Viewer session failed to start")
+                    launch_env = os.environ.copy()
+                    launch_env["DISPLAY"] = viewer_session.display
+
             playwright = await async_playwright().start()
             browser_type = getattr(playwright, self._settings.playwright_browser)
             browser = await browser_type.launch(
                 headless=self._settings.playwright_headless,
                 slow_mo=max(self._settings.playwright_slow_mo_ms, 0),
+                env=launch_env,
             )
             context = await browser.new_context()
             page = await context.new_page()
@@ -359,6 +378,9 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         except Exception:
             pass
 
+        if self._viewer_sessions is not None:
+            await self._viewer_sessions.close_session(run_id)
+
         if self._current_run_id.get() == run_id:
             self._current_run_id.set(None)
 
@@ -367,6 +389,11 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             return self._active_context().page
         except Exception:
             return None
+
+    def get_viewer_session(self, run_id: str) -> ViewerSessionInfo | None:
+        if self._viewer_sessions is None:
+            return None
+        return self._viewer_sessions.get_session(run_id)
 
     async def navigate(self, url: str) -> str:
         context = self._active_context()
@@ -1789,7 +1816,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         self._lock = asyncio.Lock()
         self._current_run_id: ContextVar[str | None] = ContextVar("mcp_browser_run_id", default=None)
 
-    async def start_run(self, run_id: str) -> None:
+    async def start_run(self, run: RunState) -> None:
+        run_id = run.run_id
         async with self._lock:
             existing = self._runs.get(run_id)
             if existing:
@@ -3131,9 +3159,13 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         return match.group(1).strip()
 
 
-def build_browser_client(settings: Settings) -> BrowserMCPClient:
+def build_browser_client(
+    settings: Settings,
+    *,
+    viewer_sessions: ViewerSessionManager | None = None,
+) -> BrowserMCPClient:
     if settings.browser_mode == "mcp":
         return MCPPlaywrightBrowserMCPClient(settings)
     if settings.browser_mode == "playwright":
-        return PlaywrightBrowserMCPClient(settings)
+        return PlaywrightBrowserMCPClient(settings, viewer_sessions=viewer_sessions)
     return BrowserMCPClient()

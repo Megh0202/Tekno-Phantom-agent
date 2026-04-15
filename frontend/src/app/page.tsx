@@ -7,6 +7,8 @@ import {
   apiFetch as fetch,
   buildApiHeaders,
   ensureCsrfCookie,
+  resolveApiBaseUrl,
+  resolveLiveViewerUrl,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
 
@@ -38,6 +40,8 @@ type RunState = {
   status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "cancelled";
   summary?: string | null;
   report_artifact?: string | null;
+  viewer_url?: string | null;
+  viewer_status?: string | null;
   steps: RuntimeStep[];
 };
 
@@ -118,33 +122,8 @@ type SuiteRunState = {
   report_artifact?: string | null;
 };
 
-function resolveApiBaseUrl(): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
-  if (typeof window === "undefined") {
-    return configured ? configured.replace(/\/$/, "") : "";
-  }
-
-  const browserHost = window.location.hostname.trim();
-  if (!configured) {
-    return window.location.origin.replace(/\/$/, "");
-  }
-
-  try {
-    const url = new URL(configured);
-    const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
-    const configuredIsLoopback = loopbackHosts.has(url.hostname);
-    const browserIsLoopback = loopbackHosts.has(browserHost);
-    if (configuredIsLoopback !== browserIsLoopback) {
-      url.hostname = browserHost;
-      return url.toString().replace(/\/$/, "");
-    }
-    return configured.replace(/\/$/, "");
-  } catch {
-    return configured.replace(/\/$/, "");
-  }
-}
-
 const API_BASE_URL = resolveApiBaseUrl();
+const LIVE_VIEWER_URL = resolveLiveViewerUrl(API_BASE_URL);
 const ADMIN_API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN?.trim() ?? "";
 const DEFAULT_MAX_STEPS = 300;
 const SHOW_ADVANCED_INPUTS =
@@ -376,6 +355,7 @@ export default function Home() {
     if (!currentRun?.run_id || !currentRun?.report_artifact) return null;
     return `${API_BASE_URL}/api/runs/${currentRun.run_id}/artifacts/report.html`;
   }, [currentRun]);
+  const liveViewerUrl = useMemo(() => currentRun?.viewer_url || LIVE_VIEWER_URL, [currentRun]);
   const suiteReportUrl = useMemo(() => {
     if (!currentSuiteRun?.suite_run_id) return null;
     return `${API_BASE_URL}/api/suite-runs/${currentSuiteRun.suite_run_id}/artifacts/suite-report.html`;
@@ -2138,6 +2118,14 @@ export default function Home() {
                       View Report
                     </a>
                   ) : null}
+                  <a
+                    className={styles.secondaryButton}
+                    href={liveViewerUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open Live Browser
+                  </a>
                   <p className={`${styles.statusPill} ${statusClass(currentRun.status)}`}>
                     {currentRun.status}
                   </p>
@@ -2145,6 +2133,17 @@ export default function Home() {
               </div>
 
               {currentRun.summary ? <p className={styles.summary}>{currentRun.summary}</p> : null}
+              <p className={styles.metaLine}>
+                {currentRun.viewer_status === "ready"
+                  ? "Live browser is ready for this run."
+                  : currentRun.viewer_status === "closing_soon"
+                    ? "Run finished. Live browser will stay open briefly before closing."
+                    : currentRun.viewer_status === "closed"
+                      ? "Live browser session closed cleanly after the run finished."
+                  : currentRun.viewer_status === "starting"
+                    ? "Live browser is starting for this run."
+                    : "Watching from another system? Open the live browser to view the streamed Playwright session."}
+              </p>
 
               <div className={styles.timeline}>
                 {currentRun.steps.map((step) => (
@@ -2209,4 +2208,3 @@ export default function Home() {
     </div>
   );
 }
-

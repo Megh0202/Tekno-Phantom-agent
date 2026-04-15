@@ -16,7 +16,7 @@ from app.schemas import (
 
 
 class RunStore(Protocol):
-    def create(self, request: RunCreateRequest) -> RunState:
+    def create(self, request: RunCreateRequest, *, user_id: int = 0) -> RunState:
         ...
 
     def get(self, run_id: str) -> RunState | None:
@@ -44,7 +44,7 @@ class InMemoryRunStore:
         self._runs: dict[str, RunState] = {}
         self._cancelled: set[str] = set()
 
-    def create(self, request: RunCreateRequest) -> RunState:
+    def create(self, request: RunCreateRequest, *, user_id: int = 0) -> RunState:
         steps = [
             StepRuntimeState(
                 index=index,
@@ -62,6 +62,7 @@ class InMemoryRunStore:
             failure_mode=request.failure_mode,
             test_data=request.test_data,
             selector_profile=request.selector_profile,
+            user_id=user_id,
             source_test_case_id=request.source_test_case_id,
             resume_from_step_index=request.resume_from_step_index,
             steps=steps,
@@ -110,8 +111,8 @@ class SqliteRunStore(InMemoryRunStore):
         self._init_db()
         self._load_from_db()
 
-    def create(self, request: RunCreateRequest) -> RunState:
-        run = super().create(request)
+    def create(self, request: RunCreateRequest, *, user_id: int = 0) -> RunState:
+        run = super().create(request, user_id=user_id)
         self._save_run(run)
         return run
 
