@@ -11,6 +11,7 @@ from app.runtime.executor import AgentExecutor
 from app.runtime.store import RunStore
 from app.runtime.suite_store import SuiteStore
 from app.runtime.test_case_store import TestCaseStore
+from app.runtime.viewer_session import ViewerSessionManager
 from app.schemas import RunCreateRequest, SuiteRunState, SuiteRunStatus
 
 LOGGER = logging.getLogger("tekno.phantom.suite_executor")
@@ -29,6 +30,7 @@ class SuiteExecutor:
         test_case_store: TestCaseStore,
         run_executor: AgentExecutor,
         file_client: FileSystemClient,
+        viewer_sessions: ViewerSessionManager | None = None,
     ) -> None:
         self._settings = settings
         self._run_store = run_store
@@ -36,6 +38,7 @@ class SuiteExecutor:
         self._test_case_store = test_case_store
         self._run_executor = run_executor
         self._files = file_client
+        self._viewer_sessions = viewer_sessions
 
     async def execute(self, suite_run_id: str) -> None:
         suite_run = self._suite_store.get(suite_run_id)
@@ -122,8 +125,16 @@ class SuiteExecutor:
                 "selector_profile": test_case.selector_profile,
             }
         )
-        run = self._run_store.create(request)
+        run = self._run_store.create(request, user_id=test_case.user_id)
         target.run_id = run.run_id
+        if self._viewer_sessions is not None:
+            info = self._viewer_sessions.prepare_run(run.run_id)
+            if info is not None:
+                run.viewer_token = info.token
+                run.viewer_url = info.viewer_url
+                run.viewer_status = info.status
+                self._run_store.persist(run)
+                target.viewer_url = info.viewer_url
         self._suite_store.persist(suite_run)
 
         try:
@@ -195,11 +206,12 @@ class SuiteExecutor:
                     "</details>"
                     "</section>"
                 )
+            status_class = f"status-{item.status.value}"
             rows.append(
                 "<tr>"
                 f"<td>{index + 1}</td>"
                 f"<td>{escape(item.name)}</td>"
-                f"<td>{escape(item.status.value)}</td>"
+                f"<td class='{status_class}'>{escape(item.status.value)}</td>"
                 f"<td>{escape(item.run_id or '-')}</td>"
                 f"<td>{escape(item.summary or item.error or '-')}</td>"
                 f"<td>{artifact}</td>"
@@ -218,29 +230,74 @@ class SuiteExecutor:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Suite Report - {escape(suite_run.suite_name)}</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; background: #f7f9fc; color: #172033; }}
-    .card {{ background: #fff; border: 1px solid #d7dfec; border-radius: 10px; padding: 16px; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-    th, td {{ border: 1px solid #d7dfec; padding: 8px; text-align: left; font-size: 14px; vertical-align: top; }}
-    th {{ background: #eef3fa; }}
-    h1 {{ margin: 0 0 8px 0; }}
-    h2 {{ margin: 18px 0 8px 0; }}
-    .meta {{ color: #4a5d77; font-size: 13px; }}
+    :root {{
+      --bg: #000000;
+      --card: #111111;
+      --border: rgba(255,255,255,0.10);
+      --border-strong: rgba(255,255,255,0.16);
+      --text: #ffffff;
+      --muted: #999999;
+      --accent: #FFB300;
+      --pass: #22c55e;
+      --fail: #ef4444;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }}
+    .card {{
+      max-width: 1100px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }}
+    h1 {{
+      margin: 0 0 6px 0;
+      font-size: 24px;
+      color: var(--accent);
+    }}
+    h2 {{ margin: 24px 0 10px 0; font-size: 18px; color: var(--accent); }}
+    .meta {{ color: var(--muted); font-size: 13px; margin-bottom: 4px; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+    th, td {{
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      text-align: left;
+      font-size: 13px;
+      vertical-align: top;
+    }}
+    th {{ background: rgba(255,179,0,0.08); color: var(--accent); font-weight: 600; }}
+    td {{ color: var(--text); }}
+    tr:hover td {{ background: rgba(255,255,255,0.03); }}
+    td.status-completed {{ color: var(--pass); font-weight: 600; }}
+    td.status-failed {{ color: var(--fail); font-weight: 600; }}
+    td.status-cancelled {{ color: var(--muted); font-weight: 600; }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
     .embedded-report {{
-      margin-top: 10px;
-      border: 1px solid #d7dfec;
+      margin-top: 12px;
+      border: 1px solid var(--border);
       border-radius: 10px;
-      background: #fbfdff;
+      background: #0a0a0a;
       overflow: hidden;
     }}
     .embedded-report summary {{
       cursor: pointer;
-      padding: 10px 12px;
+      padding: 12px 14px;
       font-weight: 600;
-      background: #eef3fa;
+      font-size: 14px;
+      background: rgba(255,179,0,0.06);
+      color: var(--text);
+      border-bottom: 1px solid var(--border);
     }}
     .embedded-actions {{
-      padding: 10px 12px 0;
+      padding: 10px 14px 0;
       font-size: 13px;
     }}
     .embedded-report iframe {{
@@ -248,7 +305,7 @@ class SuiteExecutor:
       width: 100%;
       min-height: 700px;
       border: none;
-      background: #fff;
+      background: #000;
       margin-top: 8px;
     }}
   </style>

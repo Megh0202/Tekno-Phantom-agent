@@ -788,6 +788,7 @@ class SuiteTestState(BaseModel):
     name: str
     status: SuiteRunStatus = SuiteRunStatus.pending
     run_id: str | None = None
+    viewer_url: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     summary: str | None = None

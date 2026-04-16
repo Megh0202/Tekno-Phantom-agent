@@ -117,6 +117,7 @@ type SuiteRunState = {
     name: string;
     status: "pending" | "running" | "completed" | "failed" | "cancelled";
     run_id?: string | null;
+    viewer_url?: string | null;
   }>;
   summary?: string | null;
   report_artifact?: string | null;
@@ -2085,16 +2086,28 @@ export default function Home() {
                       <p>{suiteTest.name}</p>
                       <p className={`${styles.statusPill} ${statusClass(suiteTest.status)}`}>{suiteTest.status}</p>
                     </div>
-                    {suiteTest.run_id ? (
-                      <a
-                        className={styles.secondaryButton}
-                        href={`${API_BASE_URL}/api/runs/${suiteTest.run_id}/artifacts/report.html`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        Open Test Report
-                      </a>
-                    ) : null}
+                    <div className={styles.timelineActions}>
+                      {suiteTest.viewer_url && (suiteTest.status === "running" || suiteTest.status === "pending") ? (
+                        <a
+                          className={styles.secondaryButton}
+                          href={suiteTest.viewer_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Open Live Browser
+                        </a>
+                      ) : null}
+                      {suiteTest.run_id && (suiteTest.status === "completed" || suiteTest.status === "failed") ? (
+                        <a
+                          className={styles.secondaryButton}
+                          href={`${API_BASE_URL}/api/runs/${suiteTest.run_id}/artifacts/report.html`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Open Test Report
+                        </a>
+                      ) : null}
+                    </div>
                   </article>
                 ))}
               </div>

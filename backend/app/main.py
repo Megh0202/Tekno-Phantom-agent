@@ -633,6 +633,7 @@ def build_app() -> FastAPI:
         test_case_store,
         executor,
         file_client,
+        viewer_sessions=viewer_sessions,
     )
     require_admin_auth = build_admin_auth_dependency(settings)
     require_api_access = build_api_auth_dependency(settings)
@@ -1560,133 +1561,68 @@ def build_app() -> FastAPI:
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Live Browser - {run_name}</title>
     <style>
-      :root {{
-        color-scheme: dark;
-        --bg: #111111;
-        --panel: #1a1a1a;
-        --line: rgba(255,255,255,0.08);
-        --ink: #f4f4f4;
-        --muted: #b4b4b4;
-        --accent: #ffb300;
-      }}
-      * {{ box-sizing: border-box; }}
-      body {{
-        margin: 0;
-        background: radial-gradient(circle at top, rgba(255,179,0,0.08), transparent 30%), var(--bg);
-        color: var(--ink);
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }}
-      .shell {{
-        min-height: 100vh;
-        display: grid;
-        grid-template-rows: auto 1fr;
-      }}
-      .bar {{
-        display: flex;
-        justify-content: space-between;
-        gap: 16px;
-        padding: 14px 18px;
-        border-bottom: 1px solid var(--line);
-        background: rgba(20,20,20,0.94);
-      }}
-      .title {{
-        font-size: 15px;
-        font-weight: 700;
-      }}
-      .meta {{
-        color: var(--muted);
-        font-size: 13px;
-      }}
-      .viewer-wrap {{
-        position: relative;
-        min-height: calc(100vh - 60px);
+      * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+      html, body {{
+        height: 100%;
+        background: #000;
+        overflow: hidden;
       }}
       iframe {{
         width: 100%;
-        height: calc(100vh - 60px);
+        height: 100vh;
         border: 0;
         display: block;
         background: #000;
       }}
-      .notice {{
-        position: absolute;
-        right: 18px;
-        top: 18px;
-        padding: 10px 14px;
-        border: 1px solid rgba(255,179,0,0.22);
-        border-radius: 12px;
-        background: rgba(20,20,20,0.88);
-        color: var(--muted);
-        font-size: 13px;
-      }}
       .done {{
         display: none;
-        min-height: calc(100vh - 60px);
+        height: 100vh;
         place-items: center;
-        padding: 28px;
+        background: #111;
+        color: #f4f4f4;
+        font-family: system-ui, -apple-system, sans-serif;
       }}
       .doneCard {{
-        width: min(100%, 560px);
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        background: var(--panel);
+        width: min(100%, 480px);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        background: #1a1a1a;
         padding: 28px;
         text-align: center;
       }}
-      .doneCard h1 {{
-        margin: 0 0 10px;
-        font-size: 28px;
-      }}
-      .doneCard p {{
-        margin: 0;
-        color: var(--muted);
-        line-height: 1.55;
-      }}
+      .doneCard h1 {{ margin: 0 0 10px; font-size: 24px; }}
+      .doneCard p {{ color: #b4b4b4; line-height: 1.55; font-size: 14px; }}
       .doneCard a {{
         display: inline-block;
         margin-top: 18px;
-        color: #111111;
-        background: var(--accent);
-        padding: 10px 16px;
+        color: #111;
+        background: #ffb300;
+        padding: 10px 20px;
         text-decoration: none;
         border-radius: 10px;
         font-weight: 700;
+        font-size: 14px;
       }}
     </style>
   </head>
   <body>
-    <div class="shell">
-      <div class="bar">
-        <div>
-          <div class="title">{run_name}</div>
-          <div class="meta">Run ID: {escape(run.run_id)}</div>
-        </div>
-        <div class="meta" id="status-text">Connecting live browser...</div>
-      </div>
-      <div class="viewer-wrap" id="viewer-wrap">
-        <iframe id="viewer-frame" src="{iframe_src}" title="Live Browser"></iframe>
-        <div class="notice" id="notice">Viewer stays open briefly after the run ends.</div>
-      </div>
-      <div class="done" id="done">
-        <div class="doneCard">
-          <h1 id="done-title">Run Finished</h1>
-          <p id="done-copy">The live browser session has ended. You can return to the dashboard to review the report.</p>
-          <a href="/">Back to Dashboard</a>
-        </div>
+    <iframe id="viewer-frame" src="{iframe_src}" title="Live Browser"></iframe>
+    <div class="done" id="done">
+      <div class="doneCard">
+        <h1 id="done-title">Run Finished</h1>
+        <p id="done-copy">The live browser session has ended.</p>
+        <a href="/">Back to Dashboard</a>
       </div>
     </div>
     <script>
       const statusUrl = {json.dumps(status_url)};
-      const viewerWrap = document.getElementById("viewer-wrap");
       const viewerFrame = document.getElementById("viewer-frame");
       const done = document.getElementById("done");
-      const statusText = document.getElementById("status-text");
       const doneTitle = document.getElementById("done-title");
       const doneCopy = document.getElementById("done-copy");
-      const notice = document.getElementById("notice");
 
       function showDone(title, copy) {{
-        if (viewerWrap) viewerWrap.style.display = "none";
+        if (viewerFrame) viewerFrame.style.display = "none";
         if (done) done.style.display = "grid";
         if (doneTitle) doneTitle.textContent = title;
         if (doneCopy) doneCopy.textContent = copy;
@@ -1700,30 +1636,9 @@ def build_app() -> FastAPI:
             return;
           }}
           const payload = await response.json();
-          const runStatus = payload.run_status || "running";
           const viewerStatus = payload.viewer_status || "starting";
-          const keepaliveSeconds = payload.viewer_keepalive_seconds || 0;
-
-          if (statusText) {{
-            if (viewerStatus === "closing_soon") {{
-              statusText.textContent = "Run " + runStatus + ". Viewer will close shortly.";
-            }} else if (viewerStatus === "ready") {{
-              statusText.textContent = "Run " + runStatus + ". Live browser connected.";
-            }} else if (viewerStatus === "starting") {{
-              statusText.textContent = "Starting live browser...";
-            }} else {{
-              statusText.textContent = "Run " + runStatus + ". Viewer " + viewerStatus + ".";
-            }}
-          }}
-
-          if (notice) {{
-            notice.textContent = viewerStatus === "closing_soon"
-              ? "Run finished. This viewer will stay open for about " + keepaliveSeconds + " seconds."
-              : "Viewer stays open briefly after the run ends.";
-          }}
-
           if (viewerStatus === "closed") {{
-            showDone("Run Finished", "The live browser stayed open briefly after completion and has now closed cleanly.");
+            showDone("Run Finished", "The live browser session has closed. Return to the dashboard to view the report.");
             return;
           }}
           if (viewerStatus === "failed") {{

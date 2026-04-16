@@ -709,6 +709,13 @@
   gap: 8px;
 }
 
+.timelineActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
 .timelineTop p {
   color: var(--ink-700);
   font-size: 14px;
