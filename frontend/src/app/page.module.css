@@ -284,6 +284,111 @@
   background: rgba(255, 179, 0, 0.04);
 }
 
+.stepIndexBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #FFB300;
+  color: #000000;
+  font-size: 11px;
+  font-weight: 700;
+  margin-right: 6px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.generatedStepsPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.generatedStepsList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.generatedStepCard {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #111111;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.generatedStepIndex {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #FFB300;
+  color: #000000;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.generatedStepText {
+  color: #ffffff;
+  font-size: 13px;
+  line-height: 1.5;
+  flex: 1;
+}
+
+.genStepEditBtn {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 179, 0, 0.4);
+  background: transparent;
+  color: #FFB300;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.generatedStepEditInput {
+  flex: 1;
+  background: #1a1a1a;
+  border: 1px solid rgba(255, 179, 0, 0.5);
+  border-radius: 6px;
+  color: #ffffff;
+  font-size: 13px;
+  padding: 4px 10px;
+  outline: none;
+}
+
+.genStepSaveBtn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: none;
+  background: #FFB300;
+  color: #000000;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.genStepCancelBtn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .planHeader {
   display: flex;
   align-items: center;

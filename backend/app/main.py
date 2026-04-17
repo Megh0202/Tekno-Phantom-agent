@@ -43,6 +43,8 @@ from app.schemas import (
     FolderState,
     PlanGenerateRequest,
     PlanGenerateResponse,
+    PromptToStepsRequest,
+    PromptToStepsResponse,
     RunCreateRequest,
     RunListResponse,
     RunResumeRequest,
@@ -554,6 +556,296 @@ def _validate_generated_plan(task: str, normalized_steps: list[dict[str, object]
         "rejection_reasons": rejection_reasons,
         "is_enterprise_prompt": is_enterprise,
     }
+
+
+_ACTION_SPLIT_RE = re.compile(
+    r",?\s+then\s+|,\s+and\s+then\s+|;\s*",
+    flags=re.IGNORECASE,
+)
+_ACTION_BOUNDARY_RE = re.compile(
+    r",\s+(?=(?:go\s+to|navigate|open|click|fill|type|enter|verify|assert|check|wait|scroll)\b)",
+    flags=re.IGNORECASE,
+)
+_URL_EXTRACT_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+_BARE_DOMAIN_RE = re.compile(r"(?:go\s+to|navigate\s+to|open|visit)\s+([a-z0-9][\w.-]+\.[a-z]{2,}\S*)", flags=re.IGNORECASE)
+_CLICK_RE_LOCAL = re.compile(
+    r"^click(?:\s+on)?\s+(?:the\s+)?['\"]?(.+?)['\"]?\s*$",
+    flags=re.IGNORECASE,
+)
+_FILL_RE = re.compile(
+    r"^(?:type|fill|enter)\s+['\"]?(.+?)['\"]?\s+in(?:to)?(?:\s+the)?\s+['\"]?(.+?)['\"]?\s*$",
+    flags=re.IGNORECASE,
+)
+_FILL_FIELD_FIRST_RE = re.compile(
+    r"^(?:fill|enter)\s+(?:the\s+)?['\"]?(.+?)['\"]?\s+(?:field\s+)?with\s+['\"]?(.+?)['\"]?\s*$",
+    flags=re.IGNORECASE,
+)
+_VERIFY_RE = re.compile(
+    r"^(?:verify|assert|check)\s+(?:that\s+)?['\"]?(.+?)['\"]?\s*(?:is\s+visible|appears|is\s+shown|exists|is\s+present|is\s+displayed)?\s*$",
+    flags=re.IGNORECASE,
+)
+_WAIT_MS_LOCAL_RE = re.compile(r"^wait\s+(?:for\s+)?(\d+)\s*(?:ms|milliseconds?)\s*$", flags=re.IGNORECASE)
+
+_BUTTON_KEYWORDS = frozenset({
+    "submit", "save", "login", "sign in", "sign up", "create", "confirm",
+    "continue", "next", "proceed", "apply", "ok", "done", "finish",
+    "register", "update", "delete", "cancel", "close", "add", "remove",
+    "upload", "download", "send", "publish", "approve", "reject",
+    "schedule", "demo", "get started", "learn more", "contact",
+})
+
+
+def _split_prompt_into_action_lines(prompt: str) -> list[str]:
+    """Split a free-form prompt into individual action lines."""
+    lines = [l.strip() for l in prompt.splitlines() if l.strip()]
+    lines = [re.sub(r"^\d+[\).\s\-]+", "", l).strip() for l in lines if l.strip()]
+    if len(lines) >= 2:
+        return lines
+
+    # Single line — split by "then" and action boundaries
+    text = prompt.strip()
+    parts = _ACTION_SPLIT_RE.split(text)
+    result: list[str] = []
+    for part in parts:
+        subparts = _ACTION_BOUNDARY_RE.split(part)
+        result.extend(subparts)
+    return [p.strip() for p in result if p.strip()]
+
+
+def _action_line_to_text(line: str) -> str:
+    """Convert a single natural-language action line to a canonical human-readable step."""
+    stripped = line.strip().strip(".,;")
+    lower = stripped.lower()
+
+    # Navigate — explicit URL
+    url_match = _URL_EXTRACT_RE.search(stripped)
+    if url_match:
+        url = url_match.group(0).rstrip(".,)")
+        return f"Go to {url}"
+
+    # Navigate — bare domain
+    domain_match = _BARE_DOMAIN_RE.search(stripped)
+    if domain_match:
+        raw = domain_match.group(1).rstrip(".,)")
+        url = raw if raw.startswith("http") else f"https://{raw}"
+        return f"Go to {url}"
+
+    # Wait
+    wait_match = _WAIT_MS_LOCAL_RE.match(stripped)
+    if wait_match:
+        return f"wait {wait_match.group(1)}ms"
+
+    # Fill: "fill the X field with Y" / "fill X with Y"
+    fill_ff = _FILL_FIELD_FIRST_RE.match(stripped)
+    if fill_ff:
+        field = fill_ff.group(1).strip().strip("'\"")
+        value = fill_ff.group(2).strip().strip("'\"")
+        return f'fill the "{field}" field with "{value}"'
+
+    # Fill: "type/fill/enter X into Y"
+    fill_match = _FILL_RE.match(stripped)
+    if fill_match:
+        value = fill_match.group(1).strip().strip("'\"")
+        field = fill_match.group(2).strip().strip("'\"")
+        return f'fill the "{field}" field with "{value}"'
+
+    # Verify
+    verify_match = _VERIFY_RE.match(stripped)
+    if verify_match:
+        text_val = verify_match.group(1).strip().strip("'\"")
+        return f'verify "{text_val}" is visible'
+
+    # Click
+    click_match = _CLICK_RE_LOCAL.match(stripped)
+    if click_match:
+        raw_target = click_match.group(1).strip().strip("'\"").rstrip(".,;")
+        target_lower = raw_target.lower()
+        # Determine link vs button
+        explicit_link = any(t in lower for t in ("link", "anchor", "href", "menu item", "nav"))
+        explicit_button = "button" in lower or "btn" in lower
+        if not explicit_button and not explicit_link:
+            # Guess by common button label words
+            words = set(re.findall(r"[a-z]+", target_lower))
+            explicit_button = bool(words & _BUTTON_KEYWORDS)
+        kind = "button" if explicit_button else "link"
+        return f'click the "{raw_target}" {kind}'
+
+    # Scroll
+    if "scroll" in lower:
+        direction = "up" if "up" in lower else "down"
+        return f"scroll {direction}"
+
+    # Fallback — return cleaned-up original
+    cleaned = re.sub(r"^\d+[\).\s\-]+", "", stripped).strip()
+    return cleaned if cleaned else stripped
+
+
+def _split_and_convert_prompt(prompt: str) -> list[str]:
+    """Main entry: split prompt into action lines and convert each to human-readable text."""
+    lines = _split_prompt_into_action_lines(prompt)
+    result: list[str] = []
+    for line in lines:
+        converted = _action_line_to_text(line)
+        if converted:
+            result.append(converted)
+    return result
+
+
+_SELECTOR_LABEL_MAP: dict[str, str] = {
+    "{{selector.login_button}}": ("Login", "button"),
+    "{{selector.logout_link}}": ("Logout", "link"),
+    "{{selector.create_form}}": ("Create Form", "button"),
+    "{{selector.save_form}}": ("Save", "button"),
+    "{{selector.cancel_button}}": ("Cancel", "button"),
+    "{{selector.create_account}}": ("Create Account", "button"),
+    "{{selector.next_button}}": ("Next", "button"),
+    "{{selector.back_button}}": ("Back", "button"),
+    "{{selector.save_changes_button}}": ("Save Changes", "button"),
+    "{{selector.save_workflow}}": ("Save Workflow", "button"),
+    "{{selector.add_status_button}}": ("Add Status", "button"),
+    "{{selector.transition_button}}": ("Transition", "button"),
+    "{{selector.create_workflow}}": ("Create Workflow", "button"),
+    "{{selector.top_left_corner}}": ("menu", "icon"),
+    "{{selector.workflows_module}}": ("Workflows", "link"),
+    "{{selector.email}}": "Email",
+    "{{selector.password}}": "Password",
+    "{{selector.first_name}}": "First Name",
+    "{{selector.surname}}": "Last Name",
+    "{{selector.phone}}": "Phone",
+    "{{selector.confirm_password}}": "Confirm Password",
+    "{{selector.username}}": "Username",
+    "{{selector.form_name}}": "Form Name",
+    "{{selector.workflow_name}}": "Workflow Name",
+    "{{selector.workflow_description}}": "Description",
+    "{{selector.status_name}}": "Status Name",
+    "{{selector.transition_name}}": "Transition Name",
+    "{{selector.form_label}}": "Label",
+    "{{selector.dropdown_option_label}}": "Option Label",
+    "{{selector.dropdown_option_value}}": "Option Value",
+}
+
+
+def _step_to_text(step: dict[str, object]) -> str:
+    """Convert a JSON step dict into a short human-readable action line."""
+    step_type = str(step.get("type") or "").strip()
+
+    if step_type == "navigate":
+        url = str(step.get("url") or "").strip()
+        return f"Go to {url}" if url else ""
+
+    if step_type == "click":
+        selector = str(step.get("selector") or "").strip()
+        target = step.get("target")
+
+        # Semantic target
+        if isinstance(target, dict):
+            text = str(target.get("text") or target.get("label") or "").strip()
+            role = str(target.get("role") or "").lower()
+            if text:
+                element = "button" if "button" in role else "link"
+                return f'click the "{text}" {element}'
+
+        # text= selector
+        if selector.startswith("text="):
+            label = selector[5:].strip()
+            return f'click the "{label}" link'
+
+        # Known profile selector
+        mapping = _SELECTOR_LABEL_MAP.get(selector)
+        if isinstance(mapping, tuple):
+            label, kind = mapping
+            return f'click the "{label}" {kind}'
+
+        # text_hint on the step
+        text_hint = str(step.get("text_hint") or "").strip()
+        if text_hint:
+            return f'click the "{text_hint}" link'
+
+        # Fallback: clean up selector for display
+        display = re.sub(r"\{\{selector\.[^}]+\}\}", "", selector).strip(" .,;/")
+        if display:
+            return f'click the "{display}" element'
+        return 'click the element'
+
+    if step_type == "type":
+        text = str(step.get("text") or "").strip()
+        selector = str(step.get("selector") or "").strip()
+        target = step.get("target")
+
+        field = ""
+        if isinstance(target, dict):
+            field = str(target.get("label") or target.get("placeholder") or target.get("text") or "").strip()
+        if not field:
+            mapping = _SELECTOR_LABEL_MAP.get(selector)
+            if isinstance(mapping, str):
+                field = mapping
+            elif not field:
+                m = re.search(r"has-text\('([^']+)'\)", selector)
+                if m:
+                    field = m.group(1)
+        if field and text:
+            return f'fill the "{field}" field with "{text}"'
+        if text:
+            return f'type "{text}"'
+        return ""
+
+    if step_type == "select":
+        value = str(step.get("value") or "").strip()
+        selector = str(step.get("selector") or "").strip()
+        field = ""
+        mapping = _SELECTOR_LABEL_MAP.get(selector)
+        if isinstance(mapping, str):
+            field = mapping
+        if field and value:
+            return f'select "{value}" from the "{field}" dropdown'
+        if value:
+            return f'select "{value}"'
+        return ""
+
+    if step_type == "wait":
+        until = str(step.get("until") or "timeout").lower()
+        ms = step.get("ms")
+        ms_val = int(ms) if isinstance(ms, (int, float)) else 500
+        if until == "timeout":
+            return f"wait {ms_val}ms"
+        selector = str(step.get("selector") or "").strip()
+        if until == "selector_visible":
+            label = selector[5:].strip() if selector.startswith("text=") else selector
+            display = re.sub(r"\{\{selector\.[^}]+\}\}", "", label).strip()
+            if display:
+                return f'wait for "{display}" to be visible'
+            return "wait for element to be visible"
+        if until == "selector_hidden":
+            return "wait for element to be hidden"
+        if until == "load_state":
+            return "wait for page to load"
+        return f"wait {ms_val}ms"
+
+    if step_type == "verify_text":
+        value = str(step.get("value") or "").strip()
+        if value:
+            return f'verify text "{value}" is visible'
+        return ""
+
+    if step_type == "scroll":
+        direction = str(step.get("direction") or "down").lower()
+        return f"scroll {direction}"
+
+    if step_type == "drag":
+        source = str(step.get("source_selector") or "").strip()
+        target_sel = str(step.get("target_selector") or "").strip()
+        s_label = re.sub(r"\{\{selector\.[^}]+\}\}", "", source).strip()
+        t_label = re.sub(r"\{\{selector\.[^}]+\}\}", "", target_sel).strip()
+        return f'drag "{s_label or source}" to "{t_label or target_sel}"'
+
+    if step_type == "handle_popup":
+        action = str(step.get("action") or "accept").lower()
+        return f"{action} the popup dialog"
+
+    if step_type == "verify_image":
+        return "verify image on page"
+
+    return ""
 
 
 def _build_structured_plan_attempt(
@@ -1259,6 +1551,18 @@ def build_app() -> FastAPI:
                 + list((last_validation or {}).get("rejection_reasons", [])),
             },
         )
+
+    @app.post("/api/prompt-to-steps", response_model=PromptToStepsResponse)
+    async def convert_prompt_to_steps(
+        request: PromptToStepsRequest,
+        _: None = Depends(require_admin_auth),
+    ) -> PromptToStepsResponse:
+        # Step 1: local action-line parser — no LLM, produces clean human-readable steps
+        lines = _split_and_convert_prompt(request.prompt)
+        if lines:
+            return PromptToStepsResponse(steps=lines)
+
+        raise HTTPException(status_code=422, detail="Could not extract steps from that prompt.")
 
     @app.post("/api/suite-runs", response_model=SuiteRunState)
     async def create_suite_run(

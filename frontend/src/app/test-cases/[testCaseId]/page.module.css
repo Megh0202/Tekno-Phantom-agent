@@ -274,6 +274,33 @@
   background: #1f1f1f;
 }
 
+.convertRow {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) auto;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 4px;
+}
+
+.convertRow input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: #1a1a1a;
+  color: #ffffff;
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.convertRow input:focus {
+  outline: none;
+  border-color: rgba(255, 179, 0, 0.5);
+  box-shadow: 0 0 0 3px var(--focus);
+  background: #1f1f1f;
+}
+
 .newRow {
   display: grid;
   grid-template-columns: minmax(200px, 1fr) auto;

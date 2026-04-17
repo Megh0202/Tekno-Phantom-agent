@@ -171,6 +171,8 @@ export default function TestCaseDetailsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [isConvertingSteps, setIsConvertingSteps] = useState(false);
+  const [convertPromptInput, setConvertPromptInput] = useState("");
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [activeTab, setActiveTab] = useState<TestTab>("tests");
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -360,6 +362,39 @@ export default function TestCaseDetailsPage() {
       cancelEditingStep();
     } else if (editingStepIndex !== null && editingStepIndex > index) {
       setEditingStepIndex(editingStepIndex - 1);
+    }
+  }
+
+  async function convertToSteps(): Promise<void> {
+    const task = convertPromptInput.trim();
+    if (!task) {
+      setRequestError("Enter a prompt to convert.");
+      return;
+    }
+    setRequestError(null);
+    setRequestInfo(null);
+    setIsConvertingSteps(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt-to-steps`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
+        body: JSON.stringify({ prompt: task, max_steps: 300 }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const data = (await response.json()) as { steps: string[] };
+      if (!data.steps || data.steps.length === 0) {
+        setRequestError("Could not extract steps from that prompt.");
+        return;
+      }
+      setManualStepsInput(data.steps.join("\n"));
+      setConvertPromptInput("");
+      setRequestInfo(`Converted to ${data.steps.length} step${data.steps.length !== 1 ? "s" : ""}. Review and click Save.`);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to convert prompt");
+    } finally {
+      setIsConvertingSteps(false);
     }
   }
 
@@ -684,6 +719,21 @@ export default function TestCaseDetailsPage() {
 
         {activeTab === "tests" ? (
           <div className={styles.testsPane}>
+            <div className={styles.convertRow}>
+              <input
+                value={convertPromptInput}
+                onChange={(event) => setConvertPromptInput(event.target.value)}
+                placeholder="Describe what to test in plain language..."
+              />
+              <button
+                type="button"
+                className={styles.primaryButton}
+                onClick={() => void convertToSteps()}
+                disabled={authBlocked || isConvertingSteps || isSaving}
+              >
+                {isConvertingSteps ? "Converting..." : "Convert to Steps"}
+              </button>
+            </div>
             <ol className={styles.list}>
               {normalizeManualStepLines(manualStepsInput).map((line, index) => (
                 <li key={`step-${index}`} className={styles.stepItem}>

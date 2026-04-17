@@ -316,6 +316,10 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isConvertingSteps, setIsConvertingSteps] = useState(false);
+  const [generatedStepLines, setGeneratedStepLines] = useState<string[] | null>(null);
+  const [editingGenStepIndex, setEditingGenStepIndex] = useState<number | null>(null);
+  const [editingGenStepValue, setEditingGenStepValue] = useState("");
   const [isSavingTestCase, setIsSavingTestCase] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [isRefreshingCases, setIsRefreshingCases] = useState(false);
@@ -714,6 +718,46 @@ export default function Home() {
     }
   }
 
+  async function generateSteps(): Promise<void> {
+    setRequestError(null);
+    setRequestInfo(null);
+
+    const task = prompt.trim();
+    if (!task) {
+      setRequestError("Enter a prompt first.");
+      return;
+    }
+
+    try {
+      setIsConvertingSteps(true);
+      setGeneratedStepLines(null);
+      const response = await fetch(`${API_BASE_URL}/api/prompt-to-steps`, {
+        method: "POST",
+        headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
+        body: JSON.stringify({
+          prompt: task,
+          max_steps: config?.max_steps_per_run ?? DEFAULT_MAX_STEPS,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const data = (await response.json()) as { steps: string[] };
+      if (!data.steps || data.steps.length === 0) {
+        setRequestError("Could not extract steps from that prompt. Try a more specific description.");
+        return;
+      }
+      setGeneratedStepLines(data.steps);
+      setCurrentRun(null);
+      setCurrentSuiteRun(null);
+    } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : "Failed to generate steps";
+      setRequestError(toUserMessage(rawMessage));
+    } finally {
+      setIsConvertingSteps(false);
+    }
+  }
+
   function parseCsvSteps(text: string): string[] {
     const rows = text.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
     if (rows.length === 0) return [];
@@ -1097,6 +1141,7 @@ export default function Home() {
 
     try {
       setIsSubmitting(true);
+      setGeneratedStepLines(null);
 
       let plan: PlanGenerateResponse;
       if (importedPlan) {
@@ -1922,6 +1967,14 @@ export default function Home() {
               {requestInfo ? <p className={styles.infoText}>{requestInfo}</p> : null}
 
               <div className={styles.actions}>
+                <button
+                  type="button"
+                  className={styles.secondaryButton}
+                  onClick={() => void generateSteps()}
+                  disabled={authBlocked || isConvertingSteps || isSubmitting}
+                >
+                  {isConvertingSteps ? "Generating..." : "Generate Steps"}
+                </button>
                 {SHOW_ADVANCED_INPUTS ? (
                   <button
                     type="button"
@@ -2056,8 +2109,87 @@ export default function Home() {
 
         <section className={`${styles.panel} ${styles.resultPanel}`}>
           <h2>Result</h2>
-          {!currentRun && !currentSuiteRun ? (
+          {!currentRun && !currentSuiteRun && !generatedStepLines ? (
             <p className={styles.emptyState}>No result yet. Submit a prompt to run automation.</p>
+          ) : null}
+          {generatedStepLines && !currentRun && !currentSuiteRun ? (
+            <div className={styles.generatedStepsPanel}>
+              <div className={styles.planHeader}>
+                <h3>Generated Steps ({generatedStepLines.length})</h3>
+                <p className={styles.metaLine}>Edit steps if needed, then click Run Prompt to execute.</p>
+              </div>
+              <div className={styles.generatedStepsList}>
+                {generatedStepLines.map((line, index) => (
+                  <div key={`gen-step-${index}`} className={styles.generatedStepCard}>
+                    <span className={styles.generatedStepIndex}>{index + 1}</span>
+                    {editingGenStepIndex === index ? (
+                      <>
+                        <input
+                          className={styles.generatedStepEditInput}
+                          value={editingGenStepValue}
+                          onChange={(e) => setEditingGenStepValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              const trimmed = editingGenStepValue.trim();
+                              if (trimmed) {
+                                setGeneratedStepLines((prev) => {
+                                  if (!prev) return prev;
+                                  const next = [...prev];
+                                  next[index] = trimmed;
+                                  return next;
+                                });
+                              }
+                              setEditingGenStepIndex(null);
+                            }
+                            if (e.key === "Escape") setEditingGenStepIndex(null);
+                          }}
+                          autoFocus
+                        />
+                        <button
+                          type="button"
+                          className={styles.genStepSaveBtn}
+                          onClick={() => {
+                            const trimmed = editingGenStepValue.trim();
+                            if (trimmed) {
+                              setGeneratedStepLines((prev) => {
+                                if (!prev) return prev;
+                                const next = [...prev];
+                                next[index] = trimmed;
+                                return next;
+                              });
+                            }
+                            setEditingGenStepIndex(null);
+                          }}
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          className={styles.genStepCancelBtn}
+                          onClick={() => setEditingGenStepIndex(null)}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span className={styles.generatedStepText}>{line}</span>
+                        <button
+                          type="button"
+                          className={styles.genStepEditBtn}
+                          onClick={() => {
+                            setEditingGenStepIndex(index);
+                            setEditingGenStepValue(line);
+                          }}
+                        >
+                          Edit
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
           ) : null}
           {currentSuiteRun ? (
             <div className={styles.planPreview}>
@@ -2159,17 +2291,22 @@ export default function Home() {
               </p>
 
               <div className={styles.timeline}>
-                {currentRun.steps.map((step) => (
+                {currentRun.steps.map((step) => {
+                  const genLabel = generatedStepLines?.[step.index] ?? null;
+                  return (
                   <article key={step.step_id} className={styles.timelineItem}>
                     <div className={styles.timelineTop}>
                       <p>
-                        #{step.index + 1} {formatStepType(step.type)}
+                        {genLabel
+                          ? <><span className={styles.stepIndexBadge}>{step.index + 1}</span> {genLabel}</>
+                          : <>{`#${step.index + 1} ${formatStepType(step.type)}`}</>
+                        }
                       </p>
                       <p className={`${styles.statusPill} ${statusClass(step.status)}`}>
                         {step.status}
                       </p>
                     </div>
-                    {step.message ? <p className={styles.stepMessage}>{step.message}</p> : null}
+                    {!genLabel && step.message ? <p className={styles.stepMessage}>{step.message}</p> : null}
                     {step.error ? (
                       <p className={styles.stepError}>{step.error}</p>
                     ) : step.status === "failed" ? (
@@ -2212,7 +2349,8 @@ export default function Home() {
                       </div>
                     ) : null}
                   </article>
-                ))}
+                  );
+                })}
               </div>
             </>
           ) : null}

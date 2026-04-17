@@ -266,6 +266,15 @@ class PlanGenerateResponse(BaseModel):
     steps: list[ActionStep] = Field(min_length=1)
 
 
+class PromptToStepsRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=5000)
+    max_steps: int = Field(default=50, ge=1, le=300)
+
+
+class PromptToStepsResponse(BaseModel):
+    steps: list[str]
+
+
 class StepImportResponse(BaseModel):
     run_name: str
     start_url: str | None = None

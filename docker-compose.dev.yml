@@ -1,0 +1,45 @@
+# Dev override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# What this does:
+#   Backend  — mounts ./backend/app into the container, uvicorn auto-reloads on save
+#   Frontend — mounts ./frontend/src + public, Next.js HMR on save
+#
+# First-time setup (builds images, installs deps — only needed once or when deps change):
+#   docker compose up --build -d
+#
+# Daily dev (fast — no rebuild):
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+services:
+  backend:
+    volumes:
+      - ./backend/app:/app/app          # live-sync Python source
+      - backend_data:/app/data
+      - backend_artifacts:/app/artifacts
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/app
+
+  frontend:
+    volumes:
+      - ./frontend/src:/app/src          # live-sync Next.js source
+      - ./frontend/public:/app/public
+    environment:
+      NODE_ENV: development
+    command:
+      - npm
+      - run
+      - dev
+      - --
+      - -H
+      - "0.0.0.0"
+      - -p
+      - "3000"
