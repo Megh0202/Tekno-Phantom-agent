@@ -273,93 +273,6 @@ def _has_navigate_step(steps: list[dict[str, object]]) -> bool:
     return any(str(step.get("type") or "").strip().lower() == "navigate" for step in steps)
 
 
-def _ensure_drag_step(task: str, steps: list[dict[str, object]]) -> list[dict[str, object]]:
-    def _contains_short_answer(text: str) -> bool:
-        candidate = text.lower()
-        return any(token in candidate for token in ("short answer", "short-answer", "short_answer"))
-
-    def _is_drag_candidate(step: dict[str, object]) -> bool:
-        if step.get("type") not in {"click", "select"}:
-            return False
-        fields = [
-            str(step.get("selector", "")),
-            str(step.get("target", "")),
-            str(step.get("value", "")),
-            str(step.get("option", "")),
-            str(step.get("text", "")),
-        ]
-        return _contains_short_answer(" ".join(fields))
-
-    def _drag_insert_index(items: list[dict[str, object]]) -> int:
-        for index, step in enumerate(items):
-            step_type = str(step.get("type") or "").lower()
-            selector = str(step.get("selector", "")).lower()
-            text = str(step.get("text", "")).lower()
-            value = str(step.get("value", "")).lower()
-            if step_type == "type" and any(
-                token in selector or token in text
-                for token in ("label", "first name", "form name", "formname")
-            ):
-                return index
-            if step_type == "click" and any(token in selector for token in ("save", "required")):
-                return index
-            if step_type == "verify_text" and "create form" in value:
-                return index
-        return len(items)
-
-    task_lower = task.lower()
-    mentions_drag = "drag" in task_lower
-    mentions_drop = "drop" in task_lower
-    mentions_short_answer = _contains_short_answer(task_lower)
-    should_force_drag = (mentions_drag and (mentions_drop or mentions_short_answer)) or mentions_short_answer
-
-    ensured = [dict(step) for step in steps]
-    insert_at = _drag_insert_index(ensured)
-
-    existing_drag_indices = [index for index, step in enumerate(ensured) if step.get("type") == "drag"]
-    if existing_drag_indices:
-        first_drag_index = existing_drag_indices[0]
-        if first_drag_index > insert_at:
-            drag_step = dict(ensured.pop(first_drag_index))
-            ensured.insert(insert_at, drag_step)
-        return ensured
-
-    drag_candidate_index = next(
-        (index for index, step in enumerate(ensured) if _is_drag_candidate(step)),
-        None,
-    )
-    if drag_candidate_index is not None:
-        candidate = ensured.pop(drag_candidate_index)
-        source_selector = (
-            str(candidate.get("selector"))
-            if candidate.get("selector")
-            else str(candidate.get("target") or "short answer")
-        )
-        insert_at = _drag_insert_index(ensured)
-        ensured.insert(
-            insert_at,
-            {
-                "type": "drag",
-                "source_selector": source_selector,
-                "target_selector": "form canvas",
-            },
-        )
-        return ensured
-
-    if not should_force_drag:
-        return ensured
-
-    ensured.insert(
-        insert_at,
-        {
-            "type": "drag",
-            "source_selector": "short answer",
-            "target_selector": "form canvas",
-        },
-    )
-    return ensured
-
-
 def _expand_drag_steps(
     steps: list[dict[str, object]],
     *,
@@ -469,30 +382,12 @@ def _can_access_owned_resource(actor: User | None, owner_id: int) -> bool:
     return actor is None or int(actor.id) == int(owner_id)
 
 
-def _is_enterprise_prompt(task: str) -> bool:
-    lowered = task.lower()
-    return any(
-        token in lowered
-        for token in (
-            "vita",
-            "workflow",
-            "workflows",
-            "form canvas",
-            "short answer",
-            "status",
-            "transition",
-            "editor",
-        )
-    )
-
-
 def _validate_generated_plan(task: str, normalized_steps: list[dict[str, object]]) -> dict[str, object]:
     errors: list[str] = []
     missing_steps: list[str] = []
     rejection_reasons: list[str] = []
     lowered_task = task.lower()
     step_types = [str(step.get("type") or "").strip().lower() for step in normalized_steps]
-    is_enterprise = _is_enterprise_prompt(task)
 
     if not normalized_steps:
         errors.append("Planner response was dropped during normalization or produced no runnable steps.")
@@ -554,7 +449,6 @@ def _validate_generated_plan(task: str, normalized_steps: list[dict[str, object]
         "errors": errors,
         "missing_steps": missing_steps,
         "rejection_reasons": rejection_reasons,
-        "is_enterprise_prompt": is_enterprise,
     }
 
 
@@ -602,14 +496,19 @@ def _split_prompt_into_action_lines(prompt: str) -> list[str]:
     if len(lines) >= 2:
         return lines
 
-    # Single line — split by "then" and action boundaries
+    # Single paragraph — first split by sentence boundaries (". " followed by capital)
+    # then by "then" and action-keyword boundaries
     text = prompt.strip()
-    parts = _ACTION_SPLIT_RE.split(text)
+    sentence_parts = re.split(r"\.\s+(?=[A-Z])", text)
+    # Strip trailing period from each part and re-split further by "then"/action keywords
     result: list[str] = []
-    for part in parts:
-        subparts = _ACTION_BOUNDARY_RE.split(part)
-        result.extend(subparts)
-    return [p.strip() for p in result if p.strip()]
+    for sentence in sentence_parts:
+        sentence = sentence.rstrip(". ")
+        parts = _ACTION_SPLIT_RE.split(sentence)
+        for part in parts:
+            subparts = _ACTION_BOUNDARY_RE.split(part)
+            result.extend(subparts)
+    return [p.strip().rstrip(".,;") for p in result if p.strip()]
 
 
 def _action_line_to_text(line: str) -> str:
@@ -725,6 +624,60 @@ _SELECTOR_LABEL_MAP: dict[str, str] = {
 }
 
 
+def _selector_to_label(selector: str) -> str:
+    """Extract a short human-readable label from a raw CSS/Playwright selector."""
+    s = selector.strip()
+    if not s:
+        return ""
+
+    # Take only the first candidate if comma-separated list
+    first = s.split(",")[0].strip()
+
+    # text= or :has-text()
+    m = re.search(r":has-text\(['\"](.+?)['\"]\)", first)
+    if m:
+        return m.group(1)
+    if first.lower().startswith("text="):
+        return first[5:].strip().strip("'\"")
+
+    # aria-label
+    m = re.search(r'\[aria-label=["\']([^"\']+)["\']', first)
+    if m:
+        return m.group(1)
+
+    # placeholder
+    m = re.search(r'\[placeholder=["\']([^"\']+)["\']', first)
+    if m:
+        return m.group(1)
+
+    # name attribute
+    m = re.search(r'\[name=["\']([^"\']+)["\']', first)
+    if m:
+        return m.group(1)
+
+    # id — #searchInput → "search input"
+    m = re.match(r"#([a-zA-Z][\w-]*)", first)
+    if m:
+        raw = m.group(1)
+        # camelCase / PascalCase → spaced words
+        spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw)
+        spaced = re.sub(r"[-_]", " ", spaced)
+        return spaced.lower().strip()
+
+    # tag only — button, select, input
+    m = re.match(r"^(button|select|input|textarea|a)\b", first)
+    if m:
+        tag_labels = {"button": "button", "select": "dropdown", "input": "input field", "textarea": "text area", "a": "link"}
+        return tag_labels.get(m.group(1), m.group(1))
+
+    # class — .btn-primary → "btn primary"
+    m = re.match(r"\.([a-zA-Z][\w-]*)", first)
+    if m:
+        return re.sub(r"[-_]", " ", m.group(1)).lower()
+
+    return ""
+
+
 def _step_to_text(step: dict[str, object]) -> str:
     """Convert a JSON step dict into a short human-readable action line."""
     step_type = str(step.get("type") or "").strip()
@@ -737,7 +690,14 @@ def _step_to_text(step: dict[str, object]) -> str:
         selector = str(step.get("selector") or "").strip()
         target = step.get("target")
 
-        # Semantic target
+        # text_hint — primary source, set by the planner
+        text_hint = str(step.get("text_hint") or "").strip()
+        if text_hint:
+            lower = text_hint.lower()
+            kind = "button" if any(w in lower for w in _BUTTON_KEYWORDS) else "link"
+            return f'click the "{text_hint}" {kind}'
+
+        # Semantic target dict
         if isinstance(target, dict):
             text = str(target.get("text") or target.get("label") or "").strip()
             role = str(target.get("role") or "").lower()
@@ -756,15 +716,10 @@ def _step_to_text(step: dict[str, object]) -> str:
             label, kind = mapping
             return f'click the "{label}" {kind}'
 
-        # text_hint on the step
-        text_hint = str(step.get("text_hint") or "").strip()
-        if text_hint:
-            return f'click the "{text_hint}" link'
-
-        # Fallback: clean up selector for display
-        display = re.sub(r"\{\{selector\.[^}]+\}\}", "", selector).strip(" .,;/")
-        if display:
-            return f'click the "{display}" element'
+        # Extract readable label from raw selector
+        label = _selector_to_label(selector)
+        if label:
+            return f'click the "{label}" element'
         return 'click the element'
 
     if step_type == "type":
@@ -772,19 +727,17 @@ def _step_to_text(step: dict[str, object]) -> str:
         selector = str(step.get("selector") or "").strip()
         target = step.get("target")
 
-        field = ""
-        if isinstance(target, dict):
+        field = str(step.get("text_hint") or "").strip()
+        if not field and isinstance(target, dict):
             field = str(target.get("label") or target.get("placeholder") or target.get("text") or "").strip()
         if not field:
             mapping = _SELECTOR_LABEL_MAP.get(selector)
             if isinstance(mapping, str):
                 field = mapping
-            elif not field:
-                m = re.search(r"has-text\('([^']+)'\)", selector)
-                if m:
-                    field = m.group(1)
+        if not field:
+            field = _selector_to_label(selector)
         if field and text:
-            return f'fill the "{field}" field with "{text}"'
+            return f'type "{text}" into the "{field}" field'
         if text:
             return f'type "{text}"'
         return ""
@@ -796,6 +749,8 @@ def _step_to_text(step: dict[str, object]) -> str:
         mapping = _SELECTOR_LABEL_MAP.get(selector)
         if isinstance(mapping, str):
             field = mapping
+        if not field:
+            field = _selector_to_label(selector)
         if field and value:
             return f'select "{value}" from the "{field}" dropdown'
         if value:
@@ -867,7 +822,6 @@ def _build_structured_plan_attempt(
         return None
 
     normalized_steps = _sanitize_plan_steps(parsed_steps, start_url=request.start_url)
-    normalized_steps = _ensure_drag_step(request.task, normalized_steps)
     validation = _validate_generated_plan(request.task, normalized_steps)
     return {
         "source": "structured_parser",
@@ -1479,13 +1433,6 @@ def build_app() -> FastAPI:
                     "Validation feedback from the previous rejected plan:\n"
                     f"{feedback or 'The previous plan did not satisfy the prompt requirements.'}"
                 )
-                if bool(last_validation.get("is_enterprise_prompt")):
-                    attempt_task = (
-                        f"{attempt_task}\n\n"
-                        "Enterprise planning requirements:\n"
-                        "- Cover all requested workflow actions.\n"
-                        "- Include required data entry and a specific verification target.\n"
-                    )
 
             try:
                 payload = await brain_client.plan_task(attempt_task, max_steps=max_steps)
@@ -1499,7 +1446,6 @@ def build_app() -> FastAPI:
                     default_wait_ms=settings.planner_default_wait_ms,
                 )
                 normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
-                normalized_steps = _ensure_drag_step(request.task, normalized_steps)
                 validation = _validate_generated_plan(request.task, normalized_steps)
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
@@ -1557,12 +1503,16 @@ def build_app() -> FastAPI:
         request: PromptToStepsRequest,
         _: None = Depends(require_admin_auth),
     ) -> PromptToStepsResponse:
-        # Step 1: local action-line parser — no LLM, produces clean human-readable steps
-        lines = _split_and_convert_prompt(request.prompt)
-        if lines:
-            return PromptToStepsResponse(steps=lines)
+        max_steps = max(int(request.max_steps or 30), 1)
+        try:
+            lines = await brain_client.human_steps(request.prompt, max_steps=max_steps)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Brain failed to generate steps: {exc}") from exc
 
-        raise HTTPException(status_code=422, detail="Could not extract steps from that prompt.")
+        if not lines:
+            raise HTTPException(status_code=422, detail="Could not extract steps from that prompt.")
+
+        return PromptToStepsResponse(steps=lines)
 
     @app.post("/api/suite-runs", response_model=SuiteRunState)
     async def create_suite_run(

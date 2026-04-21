@@ -39,3 +39,24 @@ class SelectorSuggestionRequest(BaseModel):
 
 class SelectorSuggestionResponse(BaseModel):
     selectors: list[str] = Field(default_factory=list)
+
+
+class HumanStepsRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=5000)
+    max_steps: int = Field(default=30, ge=1, le=500)
+
+
+class HumanStepsResponse(BaseModel):
+    steps: list[str]
+
+
+class DiagnoseFailureRequest(BaseModel):
+    step_type: str = Field(min_length=1, max_length=40)
+    error_message: str = Field(min_length=1, max_length=2000)
+    screenshot_base64: str = Field(min_length=1)  # PNG base64
+    goal: str | None = Field(default=None, max_length=1000)
+
+
+class DiagnoseFailureResponse(BaseModel):
+    diagnosis: str
+    suggested_fix: str

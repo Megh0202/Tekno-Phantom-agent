@@ -8,6 +8,10 @@ from fastapi import FastAPI, Header, HTTPException
 from app.config import get_settings
 from app.llm.factory import build_llm_provider
 from app.schemas import (
+    DiagnoseFailureRequest,
+    DiagnoseFailureResponse,
+    HumanStepsRequest,
+    HumanStepsResponse,
     PlanRequest,
     PlanResponse,
     SelectorSuggestionRequest,
@@ -81,6 +85,32 @@ def build_app() -> FastAPI:
             element_hint=request.element_hint,
         )
         return SelectorSuggestionResponse(selectors=selectors[: request.max_candidates])
+
+    @app.post("/v1/human-steps", response_model=HumanStepsResponse)
+    async def human_steps(
+        request: HumanStepsRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> HumanStepsResponse:
+        ensure_auth(authorization)
+        steps = await provider.human_steps(request.prompt, request.max_steps)
+        return HumanStepsResponse(steps=steps)
+
+    @app.post("/v1/diagnose-failure", response_model=DiagnoseFailureResponse)
+    async def diagnose_failure(
+        request: DiagnoseFailureRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> DiagnoseFailureResponse:
+        ensure_auth(authorization)
+        result = await provider.diagnose_failure(
+            step_type=request.step_type,
+            error_message=request.error_message,
+            screenshot_base64=request.screenshot_base64,
+            goal=request.goal,
+        )
+        return DiagnoseFailureResponse(
+            diagnosis=result["diagnosis"],
+            suggested_fix=result["suggested_fix"],
+        )
 
     return app
 

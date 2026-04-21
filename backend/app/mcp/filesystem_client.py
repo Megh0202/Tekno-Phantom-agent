@@ -26,6 +26,9 @@ class FileSystemClient(Protocol):
     async def write_bytes_artifact(self, run_id: str, filename: str, content: bytes) -> str:
         ...
 
+    async def read_bytes_artifact(self, run_id: str, filename: str) -> bytes | None:
+        ...
+
     async def exists(self, path: str) -> bool:
         ...
 
@@ -53,6 +56,12 @@ class LocalFileSystemClient:
         path = (run_path / filename).resolve()
         await asyncio.to_thread(path.write_bytes, content)
         return str(path)
+
+    async def read_bytes_artifact(self, run_id: str, filename: str) -> bytes | None:
+        path = (self._artifact_root / run_id / filename).resolve()
+        if not path.is_relative_to(self._artifact_root) or not path.exists():
+            return None
+        return await asyncio.to_thread(path.read_bytes)
 
     async def exists(self, path: str) -> bool:
         file_path = self._resolve_allowed_path(path)

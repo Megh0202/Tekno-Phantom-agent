@@ -11,6 +11,7 @@ import {
   resolveLiveViewerUrl,
 } from "@/lib/api-auth";
 import styles from "./page.module.css";
+import { AutocompleteInput, AutocompleteTextarea } from "@/components/AutocompleteInput";
 
 type AgentConfig = {
   llm_mode: string;
@@ -30,6 +31,9 @@ type RuntimeStep = {
   status: "pending" | "running" | "waiting_for_input" | "completed" | "failed" | "skipped" | "cancelled";
   message?: string | null;
   error?: string | null;
+  failure_diagnosis?: string | null;
+  failure_suggested_fix?: string | null;
+  failure_selector_suggestions?: string[] | null;
   user_input_kind?: string | null;
   user_input_prompt?: string | null;
 };
@@ -213,6 +217,7 @@ function statusClass(status: RunState["status"] | RuntimeStep["status"] | undefi
   if (status === "failed") return styles.statusFailed;
   if (status === "running") return styles.statusRunning;
   if (status === "cancelled") return styles.statusCancelled;
+  if (status === "waiting_for_input") return styles.statusWaiting;
   return styles.statusPending;
 }
 
@@ -1874,10 +1879,10 @@ export default function Home() {
             <form onSubmit={runFromPrompt} className={styles.form}>
               <label className={styles.fieldLabel}>
                 <span>Prompt</span>
-                <textarea
+                <AutocompleteTextarea
                   rows={4}
                   value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
+                  onChange={setPrompt}
                   placeholder="Example: Open https://example.com and verify h1 contains Example Domain."
                 />
               </label>
@@ -1885,20 +1890,20 @@ export default function Home() {
               <div className={styles.fieldSplit}>
                 <label className={styles.fieldLabel}>
                   <span>Test Case Name</span>
-                  <input
+                  <AutocompleteInput
                     ref={testCaseNameInputRef}
                     value={testCaseName}
-                    onChange={(event) => setTestCaseName(event.target.value)}
+                    onChange={setTestCaseName}
                     placeholder="Create_Form_01"
                   />
                 </label>
 
                 <label className={styles.fieldLabel}>
                   <span>Description</span>
-                  <textarea
+                  <AutocompleteTextarea
                     rows={2}
                     value={testCaseDescription}
-                    onChange={(event) => setTestCaseDescription(event.target.value)}
+                    onChange={setTestCaseDescription}
                     placeholder="Create form flow with required field verification."
                   />
                 </label>
@@ -2074,9 +2079,9 @@ export default function Home() {
             </div>
 
             <div className={styles.folderCreateRow}>
-              <input
+              <AutocompleteInput
                 value={folderNameInput}
-                onChange={(event) => setFolderNameInput(event.target.value)}
+                onChange={setFolderNameInput}
                 placeholder="Folder name"
               />
               <button
@@ -2277,6 +2282,15 @@ export default function Home() {
                 </div>
               </div>
 
+              {currentRun.status === "waiting_for_input" && (
+                <div className={styles.pauseBanner}>
+                  <span className={styles.pauseBannerIcon}>⏸</span>
+                  <div>
+                    <strong>Run paused — action required</strong>
+                    <p>A step failed and needs your input. Scroll down to the highlighted step, paste a working selector, and click <em>Apply &amp; Continue</em>.</p>
+                  </div>
+                </div>
+              )}
               {currentRun.summary ? <p className={styles.summary}>{currentRun.summary}</p> : null}
               <p className={styles.metaLine}>
                 {currentRun.viewer_status === "ready"
@@ -2316,7 +2330,42 @@ export default function Home() {
                         {currentRun.run_id}
                       </p>
                     ) : null}
-                    {(step.status === "failed" || (step.status === "waiting_for_input" && step.user_input_kind === "selector")) && editableSelectorField(step) ? (
+                    {(step.status === "failed" || step.status === "waiting_for_input") && (step.failure_diagnosis || step.failure_suggested_fix || (step.failure_selector_suggestions && step.failure_selector_suggestions.length > 0)) ? (
+                      <div className={styles.diagnosisBox}>
+                        {step.failure_diagnosis ? (
+                          <div className={styles.diagnosisRow}>
+                            <span className={styles.diagnosisLabel}>What went wrong</span>
+                            <p className={styles.diagnosisText}>{step.failure_diagnosis}</p>
+                          </div>
+                        ) : null}
+                        {step.failure_suggested_fix ? (
+                          <div className={styles.diagnosisRow}>
+                            <span className={styles.diagnosisLabel}>Suggested fix</span>
+                            <p className={styles.diagnosisText}>{step.failure_suggested_fix}</p>
+                          </div>
+                        ) : null}
+                        {step.failure_selector_suggestions && step.failure_selector_suggestions.length > 0 ? (
+                          <div className={styles.diagnosisRow}>
+                            <span className={styles.diagnosisLabel}>Try these selectors</span>
+                            <div className={styles.selectorSuggestions}>
+                              {step.failure_selector_suggestions.map((sel, i) => (
+                                <button
+                                  key={i}
+                                  type="button"
+                                  className={styles.selectorSuggestionChip}
+                                  onClick={() =>
+                                    setSelectorFixInputs((prev) => ({ ...prev, [step.step_id]: sel }))
+                                  }
+                                >
+                                  {sel}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {(step.status === "failed" || step.status === "waiting_for_input") && editableSelectorField(step) ? (
                       <div className={styles.selectorFixBox}>
                         <p className={styles.selectorFixTitle}>Selector Recovery</p>
                         <p className={styles.selectorFixHint}>

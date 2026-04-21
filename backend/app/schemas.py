@@ -169,7 +169,7 @@ class RunCreateRequest(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "continue"
+    failure_mode: Literal["stop", "continue"] = "stop"
     steps: list[ActionStep] = Field(default_factory=list)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
@@ -603,6 +603,9 @@ class StepRuntimeState(BaseModel):
     message: str | None = None
     error: str | None = None
     failure_screenshot: str | None = None
+    failure_diagnosis: str | None = None
+    failure_suggested_fix: str | None = None
+    failure_selector_suggestions: list[str] = Field(default_factory=list)
     user_input_kind: str | None = None
     user_input_prompt: str | None = None
     requested_selector_target: str | None = None
@@ -615,7 +618,7 @@ class RunState(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "continue"
+    failure_mode: Literal["stop", "continue"] = "stop"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
     user_id: int = 0

@@ -234,389 +234,6 @@ DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
         "text=FR",
         "text=ES",
     ],
-    "amazon_search_box": [
-        "#twotabsearchtextbox",
-        "input[name='field-keywords']",
-    ],
-    "amazon_search_submit": [
-        "#nav-search-submit-button",
-        "input#nav-search-submit-button",
-    ],
-    "amazon_first_result": [
-        "div[data-component-type='s-search-result'] h2 a",
-        "h2 a.a-link-normal",
-        "h2 a",
-    ],
-    "amazon_second_result": [
-        "div[data-component-type='s-search-result'] h2 a >> nth=1",
-        "div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a >> nth=1",
-        "div[data-component-type='s-search-result']:nth-of-type(2) h2 a",
-        "div[data-component-type='s-search-result']:nth-of-type(2) [data-cy='title-recipe-title'] a",
-    ],
-    "amazon_add_to_cart": [
-        "#add-to-cart-button",
-        "input[name='submit.add-to-cart']",
-        "button[name='submit.add-to-cart']",
-        "[id*='add-to-cart']",
-    ],
-    "amazon_cart": [
-        "#nav-cart",
-        "a[href*='/gp/cart/view.html']",
-        "a[href*='cart']",
-    ],
-}
-
-VITAONE_SELECTOR_PROFILE: dict[str, list[str]] = {
-    "top_left_corner": [
-        "header button[aria-label*='menu']",
-        "header button[aria-label*='navigation']",
-        "header button[aria-label*='sidebar']",
-        "header button:first-of-type",
-        "[role='banner'] button:first-of-type",
-    ],
-    "workflows_module": [
-        "a:has-text('Workflows')",
-        "button:has-text('Workflows')",
-        "[role='menuitem']:has-text('Workflows')",
-        "[role='link']:has-text('Workflows')",
-        "text=Workflows",
-    ],
-    "create_form": [
-        "button#createForm",
-        "button#create_form",
-        "button:has-text('Create Form')",
-        "[role='button']:has-text('Create Form')",
-    ],
-    "create_workflow": [
-        "button:has-text('Create Workflow')",
-        "[role='button']:has-text('Create Workflow')",
-        "a:has-text('Create Workflow')",
-        "text=Create Workflow",
-    ],
-    "workflow_confirmation": [
-        "[role='alert']:has-text('Workflow has been created')",
-        "[role='status']:has-text('Workflow has been created')",
-        ".toast:has-text('Workflow has been created')",
-        ".notification:has-text('Workflow has been created')",
-        "text=Workflow has been created",
-    ],
-    "workflow_name": [
-        "input[name='workflowName']",
-        "input[name='name']",
-        "input#workflowName",
-        "input#workflow-name",
-        "input[placeholder*='Workflow Name']",
-        "input[aria-label*='Workflow Name']",
-    ],
-    "workflow_description": [
-        "textarea[name='description']",
-        "textarea[placeholder*='Description']",
-        "textarea[aria-label*='Description']",
-        "input[name='description']",
-        "input[placeholder*='Description']",
-    ],
-    "save_workflow": [
-        "div[role='dialog'] button:has-text('Save')",
-        "div[role='dialog'] [role='button']:has-text('Save')",
-        "button[type='submit']:has-text('Save')",
-        "button:has-text('Save')",
-        "[role='button']:has-text('Save')",
-    ],
-    "add_status_button": [
-        "button:has-text('Add Status')",
-        "[role='button']:has-text('Add Status')",
-        "a:has-text('Add Status')",
-        "text=Add Status",
-    ],
-    "transition_button": [
-        "button:has-text('Transition')",
-        "[role='button']:has-text('Transition')",
-        "a:has-text('Transition')",
-        "text=Transition",
-    ],
-    "new_status_tab": [
-        "[role='tab']:has-text('New status')",
-        "button:has-text('New status')",
-        "[role='button']:has-text('New status')",
-        "text=New status",
-    ],
-    "status_name": [
-        "div[role='dialog'] input[name='statusName']",
-        "div[role='dialog'] input#statusName",
-        "div[role='dialog'] input[placeholder*='Status Name']",
-        "div[role='dialog'] input[placeholder*='status name']",
-        "div[role='dialog'] input[placeholder*='status']",
-        "div[role='dialog'] input[aria-label*='Status Name']",
-        "div[role='dialog'] input[aria-label*='status name']",
-        "input[name='statusName']",
-    ],
-    "status_category_dropdown": [
-        "div[role='dialog'] [role='combobox']",
-        "div[role='dialog'] [aria-haspopup='listbox']",
-        "div[role='dialog'] button:has-text('Select category')",
-        "div[role='dialog'] input[placeholder*='category']",
-        "div[role='dialog'] button:has-text('To Do')",
-        "text=Select category",
-    ],
-    "from_status_dropdown": [
-        "div[role='dialog'] input[placeholder*='InitialState']",
-        "div[role='dialog'] input[value*='InitialState']",
-        "div[role='dialog'] [role='combobox']:nth-of-type(1)",
-        "div[role='dialog'] [aria-haspopup='listbox']:nth-of-type(1)",
-        "div[role='dialog'] input[placeholder*='From status']",
-        "div[role='dialog'] input[aria-label*='From status']",
-    ],
-    "to_status_dropdown": [
-        "div[role='dialog'] input[placeholder='Select to status']",
-        "div[role='dialog'] input[placeholder*='Select to status']",
-        "div[role='dialog'] input[placeholder*='to status']",
-        "div[role='dialog'] button:has-text('Select to status')",
-        "div[role='dialog'] [role='button']:has-text('Select to status')",
-        "div[role='dialog'] input[aria-label*='To status']",
-        "div[role='dialog'] [role='combobox']:nth-of-type(2)",
-        "div[role='dialog'] [aria-haspopup='listbox']:nth-of-type(2)",
-        "div[role='dialog'] input[placeholder*='To status']",
-    ],
-    "status_category_todo": [
-        "div[role='listbox'] [role='option']:has-text('To Do')",
-        "div[role='dialog'] [role='option']:has-text('To Do')",
-        "div[role='dialog'] li:has-text('To Do')",
-        "div[role='dialog'] div:has-text('To Do')",
-        "[role='option']:has-text('To Do')",
-        "text=To Do",
-    ],
-    "save_status": [
-        "div[role='dialog'] button:has-text('Save')",
-        "div[role='dialog'] [role='button']:has-text('Save')",
-        "div[role='dialog'] button[type='submit']",
-        "button:has-text('Save')",
-        "[role='button']:has-text('Save')",
-    ],
-    "transition_name": [
-        "div[role='dialog'] input[name='transitionName']",
-        "div[role='dialog'] input[placeholder*='Transition Name']",
-        "div[role='dialog'] input[placeholder*='transition name']",
-        "div[role='dialog'] input[placeholder*='Enter a transition name']",
-        "div[role='dialog'] input[aria-label*='Transition Name']",
-        "div[role='dialog'] input[aria-label*='transition name']",
-    ],
-    "transition_canvas_label": [
-        "[data-edge-label-renderer] text",
-        "[data-edge-label-renderer] *",
-        "svg text",
-        "[class*='edge-label']",
-        "[class*='transition-label']",
-    ],
-    "save_transition": [
-        "div[role='dialog'] button:has-text('Save')",
-        "div[role='dialog'] [role='button']:has-text('Save')",
-        "div[role='dialog'] button[type='submit']",
-        "button:has-text('Save')",
-        "[role='button']:has-text('Save')",
-    ],
-    "save_changes_button": [
-        "button:has-text('Save Changes')",
-        "[role='button']:has-text('Save Changes')",
-        "text=Save Changes",
-    ],
-    "workflow_list_item": [
-        "table tbody tr td a",
-        "table tbody tr a",
-        "[role='table'] [role='row'] a",
-        "[data-testid*='workflow'] a",
-        "a:has-text('QA_Auto_Workflow_')",
-    ],
-    "workflow_saved_success": [
-        "[role='alert']:has-text('Workflow saved successfully')",
-        "[role='status']:has-text('Workflow saved successfully')",
-        ".toast:has-text('Workflow saved successfully')",
-        ".notification:has-text('Workflow saved successfully')",
-        "text=Workflow saved successfully",
-        "text=less than a minute ago",
-    ],
-    "cancel_button": [
-        "button:has-text('Cancel')",
-        "[role='button']:has-text('Cancel')",
-        "text=Cancel",
-    ],
-    "create_form_confirm": [
-        "[role='dialog'] button:has-text('Create')",
-        "div[role='dialog'] button:has-text('Create')",
-        "button:has-text('Create')",
-    ],
-    "form_name": [
-        "div[role='dialog'] input#name",
-        "div[role='dialog'] input[name='name']",
-        "div[role='dialog'] input[placeholder='Enter a name']",
-        "div[role='dialog'] input[placeholder*='Enter a name']",
-        "div[role='dialog'] input[data-slot='input'][name='name']",
-        "input#name",
-        "input[name='name']",
-        "input[placeholder='Enter a name']",
-        "input[placeholder*='Enter a name']",
-        "input[data-slot='input'][name='name']",
-        "input[placeholder*='name']",
-        "input[aria-label*='name']",
-    ],
-    "form_list_first_row": [
-        "table tbody tr:first-child",
-        "[role='table'] [role='row']:nth-child(2)",
-        "div[role='rowgroup'] div[role='row']:first-child",
-        "[data-testid*='forms'] tr:first-child",
-        "main tr:first-child",
-    ],
-    "form_list_first_name": [
-        "table tbody tr:first-child a",
-        "table tbody tr:first-child td a",
-        "[role='table'] [role='row']:nth-child(2) a",
-        "[data-testid*='forms'] tr:first-child a",
-        "main tr:first-child a",
-    ],
-    "save_form": [
-        "div[role='dialog'] button:has-text('Save')",
-        "div[role='dialog'] [role='button']:has-text('Save')",
-        "div[role='dialog'] button[type='submit']",
-        "button#saveForm",
-        "button.save-form",
-        "button:has-text('Save')",
-        "[role='button']:has-text('Save')",
-    ],
-    "back_button": [
-        "button:has([data-lucide='chevron-left'])",
-        "button:has([data-lucide='arrow-left'])",
-        "button:has(svg[class*='chevron-left'])",
-        "button:has(svg[class*='arrow-left'])",
-        "button[aria-label*='Back']",
-        "[role='button'][aria-label*='Back']",
-        "button:has-text('Back')",
-        "text=Back",
-    ],
-    "short_answer_source": [
-        "[data-testid='field-short-answer']",
-        "[data-testid*='short-answer']",
-        "[data-rbd-draggable-id*='short']",
-        "[draggable='true'][aria-label*='Short answer']",
-        "[draggable='true']:has-text('Short answer')",
-        "[role='listitem']:has-text('Short answer')",
-        "button:has-text('Short answer')",
-        "[role='button']:has-text('Short answer')",
-        "text=Short answer",
-    ],
-    "email_field_source": [
-        "[draggable='true'][aria-label*='Email']",
-        "[draggable='true']:has-text('Email')",
-        "[role='listitem']:has-text('Email')",
-        "[data-rbd-draggable-id*='email']",
-        "[data-testid='field-email']",
-        "[data-testid*='field-email']",
-        "button:has-text('Email')",
-        "[role='button']:has-text('Email')",
-        "text=Email",
-    ],
-    "dropdown_field_source": [
-        "[data-testid='field-dropdown']",
-        "[data-testid*='field-dropdown']",
-        "[data-rbd-draggable-id*='dropdown']",
-        "[draggable='true']:has-text('Dropdown')",
-        "[role='listitem']:has-text('Dropdown')",
-        "button:has-text('Dropdown')",
-        "[role='button']:has-text('Dropdown')",
-        "text=Dropdown",
-    ],
-    "form_canvas_target": [
-        "[data-row-id].form-row[draggable='true']",
-        "[data-row-id]",
-        "[data-testid='form-builder-canvas']",
-        ".form-canvas",
-        ".form-drop-area",
-        "[data-testid*='form-builder'][class*='canvas']",
-        ".form-builder-canvas",
-        ".form-builder-drop-area",
-        ".form-builder-editor",
-        "[data-testid='form-canvas']",
-        "[class*='drop'][class*='canvas']",
-        "[class*='builder'][class*='canvas']",
-        "div.form-row[draggable='true']:has-text('Drag and drop fields here')",
-        "div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')",
-        "div:has-text('Drag and drop fields here')",
-        "section:has-text('Drag and drop fields here')",
-        "[role='application']",
-    ],
-    "form_label": [
-        "div[role='dialog'] input[placeholder='Enter a label']",
-        "div[role='dialog'] input[name='label']",
-        "div[role='dialog'] input[aria-label*='Label']",
-        "div[role='dialog'] textarea[placeholder='Enter a label']",
-        "div[role='dialog'] textarea[name='label']",
-        "[data-testid='form-builder-canvas'] input[placeholder='Label']",
-        "[data-testid='form-builder-canvas'] textarea[placeholder='Label']",
-        "[data-testid='form-builder-canvas'] input[name='label']",
-        "[data-testid='form-builder-canvas'] textarea[name='label']",
-        "[data-testid='form-builder-canvas'] input[aria-label*='Label']",
-        "[data-testid='form-builder-canvas'] textarea[aria-label*='Label']",
-        ".form-canvas input[placeholder='Label']",
-        ".form-canvas textarea[placeholder='Label']",
-        "input[placeholder='Label']",
-        "textarea[placeholder='Label']",
-        "input[name='label']",
-        "textarea[name='label']",
-        "input[aria-label*='Label']",
-        "textarea[aria-label*='Label']",
-        "[contenteditable='true'][aria-label*='Label']",
-        "[role='textbox'][aria-label*='Label']",
-    ],
-    "required_checkbox": [
-        "div[role='dialog'] label:has-text('Required')",
-        "div[role='dialog'] label:has-text('Required') input[type='checkbox']",
-        "div[role='dialog'] input[type='checkbox'][name='required']",
-        "div[role='dialog'] [role='checkbox'][aria-label*='Required']",
-        "input[name='required']",
-        "input[type='checkbox'][name='required']",
-        "[data-testid='required'] input[type='checkbox']",
-        "label:has-text('Required')",
-        "label:has-text('Required') input[type='checkbox']",
-        "text=Required",
-    ],
-    "dropdown_option_type_trigger": [
-        "div[role='dialog'] [role='combobox']:has-text('Select an option')",
-        "div[role='dialog'] [role='combobox']",
-        "div[role='dialog'] [aria-haspopup='listbox']",
-        "div[role='dialog'] button:has-text('Select an option')",
-        "text=Select an option",
-    ],
-    "dropdown_option_enter_manual": [
-        "div[role='listbox'] [role='option']:text-is('Enter options manually')",
-        "div[role='dialog'] [role='option']:text-is('Enter options manually')",
-        "[role='option']:text-is('Enter options manually')",
-        "div[role='listbox'] :text-is('Enter options manually')",
-        "[role='option']:has-text('Enter options manually')",
-        "div[role='dialog'] :text-is('Enter options manually')",
-        "text=Enter options manually",
-    ],
-    "dropdown_options_section": [
-        "div[role='dialog'] :has-text('Options')",
-        "div[role='dialog'] input[placeholder='Label']",
-        "div[role='dialog'] input[placeholder='Value']",
-    ],
-    "dropdown_option_label": [
-        "div[role='dialog'] input[placeholder='Label']",
-        "div[role='dialog'] input[name='label']",
-    ],
-    "dropdown_option_value": [
-        "div[role='dialog'] input[placeholder='Value']",
-        "div[role='dialog'] input[name='value']",
-    ],
-    "dropdown_option_add_button": [
-        "div[role='dialog'] button:has(svg[class*='plus'])",
-        "div[role='dialog'] button:has(i[class*='plus'])",
-        "div[role='dialog'] [data-testid*='add-option']",
-        "div[role='dialog'] [aria-label*='Add option']",
-        "div[role='dialog'] [title*='Add option']",
-        "div[role='dialog'] div:has(input[placeholder='Value']) button",
-        "div[role='dialog'] button:has-text('+')",
-        "div[role='dialog'] [role='button']:has-text('+')",
-        "text=+",
-    ],
 }
 
 
@@ -866,9 +483,10 @@ class AgentExecutor:
             if step.status in {StepStatus.completed, StepStatus.skipped}:
                 continue
             if step.status == StepStatus.waiting_for_input:
+                run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
                 has_step_failure = True
-                continue
+                break
             if self._run_store.is_cancelled(run.run_id):
                 step.status = StepStatus.cancelled
                 run.status = RunStatus.cancelled
@@ -893,11 +511,21 @@ class AgentExecutor:
             )
             self._run_store.persist(run)
             if step.status == StepStatus.waiting_for_input:
+                run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
                 has_step_failure = True
-                continue
+                break
             if step.status == StepStatus.failed:
                 has_step_failure = True
+                # Agentic fallback: only attempt when failure_mode is "continue".
+                # When failure_mode is "stop" we want to halt immediately — the
+                # fallback would inject a new step and `continue` the loop,
+                # causing subsequent steps to run even though the run should pause.
+                is_fallback_step = bool((step.input or {}).get("_is_fallback"))
+                if run.prompt and not is_fallback_step and self._should_continue_after_failure(run):
+                    injected = await self._try_agentic_fallback(run, step)
+                    if injected:
+                        continue
                 if self._should_continue_after_failure(run):
                     continue
                 self._mark_remaining_steps_skipped(run, step.index + 1)
@@ -982,6 +610,87 @@ class AgentExecutor:
             run.summary = "Autonomous mode reached the maximum step budget before completing the goal."
 
         return has_step_failure
+
+    async def _try_agentic_fallback(
+        self, run: RunState, failed_step: StepRuntimeState
+    ) -> bool:
+        """
+        After a deterministic step fails, ask the brain what to do next.
+        If the brain returns a valid action, append a new StepRuntimeState to
+        run.steps (the for-loop in _execute_existing_steps will pick it up
+        naturally) and return True.  Returns False if recovery is not possible.
+        """
+        if not run.prompt:
+            return False
+        try:
+            page_snapshot = await self._safe_page_snapshot()
+            history = self._history_from_run(run)
+            max_steps = max(int(self._settings.max_steps_per_run), 1)
+            remaining = max(max_steps - len(run.steps), 1)
+            memory_context = self._build_autonomous_memory(run)
+
+            LOGGER.info(
+                "Run %s step %d: agentic fallback triggered (error=%r)",
+                run.run_id, failed_step.index + 1, failed_step.error,
+            )
+
+            decision = await self._brain.next_action(
+                goal=run.prompt,
+                page=page_snapshot,
+                history=history,
+                remaining_steps=remaining,
+                memory=memory_context,
+            )
+
+            decision_status = str(decision.get("status", "")).strip().lower()
+            if decision_status == "complete":
+                LOGGER.info(
+                    "Run %s step %d: agentic fallback — brain says complete, no recovery",
+                    run.run_id, failed_step.index + 1,
+                )
+                return False
+
+            raw_action = decision.get("action")
+            if not raw_action or not isinstance(raw_action, dict):
+                LOGGER.warning(
+                    "Run %s step %d: agentic fallback — brain returned invalid action: %r",
+                    run.run_id, failed_step.index + 1, raw_action,
+                )
+                return False
+
+            normalized_steps = normalize_plan_steps(
+                [raw_action],
+                max_steps=1,
+                default_wait_ms=self._settings.planner_default_wait_ms,
+            )
+            if not normalized_steps:
+                LOGGER.warning(
+                    "Run %s step %d: agentic fallback — action normalization returned empty",
+                    run.run_id, failed_step.index + 1,
+                )
+                return False
+
+            step_input = {**normalized_steps[0], "_is_fallback": True}
+            fallback_step = StepRuntimeState(
+                index=len(run.steps),
+                type=str(step_input.get("type", "step")),
+                input=step_input,
+                status=StepStatus.pending,
+            )
+            run.steps.append(fallback_step)
+            self._run_store.persist(run)
+            LOGGER.info(
+                "Run %s step %d: agentic fallback injected step index=%d type=%s",
+                run.run_id, failed_step.index + 1, fallback_step.index, fallback_step.type,
+            )
+            return True
+
+        except Exception as exc:
+            LOGGER.warning(
+                "Run %s step %d: agentic fallback raised exception (%s) — skipping",
+                run.run_id, failed_step.index + 1, self._compact_error(exc),
+            )
+            return False
 
     @staticmethod
     def _history_from_run(run: RunState) -> list[dict[str, Any]]:
@@ -1672,11 +1381,48 @@ class AgentExecutor:
                     break
             root_cause_str = " <- ".join(cause_chain)
 
+            # Pause and request user selector input only when the element could NOT be
+            # located on the page (selector is broken / element absent).
+            # Hard-exclude post-action outcome failures — these mean the element WAS
+            # found and actioned but the page reacted unexpectedly (form rejected,
+            # navigation didn't happen). A different selector won't fix those.
+            _INTERACTION_STEP_TYPES = {"click", "type", "select", "drag", "handle_popup"}
+            _error_lower = compact.lower()
+            # Hard excludes take priority — even if a "not found" phrase also appears
+            _OUTCOME_FAILURE_PHRASES = (
+                "click effect not observed",
+                "page url/title/text stayed the same",
+                "element remained visible/enabled",
+                "post_validation=failed",
+            )
+            _is_outcome_failure = any(p in _error_lower for p in _OUTCOME_FAILURE_PHRASES)
+            _LOCATOR_FAILURE_PHRASES = (
+                "waiting for locator",
+                "locator.click: timeout",
+                "locator.fill: timeout",
+                "locator.select_option: timeout",
+                "element not found",
+                "no element",
+                "strict mode violation",
+                "grounded selection failed",
+                "all selector candidates failed",
+                "does not contain a matching live element",
+            )
+            # "all selector candidates failed" paired with an outcome failure means the
+            # click happened but the outcome check failed — not a locator problem.
+            _is_element_not_found = (
+                not _is_outcome_failure
+                and any(p in _error_lower for p in _LOCATOR_FAILURE_PHRASES)
+            )
+            _has_selector_field = any(
+                isinstance((step.input or {}).get(f), str)
+                and bool((step.input or {}).get(f, "").strip())
+                for f in ("selector", "source_selector", "target_selector")
+            )
             if (
-                self._should_request_selector_help(step, exc)
-                and self._selector_help_mode() == "pause"
-                # If the user already provided a selector and it still fails, mark the
-                # step as failed and let execution continue — do not re-pause indefinitely.
+                step.type in _INTERACTION_STEP_TYPES
+                and _has_selector_field
+                and _is_element_not_found
                 and step.provided_selector is None
             ):
                 LOGGER.warning(
@@ -1691,6 +1437,10 @@ class AgentExecutor:
                 step.requested_selector_target = self._requested_selector_target(step)
                 step.user_input_prompt = self._build_selector_help_prompt(step)
                 step_trace["result"] = step.message
+                # Capture screenshot + diagnosis so the UI shows "What went wrong",
+                # "Suggested fix", and "Try these selectors" even while paused.
+                await self._capture_failure_screenshot(run.run_id, step)
+                await self._run_failure_diagnosis(run, step)
             else:
                 LOGGER.error(
                     "Run %s step %d/%d (type=%s) FAILED. selector=%r provided_selector=%r "
@@ -1707,6 +1457,7 @@ class AgentExecutor:
                 step.message = "Step failed"
                 step_trace["result"] = step.message
                 await self._capture_failure_screenshot(run.run_id, step)
+                await self._run_failure_diagnosis(run, step)
         finally:
             step.ended_at = utc_now()
             step_trace["status"] = step.status.value
@@ -2012,6 +1763,26 @@ class AgentExecutor:
     def _looks_like_popup_blocker(snapshot: dict[str, Any]) -> bool:
         text_excerpt = str(snapshot.get("text_excerpt", "")).lower()
         interactive_elements = snapshot.get("interactive_elements")
+
+        # If the page contains success/confirmation signals, do NOT treat it as a
+        # blocking popup — these are legitimate result pages the run needs to see.
+        success_signals = (
+            "successfully",
+            "success",
+            "confirmed",
+            "thank you",
+            "thanks",
+            "registered",
+            "account created",
+            "order placed",
+            "payment",
+            "submitted",
+            "sent",
+            "welcome",
+        )
+        if any(token in text_excerpt for token in success_signals):
+            return False
+
         popup_signals = (
             "cookie",
             "cookies",
@@ -2076,6 +1847,14 @@ class AgentExecutor:
         step.user_input_kind = None
         step.user_input_prompt = None
         step.requested_selector_target = None
+
+        # Reset any steps that were skipped due to this failure so they run
+        # after the retry succeeds.
+        for subsequent in run.steps[step.index + 1:]:
+            if subsequent.status == StepStatus.skipped:
+                subsequent.status = StepStatus.pending
+                subsequent.message = None
+                subsequent.error = None
 
         run.status = RunStatus.running
         run.finished_at = None
@@ -2299,6 +2078,67 @@ class AgentExecutor:
                 run_id,
                 step.index,
                 self._compact_error(exc),
+            )
+
+    async def _run_failure_diagnosis(self, run: "RunState", step: StepRuntimeState) -> None:
+        """
+        After a screenshot is captured, calls the brain vision endpoint to produce:
+          - step.failure_diagnosis: plain-English explanation of what went wrong
+          - step.failure_suggested_fix: one-sentence suggestion for fixing the step
+          - step.failure_selector_suggestions: LLM-suggested selectors to try manually
+        Failures here are non-fatal — diagnosis is best-effort.
+        """
+        if not step.failure_screenshot:
+            return
+        try:
+            screenshot_bytes = await self._files.read_bytes_artifact(run.run_id, step.failure_screenshot)
+            if not screenshot_bytes:
+                return
+            import base64
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
+
+            diagnosis_result = await self._brain.diagnose_failure(
+                step_type=step.type,
+                error_message=str(step.error or step.message or "unknown error"),
+                screenshot_base64=screenshot_b64,
+                goal=run.prompt or None,
+            )
+            step.failure_diagnosis = diagnosis_result.get("diagnosis") or None
+            step.failure_suggested_fix = diagnosis_result.get("suggested_fix") or None
+            LOGGER.info(
+                "Run %s step %d: failure diagnosis complete (%r)",
+                run.run_id, step.index + 1,
+                (step.failure_diagnosis or "")[:80],
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Run %s step %d: failure diagnosis failed (%s)",
+                run.run_id, step.index + 1, self._compact_error(exc),
+            )
+
+        # Selector suggestions — reuse existing suggest_selectors brain call
+        try:
+            raw_selector = str((step.input or {}).get("selector", "")).strip()
+            if raw_selector and step.type in {"click", "type", "select", "verify_text"}:
+                page_snapshot = await self._safe_page_snapshot() or {}
+                suggestions = await self._brain.suggest_selectors(
+                    step_type=step.type,
+                    failed_selector=raw_selector,
+                    error_message=str(step.error or step.message or "unknown error"),
+                    page=page_snapshot,
+                    text_hint=self._step_text_hint(step.input or {}),
+                    max_candidates=3,
+                )
+                if suggestions:
+                    step.failure_selector_suggestions = suggestions
+                    LOGGER.info(
+                        "Run %s step %d: %d selector suggestions generated",
+                        run.run_id, step.index + 1, len(suggestions),
+                    )
+        except Exception as exc:
+            LOGGER.warning(
+                "Run %s step %d: selector suggestions failed (%s)",
+                run.run_id, step.index + 1, self._compact_error(exc),
             )
 
     async def _verify_page_transition(
@@ -2614,6 +2454,9 @@ class AgentExecutor:
                         except Exception:
                             raise exc
                     raise
+
+            if until == "timeout":
+                return await self._smart_stabilization_wait(int(ms) if ms is not None else 500)
 
             return await self._browser.wait_for(
                 until=until,
@@ -4775,8 +4618,6 @@ class AgentExecutor:
 
         selector_lower = selector.lower()
         if step_type == "type":
-            if self._is_vitaone_domain(run_domain) and "email" in selector_lower:
-                keys.insert(0, "username")
             if "email" in selector_lower:
                 keys.insert(0, "email")
                 keys.append("username")
@@ -5331,11 +5172,7 @@ class AgentExecutor:
         target_offset_x: int | None = None,
         target_offset_y: int | None = None,
     ) -> str:
-        is_vitaone_domain = bool(run_domain and "vitaone.io" in run_domain.lower())
         target_seed = raw_target_selector
-        if is_vitaone_domain and "drag and drop fields here" in raw_target_selector.lower():
-            # Avoid stale placeholder target after first drop.
-            target_seed = "form_canvas_target"
 
         source_candidates = self._selector_candidates(
             raw_source_selector,
@@ -5384,27 +5221,6 @@ class AgentExecutor:
             source_pool.append(source_text_candidate)
         if target_placeholder_candidate and target_placeholder_candidate not in target_pool:
             target_pool.append(target_placeholder_candidate)
-
-        if is_vitaone_domain:
-            # Second+ drags should always target stable canvas selectors, not placeholder text.
-            target_pool = [
-                candidate
-                for candidate in target_pool
-                if "drag and drop fields here" not in candidate.lower()
-            ] or target_pool
-
-            # For email field, prefer direct text/has-text selectors over aria-label variants.
-            if "email" in raw_source_selector.lower():
-                email_prioritized: list[str] = []
-                for candidate in source_pool:
-                    lower_candidate = candidate.lower()
-                    if ":has-text('email')" in lower_candidate or "text=email" in lower_candidate:
-                        email_prioritized.append(candidate)
-                for candidate in source_pool:
-                    if candidate not in email_prioritized:
-                        email_prioritized.append(candidate)
-                source_pool = email_prioritized
-
         primary_targets = target_pool[:2] if len(target_pool) >= 2 else target_pool
         pair_set: set[tuple[str, str]] = set()
         pairs: list[tuple[str, str]] = []
@@ -5439,16 +5255,9 @@ class AgentExecutor:
         if not pairs:
             raise ValueError("No drag selector pairs available")
 
-        # VitaOne builder drag is sensitive; repeated multi-pair retries can cause
-        # duplicate drag actions even after a successful visual drop. Keep
-        # attempts bounded but allow more than one source candidate.
-        if is_vitaone_domain:
-            pairs = pairs[:3]
         trace_group["selector_pairs"] = [{"source": source, "target": target} for source, target in pairs]
 
         recovery_attempts = max(1, min(self._selector_recovery_attempts(), 2))
-        if is_vitaone_domain:
-            recovery_attempts = 1
         step_timeout = max(float(getattr(self._settings, "step_timeout_seconds", 60)), 5.0)
         # Drag/drop UIs often need a longer interaction window than click/type.
         step_budget_s = max(20.0, step_timeout * 0.90)
@@ -5537,83 +5346,6 @@ class AgentExecutor:
                                 "error": self._compact_error(exc),
                             },
                         )
-                        if is_vitaone_domain and timeout_like:
-                            drag_label = self._extract_drag_label_from_selector(
-                                raw_source_selector
-                            ) or self._extract_drag_label_from_selector(source_selector)
-                            if drag_label:
-                                try:
-                                    await asyncio.wait_for(
-                                        self._browser.verify_text(
-                                            selector="[data-row-id], [data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, div[role='dialog']",
-                                            match="contains",
-                                            value=drag_label,
-                                        ),
-                                        timeout=min(pair_timeout_s, 4.0),
-                                    )
-                                    self._remember_selector_success(
-                                        run_domain=run_domain,
-                                        step_type="drag",
-                                        raw_selector=raw_source_selector,
-                                        resolved_selector=source_selector,
-                                        text_hint=None,
-                                    )
-                                    self._remember_selector_success(
-                                        run_domain=run_domain,
-                                        step_type="drag",
-                                        raw_selector=raw_target_selector,
-                                        resolved_selector=target_selector,
-                                        text_hint=None,
-                                    )
-                                    trace_group["resolved_source_selector"] = source_selector
-                                    trace_group["resolved_target_selector"] = target_selector
-                                    trace_group["result"] = (
-                                        f"Dragged {source_selector} to {target_selector} "
-                                        "(executor post-timeout success check)"
-                                    )
-                                    return (
-                                        f"Dragged {source_selector} to {target_selector} "
-                                        "(executor post-timeout success check)"
-                                    )
-                                except Exception:
-                                    pass
-                            # VitaOne often opens an edit dialog immediately after a successful drop.
-                            # If label editor is visible, treat timeout as recovered success.
-                            try:
-                                await asyncio.wait_for(
-                                    self._browser.verify_text(
-                                        selector="div[role='dialog'], [role='dialog'] input[placeholder='Enter a label'], [role='dialog'] button:has-text('Save')",
-                                        match="contains",
-                                        value="Save",
-                                    ),
-                                    timeout=min(pair_timeout_s, 3.0),
-                                )
-                                self._remember_selector_success(
-                                    run_domain=run_domain,
-                                    step_type="drag",
-                                    raw_selector=raw_source_selector,
-                                    resolved_selector=source_selector,
-                                    text_hint=None,
-                                )
-                                self._remember_selector_success(
-                                    run_domain=run_domain,
-                                    step_type="drag",
-                                    raw_selector=raw_target_selector,
-                                    resolved_selector=target_selector,
-                                    text_hint=None,
-                                )
-                                trace_group["resolved_source_selector"] = source_selector
-                                trace_group["resolved_target_selector"] = target_selector
-                                trace_group["result"] = (
-                                    f"Dragged {source_selector} to {target_selector} "
-                                    "(executor dialog-visible success check)"
-                                )
-                                return (
-                                    f"Dragged {source_selector} to {target_selector} "
-                                    "(executor dialog-visible success check)"
-                                )
-                            except Exception:
-                                pass
                         attempts.append(
                             "pass "
                             f"{cycle + 1}: {source_selector} -> {target_selector} "
@@ -5654,6 +5386,53 @@ class AgentExecutor:
         if delay_ms <= 0:
             return
         await asyncio.sleep(delay_ms / 1000)
+
+    async def _smart_stabilization_wait(self, requested_ms: int) -> str:
+        """
+        Replace a fixed-ms timeout wait with DOM-readiness checks.
+
+        Strategy:
+        1. For short waits (≤ 3000ms): try wait_for_load_state('domcontentloaded').
+           - Returns immediately if the page is already loaded (SPA case, very common).
+           - Waits until DOMContentLoaded fires if a navigation just triggered.
+        2. After DOM ready: sleep a small settle buffer (100–200ms) so SPA
+           UI updates have time to apply before the next step runs.
+        3. Fall back to the original fixed sleep if load_state check fails or
+           the budget is large (likely an intentional long wait).
+        """
+        budget_ms = max(requested_ms, 100)
+        if budget_ms > 3000:
+            # Large waits are intentional pauses — don't second-guess them.
+            await self._browser.wait_for(until="timeout", ms=budget_ms)
+            return f"Waited {budget_ms}ms (intentional long wait)"
+
+        started = perf_counter()
+        dom_ready = False
+        try:
+            await asyncio.wait_for(
+                self._browser.wait_for(
+                    until="load_state",
+                    load_state="domcontentloaded",
+                    ms=budget_ms,
+                ),
+                timeout=max(budget_ms / 1000 + 0.5, 1.5),
+            )
+            dom_ready = True
+        except Exception:
+            pass
+
+        if dom_ready:
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            # Settle buffer: give SPA time to apply UI updates after DOM ready.
+            # Capped at 200ms; never more than the original requested budget.
+            settle_ms = max(100, min(budget_ms - elapsed_ms, 200))
+            if settle_ms > 0:
+                await asyncio.sleep(settle_ms / 1000)
+            return f"DOM ready + {settle_ms}ms settle (smart wait, budget={budget_ms}ms)"
+
+        # Fall back to original fixed sleep.
+        await self._browser.wait_for(until="timeout", ms=budget_ms)
+        return f"Waited {budget_ms}ms (timeout fallback)"
 
     def _should_retry_selector_error(self, error: Exception | None) -> bool:
         if error is None:
@@ -5791,6 +5570,55 @@ class AgentExecutor:
         if youtube_position is not None:
             variants.extend(self._youtube_result_candidates(youtube_position))
 
+        # ── ARIA-based expansion ──────────────────────────────────────────────
+        # 1. text=XXX selectors: expand into role + text combinations so the
+        #    executor tries semantic targets before falling back to recovery.
+        text_sel_match = re.fullmatch(r"text=(.+)", selector, re.IGNORECASE)
+        if text_sel_match:
+            text_val = text_sel_match.group(1).strip().strip("\"'")
+            esc = self._escape_playwright_text(text_val)
+            if step_type == "click":
+                variants.extend([
+                    f"button:has-text('{esc}')",
+                    f"[role='button']:has-text('{esc}')",
+                    f"a:has-text('{esc}')",
+                    f"[role='link']:has-text('{esc}')",
+                    f"[role='menuitem']:has-text('{esc}')",
+                    f"[role='tab']:has-text('{esc}')",
+                    f"[aria-label*='{esc}']",
+                    f"input[type='submit'][value*='{esc}']",
+                ])
+            elif step_type in {"type", "select"}:
+                variants.extend([
+                    f"input[aria-label='{esc}']",
+                    f"input[aria-label*='{esc}']",
+                    f"textarea[aria-label='{esc}']",
+                    f"[role='textbox'][aria-label*='{esc}']",
+                    f"input[placeholder='{esc}']",
+                    f"input[placeholder*='{esc}']",
+                    f"label:has-text('{esc}') + input",
+                    f"label:has-text('{esc}') ~ input",
+                ])
+
+        # 2. label:has-text('X') input selectors: also try aria-label and
+        #    placeholder attributes so any labelling pattern on the page works.
+        label_input_match = re.match(
+            r"label:has-text\((['\"])(.+?)\1\)\s*[~+]?\s*(?:input|textarea|select)",
+            selector,
+            re.IGNORECASE,
+        )
+        if label_input_match and step_type in {"type", "select"}:
+            label_text = label_input_match.group(2).strip()
+            esc = self._escape_playwright_text(label_text)
+            variants.extend([
+                f"input[aria-label='{esc}']",
+                f"input[aria-label*='{esc}']",
+                f"textarea[aria-label='{esc}']",
+                f"[role='textbox'][aria-label*='{esc}']",
+                f"input[placeholder='{esc}']",
+                f"input[placeholder*='{esc}']",
+            ])
+
         return self._dedupe(variants)
 
     def _id_case_variants(self, selector: str) -> list[str]:
@@ -5874,14 +5702,6 @@ class AgentExecutor:
                 return match.group(1)
         return None
 
-    @staticmethod
-    @staticmethod
-    def _is_vitaone_domain(run_domain: str | None) -> bool:
-        if not run_domain:
-            return False
-        domain = run_domain.strip().lower()
-        return "vitaone" in domain
-
     @classmethod
     def _merge_profile_candidates(
         cls,
@@ -5893,8 +5713,6 @@ class AgentExecutor:
         values: list[str] = []
         values.extend(selector_profile.get(key, []))
         values.extend(DEFAULT_SELECTOR_PROFILE.get(key, []))
-        if cls._is_vitaone_domain(run_domain):
-            values.extend(VITAONE_SELECTOR_PROFILE.get(key, []))
         deduped: list[str] = []
         seen: set[str] = set()
         for item in values:

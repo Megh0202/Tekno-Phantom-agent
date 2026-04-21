@@ -1,0 +1,75 @@
+/* Wrapper must be position:relative so the dropdown is anchored to the input. */
+.wrapper {
+  position: relative;
+  width: 100%;
+}
+
+/* The wrapper should not affect normal input sizing – let the input fill it. */
+.wrapper input,
+.wrapper textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Dropdown list */
+.dropdown {
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #151515;
+  border: 1px solid rgba(255, 179, 0, 0.35);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
+  max-height: 230px;
+  overflow-y: auto;
+  /* Smooth scrollbar in webkit */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 179, 0, 0.3) transparent;
+}
+
+.dropdown::-webkit-scrollbar {
+  width: 4px;
+}
+.dropdown::-webkit-scrollbar-thumb {
+  background: rgba(255, 179, 0, 0.3);
+  border-radius: 2px;
+}
+
+/* Individual suggestion row */
+.item {
+  padding: 7px 12px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: #cccccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 80ms ease, color 80ms ease;
+  user-select: none;
+}
+
+.item:hover {
+  background: rgba(255, 179, 0, 0.1);
+  color: #FFB300;
+}
+
+.item.active {
+  background: rgba(255, 179, 0, 0.16);
+  color: #FFB300;
+}
+
+/* Tiny "history" label at the top when the user hasn't typed anything */
+.hint {
+  padding: 4px 12px 2px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.3);
+  pointer-events: none;
+}

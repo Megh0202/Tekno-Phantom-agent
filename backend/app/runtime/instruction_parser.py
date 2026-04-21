@@ -41,125 +41,19 @@ def parse_structured_task_steps(
         return []
 
     steps: list[dict[str, Any]] = []
-    last_drag_source_selector: str | None = None
-    dropdown_options_mode = False
-    pending_option_type_choice: str | None = None
-    status_creation_mode = False
-    transition_creation_mode = False
-    current_transition_name: str | None = None
     for line in instruction_lines:
-        lower = line.lower()
-        normalized_lower = re.sub(r"[^a-z0-9\s]", " ", lower)
-        normalized_lower = re.sub(r"\s+", " ", normalized_lower).strip()
-        if "option type" in normalized_lower and (
-            "enter options manually" in normalized_lower or "options manually" in normalized_lower
-        ):
-            pending_option_type_choice = "enter options manually"
-            dropdown_options_mode = True
-
-        drag_field = _extract_drag_field_label(line)
-        if drag_field:
-            last_drag_source_selector = _drag_source_selector_from_label(drag_field)
-        elif any(token in lower for token in ("short answer", "short-answer", "short_answer")):
-            last_drag_source_selector = "{{selector.short_answer_source}}"
-        elif "email" in normalized_lower and "password" not in normalized_lower and "field" in normalized_lower:
-            last_drag_source_selector = "{{selector.email_field_source}}"
-
-        parsed = _parse_line(
-            line,
-            default_wait_ms=default_wait_ms,
-            structured_selector_wait_ms=structured_selector_wait_ms,
-            structured_options_wait_ms=structured_options_wait_ms,
-            current_transition_name=current_transition_name,
-        )
-        if (
-            isinstance(parsed, dict)
-            and parsed.get("type") == "drag"
-            and not drag_field
-            and last_drag_source_selector
-            and parsed.get("source_selector") == "{{selector.short_answer_source}}"
-        ):
-            parsed["source_selector"] = last_drag_source_selector
-
-        if parsed is None and _is_drag_drop_only_line(normalized_lower):
-            source_alias = last_drag_source_selector or "{{selector.short_answer_source}}"
-            parsed = {
-                "type": "drag",
-                "source_selector": source_alias,
-                "target_selector": "{{selector.form_canvas_target}}",
-            }
+        parsed = _parse_line(line, default_wait_ms=default_wait_ms)
         if parsed is None:
             continue
         parsed_steps = parsed if isinstance(parsed, list) else [parsed]
         for parsed_step in parsed_steps:
-            if (
-                dropdown_options_mode
-                and parsed_step.get("type") == "type"
-                and parsed_step.get("selector") == "{{selector.form_label}}"
-            ):
-                parsed_step["selector"] = "{{selector.dropdown_option_label}}"
-            if (
-                status_creation_mode
-                and parsed_step.get("type") == "click"
-                and parsed_step.get("selector") == "{{selector.save_form}}"
-            ):
-                parsed_step["selector"] = "{{selector.save_status}}"
-            if (
-                transition_creation_mode
-                and parsed_step.get("type") == "click"
-                and parsed_step.get("selector") == "{{selector.save_form}}"
-            ):
-                parsed_step["selector"] = "{{selector.save_transition}}"
-            if parsed_step.get("selector") in {
-                "{{selector.add_status_button}}",
-                "{{selector.new_status_tab}}",
-                "{{selector.status_name}}",
-                "{{selector.status_category_dropdown}}",
-            }:
-                status_creation_mode = True
-            if parsed_step.get("selector") in {
-                "{{selector.transition_button}}",
-                "{{selector.from_status_dropdown}}",
-                "{{selector.to_status_dropdown}}",
-                "{{selector.transition_name}}",
-            }:
-                transition_creation_mode = True
-            if parsed_step.get("type") == "type" and parsed_step.get("selector") == "{{selector.transition_name}}":
-                current_transition_name = str(parsed_step.get("text") or "") or current_transition_name
             steps.append(parsed_step)
-            if pending_option_type_choice and len(steps) < max_steps:
-                steps.append({"type": "click", "selector": "{{selector.dropdown_option_enter_manual}}"})
-                pending_option_type_choice = None
-            if (
-                dropdown_options_mode
-                and parsed_step.get("type") == "click"
-                and parsed_step.get("selector") == "{{selector.save_form}}"
-            ):
-                dropdown_options_mode = False
-            if (
-                status_creation_mode
-                and parsed_step.get("type") == "click"
-                and parsed_step.get("selector") == "{{selector.save_status}}"
-            ):
-                status_creation_mode = False
-            if (
-                transition_creation_mode
-                and parsed_step.get("type") == "click"
-                and parsed_step.get("selector") == "{{selector.save_transition}}"
-            ):
-                transition_creation_mode = False
             if len(steps) >= max_steps:
                 break
         if len(steps) >= max_steps:
             break
+
     steps = _enforce_login_sequence(steps, max_steps=max_steps, auto_login_wait_ms=auto_login_wait_ms)
-    steps = _enforce_workflow_navigation_sequence(steps, max_steps=max_steps)
-    steps = _enforce_form_create_sequence(
-        steps,
-        max_steps=max_steps,
-        auto_create_confirm_wait_ms=auto_create_confirm_wait_ms,
-    )
-    steps = _enforce_workflow_reopen_sequence(steps, max_steps=max_steps)
     return steps[:max_steps]
 
 
@@ -171,10 +65,6 @@ def _split_compound_actions(line: str) -> list[str]:
     text = line.strip()
     if not text:
         return []
-    lower = text.lower()
-    if "initial_state" in lower and "submitted_state" in lower and "transition name" in lower:
-        return [text]
-
     protected = text.replace("Drag and Drop", "Drag__AND__Drop").replace("drag and drop", "drag__AND__drop")
     chunks = re.split(r"\s+\band\b\s+", protected, flags=re.IGNORECASE)
     result: list[str] = []
@@ -183,15 +73,6 @@ def _split_compound_actions(line: str) -> list[str]:
         if normalized:
             result.append(normalized)
     return result
-
-
-def _is_drag_drop_only_line(lower: str) -> bool:
-    return (
-        "drag" in lower
-        and "drop" in lower
-        and "form" in lower
-        and all(token not in lower for token in ("short answer", "short-answer", "short_answer", "email field"))
-    )
 
 
 def _normalize_line(raw: str) -> str:
@@ -211,61 +92,22 @@ def _parse_line(
     line: str,
     *,
     default_wait_ms: int = 450,
-    structured_selector_wait_ms: int = 6000,
-    structured_options_wait_ms: int = 5000,
-    current_transition_name: str | None = None,
 ) -> dict[str, Any] | list[dict[str, Any]] | None:
     lower = line.lower()
-    quoted = _first_quoted(line)
     url = _extract_url(line)
 
     if url and (
         any(token in lower for token in (
             "launch", "open", "navigate", "visit", "go to",
-            # Handle truncated "launch" (e.g. "unch the application") and
-            # common synonyms so a single missing character doesn't drop the step.
             "application", "app", "browser", "url", "site", "page",
         ))
-        or lower.strip().startswith("http")   # bare URL line
+        or lower.strip().startswith("http")
     ):
         return {"type": "navigate", "url": url}
 
     named_field_entry = _parse_named_field_entry(line)
     if named_field_entry is not None:
         return named_field_entry
-
-    # ── Registration / account-creation field handlers ─────────────────────────
-    # These must come BEFORE the generic form-builder handlers below so that
-    # lines like "first name: John" or "enter phone +91 ..." go to the correct
-    # registration-form selector and not to the form-builder label selector.
-
-    if any(token in lower for token in (
-        "first name:", "firstname:", "first name -", "firstname -",
-        "enter first name", "type first name", "given name:", "given name -",
-    )) and not any(token in lower for token in ("label", "form label", "lable")):
-        value = _extract_field_value(line, "given name", "first name", "firstname")
-        if value:
-            return {"type": "type", "selector": "{{selector.first_name}}", "text": value, "clear_first": True}
-
-    if any(token in lower for token in (
-        "surname:", "surname -", "last name:", "last name -",
-        "lastname:", "lastname -", "enter surname", "type surname",
-        "enter last name", "type last name",
-    )):
-        value = _extract_field_value(line, "surname", "last name", "lastname")
-        if value:
-            return {"type": "type", "selector": "{{selector.surname}}", "text": value, "clear_first": True}
-
-    if any(token in lower for token in (
-        "phone:", "phone -", "phone number:", "phone number -",
-        "mobile:", "mobile -", "mobile number:", "mobile number -",
-        "contact number:", "contact number -",
-        "enter phone", "type phone", "enter mobile", "type mobile",
-        "enter phone number", "type phone number",
-    )):
-        value = _extract_field_value(line, "phone number", "mobile number", "contact number", "phone", "mobile")
-        if value:
-            return {"type": "type", "selector": "{{selector.phone}}", "text": value, "clear_first": True}
 
     if any(token in lower for token in ("enter email", "type email", "email -", "email:", "into email", "email field")):
         value = _after_delimiter(line)
@@ -280,199 +122,9 @@ def _parse_line(
         if value:
             return {"type": "type", "selector": "{{selector.password}}", "text": value, "clear_first": True}
 
-    if "create form" in lower and any(token in lower for token in ("visible", "available")):
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.create_form}}",
-            "ms": max(structured_selector_wait_ms, 0),
-        }
-
-    if "top left" in lower and any(token in lower for token in ("click", "corner")):
-        return {"type": "click", "selector": "{{selector.top_left_corner}}"}
-
-    if "top left corner" in lower and any(
-        token in lower for token in ("first name of the user", "user name", "username of the user", "profile name")
-    ):
-        return {"type": "click", "selector": "{{selector.top_left_corner}}"}
-
-    if "workflows" in lower and any(token in lower for token in ("change module", "change the module", "navigate", "open", "switch", "go to")):
-        return {"type": "click", "selector": "{{selector.workflows_module}}"}
-
-    if "create workflow" in lower and any(token in lower for token in ("visible", "available")):
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.create_workflow}}",
-            "ms": max(structured_selector_wait_ms, 0),
-        }
-
-    if "confirmation message" in lower and "workflow has been created" in lower:
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.add_status_button}}",
-            "ms": max(structured_selector_wait_ms, 0),
-        }
-
-    if "click" in lower and "create form" in lower:
-        return {"type": "click", "selector": "{{selector.create_form}}"}
-
-    if "click" in lower and "create workflow" in lower:
-        return {"type": "click", "selector": "{{selector.create_workflow}}"}
-
-    if "click" in lower and "add status" in lower:
-        return {"type": "click", "selector": "{{selector.add_status_button}}"}
-
-    if "click" in lower and "transition" in lower and "created" not in lower:
-        return {"type": "click", "selector": "{{selector.transition_button}}"}
-
-    if "click" in lower and "new status" in lower and "tab" in lower:
-        return {"type": "click", "selector": "{{selector.new_status_tab}}"}
-
-    if "form name" in lower and any(token in lower for token in ("enter", "type")):
-        value = _extract_form_name_value(line)
-        return {"type": "type", "selector": "{{selector.form_name}}", "text": value, "clear_first": True}
-
-    if "workflow name" in lower and any(token in lower for token in ("enter", "type")):
-        value = _extract_workflow_name_value(line)
-        return {"type": "type", "selector": "{{selector.workflow_name}}", "text": value, "clear_first": True}
-
-    if "description" in lower and any(token in lower for token in ("enter", "type")):
-        value = _extract_description_value(line) or "This is Automation testing workflow with test data"
-        return {"type": "type", "selector": "{{selector.workflow_description}}", "text": value, "clear_first": True}
-
-    if "status name" in lower and any(token in lower for token in ("enter", "type")):
-        value = _extract_status_name_value(line)
-        return {"type": "type", "selector": "{{selector.status_name}}", "text": value, "clear_first": True}
-
-    if "status category" in lower and any(token in lower for token in ("select", "choose")):
-        category = _extract_status_category_value(line) or "To Do"
-        return [
-            {"type": "click", "selector": "{{selector.status_category_dropdown}}"},
-            {"type": "click", "selector": _status_category_option_selector(category)},
-        ]
-
-    if "from status" in lower and any(token in lower for token in ("select", "choose")):
-        value = _extract_from_status_value(line) or "InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
-        return [
-            {"type": "click", "selector": "{{selector.from_status_dropdown}}"},
-            {"type": "click", "selector": _status_option_selector(value)},
-        ]
-
-    if "to status" in lower and any(token in lower for token in ("select", "choose")):
-        value = _extract_to_status_value(line) or "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"
-        return [
-            {"type": "click", "selector": "{{selector.to_status_dropdown}}"},
-            {"type": "click", "selector": _status_option_selector(value)},
-        ]
-
-    if "transition name" in lower and any(token in lower for token in ("enter", "type")):
-        value = _extract_transition_name_value(line)
-        return {"type": "type", "selector": "{{selector.transition_name}}", "text": value, "clear_first": True}
-
-    if "verify" in lower and "transition" in lower and "visible" in lower and "between" in lower:
-        transition_value = current_transition_name or _default_transition_value(text=line)
-        return [
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector("InitialState_{{NOW_YYYYMMDD_HHMMSS}}"), "ms": max(structured_selector_wait_ms, 0)},
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector("SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"), "ms": max(structured_selector_wait_ms, 0)},
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector(transition_value), "ms": max(structured_selector_wait_ms, 0)},
-        ]
-
-    if "workflow saved successfully" in lower:
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.workflow_saved_success}}",
-            "ms": max(structured_selector_wait_ms, 0),
-        }
-
-    if "workflow" in lower and "visible in the list" in lower and "table" in lower:
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": _text_selector("QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"),
-            "ms": max(structured_selector_wait_ms, 0),
-        }
-
-    if "click" in lower and "click on the workflow" in lower:
-        return {"type": "click", "selector": "{{selector.workflow_list_item}}", "text_hint": "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"}
-
-    if "click" in lower and "transition" in lower and "created" in lower:
-        transition_value = current_transition_name or _default_transition_value(text=line)
-        return {"type": "click", "selector": "{{selector.transition_canvas_label}}", "text_hint": transition_value}
-
-    if "verify" in lower and "initial_state" in lower and "submitted_state" in lower and "transition name" in lower:
-        transition_value = current_transition_name or _default_transition_value(text=line)
-        return [
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector("InitialState_{{NOW_YYYYMMDD_HHMMSS}}"), "ms": max(structured_selector_wait_ms, 0)},
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector("SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"), "ms": max(structured_selector_wait_ms, 0)},
-            {"type": "wait", "until": "selector_visible", "selector": _text_selector(transition_value), "ms": max(structured_selector_wait_ms, 0)},
-        ]
-
-    if "verify" in lower and "form" in lower and "top" in lower and "list" in lower:
-        return {
-            "type": "verify_text",
-            "selector": "{{selector.form_list_first_row}}",
-            "match": "contains",
-            "value": "QA_Form_",
-        }
-
-    if "click" in lower and "form name" in lower and "open" in lower and "editor" in lower:
-        return {"type": "click", "selector": "{{selector.form_list_first_name}}"}
-
-    if (
-        "verify" in lower
-        and "form editor" in lower
-        and "fields" in lower
-        and any(token in lower for token in ("required/optional", "required optional", "required and optional"))
-    ):
-        return [
-            {"type": "verify_text", "selector": "text=First Name", "match": "contains", "value": "First Name"},
-            {"type": "verify_text", "selector": "text=Email", "match": "contains", "value": "Email"},
-            {"type": "verify_text", "selector": "text=Dropdown", "match": "contains", "value": "Dropdown"},
-            {
-                "type": "verify_text",
-                "selector": ".form-row:has-text('First Name')",
-                "match": "contains",
-                "value": "Required",
-            },
-            {
-                "type": "verify_text",
-                "selector": ".form-row:has-text('Email')",
-                "match": "contains",
-                "value": "Required",
-            },
-            {
-                "type": "wait",
-                "until": "selector_hidden",
-                "selector": ".form-row:has-text('Dropdown'):has-text('Required')",
-                "ms": max(structured_selector_wait_ms, 0),
-            },
-        ]
-
-    if "verify" in lower and "form editor" in lower and "fields" in lower:
-        return {
-            "type": "verify_text",
-            "selector": "body",
-            "match": "contains",
-            "value": "First Name",
-        }
-
     generic_verify = _parse_generic_verify_text(line)
     if generic_verify is not None:
         return generic_verify
-
-    if "option type" in lower and any(token in lower for token in ("select", "choose", "value")):
-        return {"type": "click", "selector": "{{selector.dropdown_option_type_trigger}}"}
-
-    if any(token in lower for token in ("wait for options", "options label to display", "options to display")):
-        return {
-            "type": "wait",
-            "until": "selector_visible",
-            "selector": "{{selector.dropdown_options_section}}",
-            "ms": max(structured_options_wait_ms, 0),
-        }
 
     verify_contains = _parse_verify_contains_on_selector(line)
     if verify_contains is not None:
@@ -490,85 +142,11 @@ def _parse_line(
     if explicit_click is not None:
         return explicit_click
 
-    # "Select 'Short answer' field" (standalone, without drag/drop keywords)
-    # generates a click on the palette item — required by some form builders
-    # before the element can be dragged to the canvas.
-    if (
-        any(token in lower for token in ("select", "choose", "pick"))
-        and not any(token in lower for token in ("drag", "drop", "status", "category", "option type", "from status", "to status"))
-    ):
-        if any(token in lower for token in ("short answer", "short-answer", "short_answer")):
-            return {"type": "click", "selector": "{{selector.short_answer_source}}"}
-        if "email" in lower and "field" in lower and "password" not in lower:
-            return {"type": "click", "selector": "{{selector.email_field_source}}"}
-        # Generic quoted field name → click on a draggable palette item by text
-        field_label = _extract_drag_field_label(line)
-        if field_label:
-            escaped = field_label.replace('"', '\\"')
-            return {"type": "click", "selector": f"[draggable='true']:has-text(\"{escaped}\")"}
-
-    if "drag" in lower and (
-        "drop" in lower
-        or "into the form" in lower
-        or "into form" in lower
-        or "form canvas" in lower
-        or "into the canvas" in lower
-    ):
-        field_label = _extract_drag_field_label(line)
-        source_alias = _drag_source_selector_from_label(field_label)
-        return {
-            "type": "drag",
-            "source_selector": source_alias,
-            "target_selector": "{{selector.form_canvas_target}}",
-        }
-
-    # "label" / "lable" here refers to the form-BUILDER label field, NOT a
-    # registration-form "First Name" input.  "first name" was previously
-    # included here by mistake — it is now handled by the registration-field
-    # block above, so we intentionally exclude it from this condition.
-    if (
-        any(token in lower for token in ("label", "lable"))
-        and "first name" not in lower
-        and any(token in lower for token in ("enter", "type"))
-        and not ("value as" in lower and "option" in lower)
-    ):
-        value = quoted or "Label"
-        if "option" in lower:
-            return {"type": "type", "selector": "{{selector.dropdown_option_label}}", "text": value, "clear_first": True}
-        return {"type": "type", "selector": "{{selector.form_label}}", "text": value, "clear_first": True}
-
-    if any(token in lower for token in ("value as", "enter value", "type value")) and any(
-        token in lower for token in ("enter", "type", "value")
-    ):
-        value = quoted or _after_delimiter(line) or "A"
-        return {"type": "type", "selector": "{{selector.dropdown_option_value}}", "text": value, "clear_first": True}
-
-    if any(token in lower for token in ("+ icon", "plus icon", "click +", "click plus")):
-        return {"type": "click", "selector": "{{selector.dropdown_option_add_button}}"}
-
-    if any(token in lower for token in ("required checkbox", "required check box", "required")) and any(
-        token in lower for token in ("check", "select", "tick", "click")
-    ):
-        return {"type": "click", "selector": "{{selector.required_checkbox}}"}
-
-    if "click" in lower and "save" in lower and "workflow" in lower:
-        return {"type": "click", "selector": "{{selector.save_workflow}}"}
-
-    if "click" in lower and "save changes" in lower:
-        return {"type": "click", "selector": "{{selector.save_changes_button}}"}
-
-    if "click" in lower and "cancel" in lower:
-        return {"type": "click", "selector": "{{selector.cancel_button}}"}
-
-    if "click" in lower and "save" in lower:
-        return {"type": "click", "selector": "{{selector.save_form}}"}
-
     if "wait" in lower:
         wait_ms = _extract_wait_ms(line)
         return {"type": "wait", "until": "timeout", "ms": wait_ms or max(default_wait_ms, 0)}
 
     # General "Field Name: value" / "Field Name - value" handler for any application.
-    # Runs last so all specific handlers above take priority.
     general_field = _parse_general_field_value(line)
     if general_field is not None:
         return general_field
@@ -592,31 +170,18 @@ def _extract_url(text: str) -> str | None:
 
 
 def _after_delimiter(text: str) -> str | None:
-    # Accept " : ", " - " (spaces on both sides) OR ": " (no space before colon)
     parts = re.split(r"(?:\s[-:]\s|(?<=\S):\s)", text, maxsplit=1)
     value = parts[1].strip() if len(parts) > 1 else ""
     return value or _first_quoted(text)
 
 
 def _extract_field_value(line: str, *keywords: str) -> str | None:
-    """
-    Extract the value after a known field keyword.
-
-    Handles all common prompt formats:
-      - "first name: John"          (colon, no leading space)
-      - "first name - John"         (dash with spaces)
-      - "enter first name John"     (keyword then bare value)
-      - "first name John Doe"       (bare)
-      - "first name 'John'"         (quoted)
-    Returns None if no non-empty value is found.
-    """
     lower_line = line.lower()
     for kw in keywords:
         idx = lower_line.find(kw.lower())
         if idx < 0:
             continue
         after = line[idx + len(kw):].strip()
-        # Strip leading delimiters: colon, dash, equals, spaces
         after = re.sub(r"^[\s:=\-]+", "", after).strip()
         if after:
             return _strip_wrapping_quotes(after) or after
@@ -634,7 +199,6 @@ _FIELD_NAME_TO_SELECTOR: tuple[tuple[tuple[str, ...], str], ...] = (
     (("next",), "{{selector.next_button}}"),
 )
 
-# Words in a field name that indicate it's an action instruction, not a data field
 _GENERAL_FIELD_EXCLUSIONS: frozenset[str] = frozenset({
     "click", "navigate", "open", "visit", "go", "launch",
     "enter", "type", "fill", "verify", "assert", "check",
@@ -642,35 +206,24 @@ _GENERAL_FIELD_EXCLUSIONS: frozenset[str] = frozenset({
     "save", "submit", "cancel", "close", "scroll", "reload",
 })
 
-# Matches "Field Name: value" or "Field Name - value" for arbitrary web form fields
 _GENERAL_FIELD_ENTRY_RE = re.compile(
     r"^([A-Za-z][A-Za-z0-9 ']{1,60}?)(?::\s*|\s+-\s+)(.+?)\s*$"
 )
 
 
 def _auto_label_selector(field_name: str) -> str:
-    """Generate a best-guess CSS selector for an arbitrary form field by its label text."""
     clean = field_name.strip()
     esc = clean.replace("'", "\\'")
     return f"label:has-text('{esc}') input"
 
 
 def _field_name_to_profile_selector(raw: str) -> str | None:
-    """
-    Translate a plain-English field name (e.g. 'first name field') to a selector.
-
-    Returns a profile template like ``{{selector.first_name}}`` for known fields,
-    or a dynamic ``label:has-text(...)`` CSS selector for unknown fields so that
-    every field name produces a usable selector rather than being silently dropped.
-    """
     cleaned = re.sub(r"\b(field|input|box|area|textbox)\b", "", raw.lower()).strip(" .,")
     if not cleaned:
         return None
     for tokens, selector in _FIELD_NAME_TO_SELECTOR:
         if any(token == cleaned or cleaned.startswith(token) for token in tokens):
             return selector
-    # Unknown field — generate a dynamic label-based selector so the executor
-    # can attempt label:has-text() + keyword-based fallbacks.
     return _auto_label_selector(cleaned.title())
 
 
@@ -684,8 +237,6 @@ def _parse_explicit_type(line: str) -> dict[str, Any] | None:
     raw_sel_clean = _normalize_selector_text(raw_selector)
     if not text or not raw_sel_clean:
         return None
-    # Map plain English field names to profile selectors so "type John into first name field"
-    # doesn't land a raw text string as the CSS selector.
     if not _looks_like_explicit_selector(raw_sel_clean):
         profile_sel = _field_name_to_profile_selector(raw_sel_clean)
         if profile_sel:
@@ -727,38 +278,8 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
             return {"type": "click", "selector": "{{selector.create_account}}"}
         if lowered_target == "next" or "next button" in lowered_target:
             return {"type": "click", "selector": "{{selector.next_button}}"}
-        if "create form" in lowered_target:
-            return {"type": "click", "selector": "{{selector.create_form}}"}
-        if "create workflow" in lowered_target:
-            return {"type": "click", "selector": "{{selector.create_workflow}}"}
-        if "add status" in lowered_target:
-            return {"type": "click", "selector": "{{selector.add_status_button}}"}
-        if "transition" == lowered_target or "transition button" in lowered_target:
-            return {"type": "click", "selector": "{{selector.transition_button}}"}
-        if "new status" in lowered_target and "tab" in lowered_target:
-            return {"type": "click", "selector": "{{selector.new_status_tab}}"}
-        if "top left corner" in lowered_target:
-            return {"type": "click", "selector": "{{selector.top_left_corner}}"}
-        if "workflows" == lowered_target or "workflow module" in lowered_target or "workflows module" in lowered_target:
-            return {"type": "click", "selector": "{{selector.workflows_module}}"}
         if "back button" in lowered_target or lowered_target == "back":
             return {"type": "click", "selector": "{{selector.back_button}}"}
-        if "save" in lowered_target and "workflow" in lowered_target:
-            return {"type": "click", "selector": "{{selector.save_workflow}}"}
-        if "save changes" in lowered_target:
-            return {"type": "click", "selector": "{{selector.save_changes_button}}"}
-        if "save" in lowered_target and "transition" in lowered_target:
-            return {"type": "click", "selector": "{{selector.save_transition}}"}
-        if "save" in lowered_target and "status" in lowered_target:
-            return {"type": "click", "selector": "{{selector.save_status}}"}
-        if "cancel" in lowered_target:
-            return {"type": "click", "selector": "{{selector.cancel_button}}"}
-        if lowered_target == "cancel" or "cancel button" in lowered_target:
-            return {"type": "click", "selector": "{{selector.cancel_button}}"}
-        if "save" in lowered_target:
-            return {"type": "click", "selector": "{{selector.save_form}}"}
-        if "required" in lowered_target:
-            return {"type": "click", "selector": "{{selector.required_checkbox}}"}
         return {"type": "click", "selector": f"text={normalized_target}"}
 
     return {"type": "click", "selector": normalized_target}
@@ -788,7 +309,8 @@ def _parse_generic_verify_text(line: str) -> dict[str, Any] | None:
         return None
 
     if any(token in lower for token in ("message", "msg", "text", "visible", "shown", "displayed", "appears")):
-        return {"type": "verify_text", "selector": _text_selector(value), "match": "contains", "value": value}
+        escaped = value.replace('"', '\\"')
+        return {"type": "verify_text", "selector": f"text={escaped}", "match": "contains", "value": value}
 
     return None
 
@@ -819,8 +341,6 @@ def _parse_named_field_entry(line: str) -> dict[str, Any] | None:
     for tokens, selector in selector_map:
         if any(token in field_label for token in tokens):
             return {"type": "type", "selector": selector, "text": value, "clear_first": True}
-    # Unknown field — generate a dynamic label-based selector so the step is
-    # not silently dropped (was returning None before this change).
     selector = _auto_label_selector(field_label.strip().title())
     return {"type": "type", "selector": selector, "text": value, "clear_first": True}
 
@@ -828,11 +348,7 @@ def _parse_named_field_entry(line: str) -> dict[str, Any] | None:
 def _parse_general_field_value(line: str) -> dict[str, Any] | None:
     """
     Handle ``"Field Name: value"`` and ``"Field Name - value"`` patterns for
-    arbitrary web form fields on **any** application.
-
-    This is the last-resort parser — it runs after all specific handlers, so it
-    only fires for field names that weren't already matched (e.g. "Organization
-    Name", "Date of Birth", "Zip Code", "Country", etc.).
+    arbitrary web form fields on any application.
     """
     match = _GENERAL_FIELD_ENTRY_RE.match(line.strip())
     if not match:
@@ -842,15 +358,12 @@ def _parse_general_field_value(line: str) -> dict[str, Any] | None:
     if not field_name or not value or len(field_name) < 2:
         return None
     lower_field = field_name.lower()
-    # Exclude lines whose "field" portion contains action/instruction keywords
     field_words = set(re.findall(r"[a-z]+", lower_field))
     if field_words & _GENERAL_FIELD_EXCLUSIONS:
         return None
-    # Exclude lines where the value looks like a URL or another instruction
     lower_value = value.lower().lstrip()
     if lower_value.startswith(("http", "www.", "click", "navigate", "open", "//")):
         return None
-    # Map known fields to profile selectors; unknown fields get a dynamic selector
     profile_sel = _field_name_to_profile_selector(field_name)
     if profile_sel:
         return {"type": "type", "selector": profile_sel, "text": value, "clear_first": True}
@@ -886,151 +399,6 @@ def _looks_like_explicit_selector(value: str) -> bool:
     if value.startswith("//"):
         return True
     return any(token in value for token in ("#", ".", "[", "]", ">", "=", ":", "/"))
-
-
-def _extract_form_name_value(text: str) -> str:
-    quoted = _first_quoted(text)
-    if quoted:
-        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("{{timestamp}}", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("{timestamp}", "{{NOW_YYYYMMDD_HHMMSS}}")
-        return normalized
-    return "QA_Form_{{NOW_YYYYMMDD_HHMMSS}}"
-
-
-def _extract_workflow_name_value(text: str) -> str:
-    quoted = _first_quoted(text)
-    if quoted:
-        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("current date time stamp", "{{NOW_YYYYMMDD_HHMMSS}}")
-        return normalized
-    lowered = text.lower()
-    if "qa_auto_workflow" in lowered:
-        return "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"
-    return "QA_Auto_Workflow_{{NOW_YYYYMMDD_HHMMSS}}"
-
-
-def _extract_description_value(text: str) -> str | None:
-    quoted = _first_quoted(text)
-    if quoted:
-        return quoted
-    return _after_delimiter(text)
-
-
-def _extract_status_name_value(text: str) -> str:
-    quoted = _first_quoted(text)
-    if quoted:
-        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("current date time stamp", "{{NOW_YYYYMMDD_HHMMSS}}")
-        return normalized
-    lowered = text.lower()
-    if "submittedstate" in lowered:
-        return "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"
-    return "InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
-
-
-def _extract_status_category_value(text: str) -> str | None:
-    quoted = _first_quoted(text)
-    if quoted:
-        return quoted
-    return _after_delimiter(text)
-
-
-def _status_category_option_selector(category: str) -> str:
-    token = category.strip().lower()
-    if token == "to do":
-        return "{{selector.status_category_todo}}"
-    escaped = category.replace('"', '\\"')
-    return f"text={escaped}"
-
-
-def _extract_from_status_value(text: str) -> str | None:
-    lowered = text.lower()
-    if "start" in lowered:
-        return "START"
-    if "initialstate" in lowered:
-        return "InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
-    quoted = _first_quoted(text)
-    if quoted and quoted.strip().lower() not in {"from status", "to status"}:
-        return quoted
-    return _after_delimiter(text)
-
-
-def _extract_to_status_value(text: str) -> str | None:
-    lowered = text.lower()
-    if "submittedstate" in lowered:
-        return "SubmittedState_{{NOW_YYYYMMDD_HHMMSS}}"
-    if "initialstate" in lowered:
-        return "InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
-    if "start" in lowered:
-        return "START"
-    quoted = _first_quoted(text)
-    if quoted and quoted.strip().lower() not in {"from status", "to status"}:
-        return quoted
-    return _after_delimiter(text)
-
-
-def _extract_transition_name_value(text: str) -> str:
-    quoted = _first_quoted(text)
-    if quoted:
-        normalized = quoted.replace("<timestamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("<time stamp>", "{{NOW_YYYYMMDD_HHMMSS}}")
-        normalized = normalized.replace("current date time stamp", "{{NOW_YYYYMMDD_HHMMSS}}")
-        return normalized
-    return _default_transition_value(text=text)
-
-
-def _status_option_selector(value: str) -> str:
-    escaped = value.replace('"', '\\"')
-    return f"div[role='listbox'] [role='option']:has-text(\"{escaped}\")"
-
-
-def _text_selector(value: str) -> str:
-    escaped = value.replace('"', '\\"')
-    return f"text={escaped}"
-
-
-def _default_transition_value(text: str) -> str:
-    if "tranisition" in text.lower():
-        return "Tranisition_{{NOW_YYYYMMDD_HHMMSS}}"
-    return "Transition_{{NOW_YYYYMMDD_HHMMSS}}"
-
-
-def _extract_drag_field_label(text: str) -> str | None:
-    quoted = _first_quoted(text)
-    if quoted and "field" not in quoted.lower():
-        return quoted.strip()
-
-    lower = text.lower()
-    if "drag" not in lower:
-        return None
-
-    match = re.search(
-        r"(?:select|choose|pick|drag)\s+([a-z0-9][a-z0-9 _-]{1,60}?)\s+field\b",
-        lower,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        label = match.group(1).strip(" -_")
-        if label:
-            return " ".join(part.capitalize() for part in label.split())
-    return None
-
-
-def _drag_source_selector_from_label(label: str | None) -> str:
-    token = (label or "").strip()
-    lower = token.lower()
-    if not token:
-        return "{{selector.short_answer_source}}"
-    if any(mark in lower for mark in ("short answer", "short-answer", "short_answer")):
-        return "{{selector.short_answer_source}}"
-    if lower == "email":
-        return "{{selector.email_field_source}}"
-    escaped = token.replace('"', '\\"')
-    return f"[draggable='true']:has-text(\"{escaped}\")"
 
 
 def _enforce_login_sequence(
@@ -1078,207 +446,17 @@ def _enforce_login_sequence(
                 for token in ("create_account", "sign up")
             )
         )
-        or (
-            step.get("type") == "verify_text"
-            and any(
-                token in str(step.get("value", "")).lower()
-                for token in ("registered", "registration", "create account", "account created")
-            )
-        )
         for step in steps
     )
     if has_registration_flow:
         return steps
 
-    post_password_steps = steps[password_index + 1 :]
-    needs_authenticated_flow = any(
-        (
-            step.get("type") == "verify_text" and "create form" in str(step.get("value", "")).lower()
-        )
-        or (
-            step.get("type") == "click"
-            and any(
-                token in str(step.get("selector", "")).lower()
-                for token in (
-                    "create_form",
-                    "create_workflow",
-                    "workflows_module",
-                    "top_left_corner",
-                    "add_status_button",
-                    "transition_button",
-                    "save_changes_button",
-                    "workflow_list_item",
-                )
-            )
-        )
-        or (
-            step.get("type") == "wait"
-            and any(
-                token in str(step.get("selector", "")).lower()
-                for token in (
-                    "create_form",
-                    "create_workflow",
-                    "add_status_button",
-                    "workflow_saved_success",
-                )
-            )
-        )
-        for step in post_password_steps
-    ) or bool(post_password_steps)
-
-    if not (has_email_type and has_password_type and needs_authenticated_flow) or has_login_click:
+    post_password_steps = steps[password_index + 1:]
+    if not (has_email_type and has_password_type and post_password_steps) or has_login_click:
         return steps
 
     login_sequence = [{"type": "click", "selector": "{{selector.login_button}}"}]
     if auto_login_wait_ms > 0:
         login_sequence.append({"type": "wait", "until": "timeout", "ms": auto_login_wait_ms})
-    merged = steps[: password_index + 1] + login_sequence + steps[password_index + 1 :]
-    return merged[:max_steps]
-
-
-def _enforce_form_create_sequence(
-    steps: list[dict[str, Any]],
-    *,
-    max_steps: int,
-    auto_create_confirm_wait_ms: int = 450,
-) -> list[dict[str, Any]]:
-    """
-    Ensure we click "Create" after entering form name before builder interactions.
-    """
-    form_name_index = next(
-        (
-            idx
-            for idx, step in enumerate(steps)
-            if step.get("type") == "type" and str(step.get("selector", "")).strip() == "{{selector.form_name}}"
-        ),
-        None,
-    )
-    if form_name_index is None:
-        return steps
-
-    # If there is no builder work afterwards, do nothing.
-    has_builder_work_after = any(
-        (
-            step.get("type") == "drag"
-            or (step.get("type") == "type" and "form_label" in str(step.get("selector", "")))
-            or (step.get("type") == "click" and "required" in str(step.get("selector", "")).lower())
-        )
-        for step in steps[form_name_index + 1 :]
-    )
-    if not has_builder_work_after:
-        return steps
-
-    # If a create click already exists after form name typing, keep as-is.
-    has_create_click_after = any(
-        step.get("type") == "click"
-        and "create_form" in str(step.get("selector", "")).lower()
-        for step in steps[form_name_index + 1 :]
-    )
-    if has_create_click_after:
-        return steps
-
-    create_sequence: list[dict[str, Any]] = [
-        {"type": "click", "selector": "{{selector.create_form_confirm}}"},
-    ]
-    if auto_create_confirm_wait_ms > 0:
-        # Wait for the form builder canvas to become visible before attempting
-        # any builder interactions (drag, label type, checkbox clicks).
-        # selector_visible is more reliable than a fixed timeout.
-        create_sequence.append(
-            {
-                "type": "wait",
-                "until": "selector_visible",
-                "selector": "{{selector.form_canvas_target}}",
-                "ms": max(auto_create_confirm_wait_ms * 6, 2500),
-            }
-        )
-    merged = steps[: form_name_index + 1] + create_sequence + steps[form_name_index + 1 :]
-    return merged[:max_steps]
-
-
-def _enforce_workflow_navigation_sequence(
-    steps: list[dict[str, Any]],
-    *,
-    max_steps: int,
-) -> list[dict[str, Any]]:
-    workflow_click_index = next(
-        (
-            idx
-            for idx, step in enumerate(steps)
-            if step.get("type") == "click" and str(step.get("selector", "")).strip() == "{{selector.workflows_module}}"
-        ),
-        None,
-    )
-    if workflow_click_index is None:
-        return steps
-
-    has_top_left_before = any(
-        step.get("type") == "click" and str(step.get("selector", "")).strip() == "{{selector.top_left_corner}}"
-        for step in steps[:workflow_click_index]
-    )
-    if has_top_left_before:
-        return steps
-
-    merged = (
-        steps[:workflow_click_index]
-        + [
-            {"type": "click", "selector": "{{selector.top_left_corner}}"},
-            {"type": "wait", "until": "timeout", "ms": 400},
-        ]
-        + steps[workflow_click_index:]
-    )
-    return merged[:max_steps]
-
-
-def _enforce_workflow_reopen_sequence(
-    steps: list[dict[str, Any]],
-    *,
-    max_steps: int,
-) -> list[dict[str, Any]]:
-    workflow_click_index = next(
-        (
-            idx
-            for idx, step in enumerate(steps)
-            if step.get("type") == "click" and str(step.get("selector", "")).strip() == "{{selector.workflow_list_item}}"
-        ),
-        None,
-    )
-    if workflow_click_index is None:
-        return steps
-
-    has_editor_wait_after = any(
-        step.get("type") == "wait" and str(step.get("selector", "")).strip() == "{{selector.save_changes_button}}"
-        for step in steps[workflow_click_index + 1 : workflow_click_index + 4]
-    )
-    if has_editor_wait_after:
-        merged = list(steps)
-    else:
-        merged = (
-            steps[: workflow_click_index + 1]
-            + [{"type": "wait", "until": "selector_visible", "selector": "{{selector.save_changes_button}}", "ms": 12000}]
-            + steps[workflow_click_index + 1 :]
-        )
-
-    transition_click_index = next(
-        (
-            idx
-            for idx, step in enumerate(merged)
-            if idx > workflow_click_index
-            and step.get("type") == "click"
-            and str(step.get("selector", "")).strip() == "{{selector.transition_canvas_label}}"
-        ),
-        None,
-    )
-    if transition_click_index is not None:
-        has_canvas_wait = any(
-            step.get("type") == "wait"
-            and str(step.get("selector", "")).strip() == "text=InitialState_{{NOW_YYYYMMDD_HHMMSS}}"
-            for step in merged[max(workflow_click_index + 1, transition_click_index - 2) : transition_click_index]
-        )
-        if not has_canvas_wait:
-            merged = (
-                merged[:transition_click_index]
-                + [{"type": "wait", "until": "selector_visible", "selector": "text=InitialState_{{NOW_YYYYMMDD_HHMMSS}}", "ms": 15000}]
-                + merged[transition_click_index:]
-            )
+    merged = steps[: password_index + 1] + login_sequence + steps[password_index + 1:]
     return merged[:max_steps]

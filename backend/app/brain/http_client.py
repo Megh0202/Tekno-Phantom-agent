@@ -122,6 +122,55 @@ class HttpBrainClient:
             "action": None,
         }
 
+    async def human_steps(self, prompt: str, max_steps: int) -> list[str]:
+        LOGGER.info("Brain: human_steps request (max_steps=%d prompt=%r)", max_steps, prompt[:80])
+        url = f"{self._base_url}/v1/human-steps"
+        body = {"prompt": prompt, "max_steps": max_steps}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(url, json=body, headers=self._headers())
+                response.raise_for_status()
+            payload = response.json()
+            steps = payload.get("steps", [])
+            if isinstance(steps, list) and steps:
+                return [str(s).strip() for s in steps if str(s).strip()]
+        except Exception as exc:
+            LOGGER.warning("Brain: human_steps request failed: %s", exc)
+        return []
+
+    async def diagnose_failure(
+        self,
+        *,
+        step_type: str,
+        error_message: str,
+        screenshot_base64: str,
+        goal: str | None = None,
+    ) -> dict[str, str]:
+        LOGGER.info("Brain: diagnose_failure request step_type=%s", step_type)
+        url = f"{self._base_url}/v1/diagnose-failure"
+        body: dict[str, Any] = {
+            "step_type": step_type,
+            "error_message": error_message,
+            "screenshot_base64": screenshot_base64,
+        }
+        if goal:
+            body["goal"] = goal
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(url, json=body, headers=self._headers())
+                response.raise_for_status()
+            payload = response.json()
+            return {
+                "diagnosis": str(payload.get("diagnosis", "")).strip(),
+                "suggested_fix": str(payload.get("suggested_fix", "")).strip(),
+            }
+        except Exception as exc:
+            LOGGER.warning("Brain: diagnose_failure request failed: %s", exc)
+            return {
+                "diagnosis": f"Step '{step_type}' failed: {error_message}",
+                "suggested_fix": "Check the selector or page state and retry.",
+            }
+
     async def suggest_selectors(
         self,
         *,

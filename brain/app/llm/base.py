@@ -27,3 +27,13 @@ class LLMProvider(Protocol):
         max_candidates: int = 3,
     ) -> list[str]:
         ...
+
+    async def diagnose_failure(
+        self,
+        *,
+        step_type: str,
+        error_message: str,
+        screenshot_base64: str,
+        goal: str | None = None,
+    ) -> dict[str, str]:
+        ...
