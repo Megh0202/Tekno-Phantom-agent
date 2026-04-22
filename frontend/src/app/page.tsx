@@ -663,13 +663,14 @@ export default function Home() {
     task: string,
     testData: JsonObject,
     selectorProfile: JsonObject,
+    maxSteps?: number,
   ): Promise<PlanGenerateResponse> {
     const planResponse = await fetch(`${API_BASE_URL}/api/plan`, {
       method: "POST",
       headers: buildApiHeaders({ json: true, adminToken: ADMIN_API_TOKEN }),
       body: JSON.stringify({
         task,
-        max_steps: config?.max_steps_per_run ?? DEFAULT_MAX_STEPS,
+        max_steps: maxSteps ?? config?.max_steps_per_run ?? DEFAULT_MAX_STEPS,
         test_data: testData,
         selector_profile: selectorProfile,
       }),
@@ -1146,7 +1147,6 @@ export default function Home() {
 
     try {
       setIsSubmitting(true);
-      setGeneratedStepLines(null);
 
       let plan: PlanGenerateResponse;
       if (importedPlan) {
@@ -1156,8 +1156,17 @@ export default function Home() {
           steps: importedPlan.steps,
         };
       } else {
+        // If the user has generated (and possibly edited) steps, use those as the
+        // planning task so execution matches what was previewed. Pass the exact
+        // step count so the LLM cannot truncate or merge items.
         const useCachedPlan = SHOW_ADVANCED_INPUTS && Boolean(planIsFresh && planPreview);
-        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(task, testData, selectorProfile);
+        const planTask = generatedStepLines && generatedStepLines.length > 0
+          ? generatedStepLines.map((s, i) => `${i + 1}. ${s}`).join("\n")
+          : task;
+        const planMaxSteps = generatedStepLines && generatedStepLines.length > 0
+          ? generatedStepLines.length
+          : undefined;
+        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(planTask, testData, selectorProfile, planMaxSteps);
         if (!useCachedPlan) {
           setPlanPreview(plan);
           setPlanSignature(buildPlanSignature(prompt, testDataInput, selectorProfileInput));
@@ -2306,7 +2315,10 @@ export default function Home() {
 
               <div className={styles.timeline}>
                 {currentRun.steps.map((step) => {
-                  const genLabel = generatedStepLines?.[step.index] ?? null;
+                  // Only use generated step labels when the counts match exactly,
+                  // otherwise indices are misaligned and wrong labels appear on steps.
+                  const labelsMatch = generatedStepLines && generatedStepLines.length === currentRun.steps.length;
+                  const genLabel = labelsMatch ? (generatedStepLines[step.index] ?? null) : null;
                   return (
                   <article key={step.step_id} className={styles.timelineItem}>
                     <div className={styles.timelineTop}>

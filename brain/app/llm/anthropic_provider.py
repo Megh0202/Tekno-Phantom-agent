@@ -56,20 +56,40 @@ class AnthropicProvider:
         if not self._settings.anthropic_api_key:
             return fallback_plan(task, max_steps)
 
-        text = await self._messages_call(
-            system=(
+        _is_numbered_list = bool(re.match(r"^\s*1\.", task.strip()))
+        if _is_numbered_list:
+            system_msg = (
+                "You are a web automation planner. "
+                "Return ONLY strict JSON with keys: run_name, start_url, steps. "
+                "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                "The task is a numbered list of steps confirmed by the user. "
+                "Convert EVERY numbered item into exactly one execution step in the same order. "
+                "Do NOT skip, merge, reorder, or add extra steps."
+            )
+            user_msg = (
+                f"Convert each numbered item below into exactly one execution step.\n"
+                f"Total steps MUST equal {max_steps}.\n\n"
+                f"{task}\n\n"
+                "Return compact valid JSON only."
+            )
+        else:
+            system_msg = (
                 "You are a web automation planner. "
                 "Return ONLY strict JSON with keys: run_name, start_url, steps. "
                 "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
                 "Cover every explicit user instruction in order when max_steps allows. "
                 "Do not invent extra requirements not present in the task."
-            ),
-            user=(
+            )
+            user_msg = (
                 f"Task: {task}\n"
                 f"Max steps: {max_steps}\n"
                 "Return compact valid JSON only."
-            ),
-            max_tokens=1800,
+            )
+
+        text = await self._messages_call(
+            system=system_msg,
+            user=user_msg,
+            max_tokens=2000,
         )
 
         if text.strip():
