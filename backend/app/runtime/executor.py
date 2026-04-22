@@ -482,12 +482,6 @@ class AgentExecutor:
         for step in run.steps:
             if step.status in {StepStatus.completed, StepStatus.skipped}:
                 continue
-            # A failed step that is NOT pending means it already ran and failed
-            # on a previous execution (or a retry) — do not re-run it, just
-            # carry the failure flag forward so the run result reflects it.
-            if step.status == StepStatus.failed:
-                has_step_failure = True
-                continue
             if step.status == StepStatus.waiting_for_input:
                 run.status = RunStatus.waiting_for_input
                 self._run_store.persist(run)
@@ -536,11 +530,6 @@ class AgentExecutor:
                     continue
                 self._mark_remaining_steps_skipped(run, step.index + 1)
                 break
-        # Recompute from actual step statuses — a previously-failed step that was
-        # recovered and completed should not keep the run marked as failed.
-        has_step_failure = any(
-            s.status == StepStatus.failed for s in run.steps
-        )
         return has_step_failure
 
     async def _execute_autonomous_run(self, run: RunState) -> bool:
@@ -1418,16 +1407,12 @@ class AgentExecutor:
                 "grounded selection failed",
                 "all selector candidates failed",
                 "does not contain a matching live element",
-                "probe: element not visible",
             )
-            _has_locator_failure = any(p in _error_lower for p in _LOCATOR_FAILURE_PHRASES)
-            # Pure outcome failure: only outcome phrases, no locator phrases → element
-            # was found and clicked but page didn't react. A selector won't help.
-            # Mixed: outcome phrase AND many probe misses → the right element doesn't
-            # exist yet (page not transitioned); user needs to provide a working selector.
-            _probe_miss_count = _error_lower.count("probe: element not visible")
-            _is_element_not_found = _has_locator_failure and (
-                not _is_outcome_failure or _probe_miss_count >= 2
+            # "all selector candidates failed" paired with an outcome failure means the
+            # click happened but the outcome check failed — not a locator problem.
+            _is_element_not_found = (
+                not _is_outcome_failure
+                and any(p in _error_lower for p in _LOCATOR_FAILURE_PHRASES)
             )
             _has_selector_field = any(
                 isinstance((step.input or {}).get(f), str)
@@ -1438,6 +1423,7 @@ class AgentExecutor:
                 step.type in _INTERACTION_STEP_TYPES
                 and _has_selector_field
                 and _is_element_not_found
+                and step.provided_selector is None
             ):
                 LOGGER.warning(
                     "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
@@ -1445,7 +1431,6 @@ class AgentExecutor:
                     step.input.get("selector", ""), root_cause_str,
                 )
                 step.status = StepStatus.waiting_for_input
-                step.provided_selector = None  # clear so next retry is treated as fresh
                 step.error = compact
                 step.message = "Waiting for selector help"
                 step.user_input_kind = "selector"
@@ -3432,7 +3417,7 @@ class AgentExecutor:
                 # All other candidates fail fast to avoid wasting time.
                 if step_type in {"click", "type", "select"}:
                     is_grounded = bool(grounded_selector and selector == grounded_selector)
-                    probe_timeout_ms = 5000 if is_grounded else 3000
+                    probe_timeout_ms = 3000 if is_grounded else 1500
                     probe_ok = await self._probe_element_present(selector, timeout_ms=probe_timeout_ms)
                     if not probe_ok:
                         compact_error = f"probe: element not visible within {probe_timeout_ms} ms"
@@ -5896,7 +5881,7 @@ class AgentExecutor:
 
     @staticmethod
     def _should_request_selector_help(step: StepRuntimeState, exc: Exception) -> bool:
-        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
+        if step.type not in {"click", "type", "select", "wait", "handle_popup"}:
             return False
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return step.type == "click"
