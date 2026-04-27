@@ -291,6 +291,8 @@ class AgentExecutor:
         self._selector_memory = selector_memory_store
         self._run_context: dict[str, dict[str, Any]] = {}
         self._viewer_shutdown_tasks: dict[str, asyncio.Task[None]] = {}
+        self._selector_timeout_tasks: dict[str, asyncio.Task[None]] = {}
+        self._execution_locks: dict[str, asyncio.Lock] = {}
         self._step_trace_context: ContextVar[dict[str, Any] | None] = ContextVar(
             "executor_step_trace_context",
             default=None,
@@ -301,6 +303,14 @@ class AgentExecutor:
         )
 
     async def execute(self, run_id: str) -> None:
+        # Ensure only one execution runs at a time per run to prevent race conditions
+        # when multiple background tasks (e.g. rapid selector submissions) call execute().
+        if run_id not in self._execution_locks:
+            self._execution_locks[run_id] = asyncio.Lock()
+        async with self._execution_locks[run_id]:
+            await self._execute_locked(run_id)
+
+    async def _execute_locked(self, run_id: str) -> None:
         run = self._run_store.get(run_id)
         if not run:
             LOGGER.warning("execute() called for unknown run_id=%s", run_id)
@@ -389,6 +399,10 @@ class AgentExecutor:
                 else:
                     await self._browser.close_run(run_id)
                     self._mark_run_viewer_closed(run)
+            elif run.status == RunStatus.waiting_for_input:
+                # Browser is kept open — start a 40-second countdown.
+                # If the user doesn't provide a selector in time, close the run.
+                self._schedule_selector_input_timeout(run.run_id)
             self._run_store.persist(run)
             if not preserve_browser_session:
                 await self._write_html_report(run)
@@ -444,6 +458,65 @@ class AgentExecutor:
         run = self._run_store.get(run_id)
         if run is None:
             return
+        self._mark_run_viewer_closed(run)
+        self._run_store.persist(run)
+
+    _SELECTOR_INPUT_TIMEOUT_SECONDS: int = 40
+
+    def _schedule_selector_input_timeout(self, run_id: str) -> None:
+        existing = self._selector_timeout_tasks.pop(run_id, None)
+        if existing is not None:
+            existing.cancel()
+
+        task = asyncio.create_task(self._expire_selector_input_wait(run_id))
+        self._selector_timeout_tasks[run_id] = task
+
+        def _cleanup(completed: asyncio.Task[None]) -> None:
+            current = self._selector_timeout_tasks.get(run_id)
+            if current is completed:
+                self._selector_timeout_tasks.pop(run_id, None)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.result()
+
+        task.add_done_callback(_cleanup)
+        LOGGER.info("Run %s: selector input timeout scheduled (%ds)", run_id, self._SELECTOR_INPUT_TIMEOUT_SECONDS)
+
+    def _cancel_selector_input_timeout(self, run_id: str) -> None:
+        task = self._selector_timeout_tasks.pop(run_id, None)
+        if task is not None:
+            task.cancel()
+            LOGGER.info("Run %s: selector input timeout cancelled (user provided selector)", run_id)
+
+    async def _expire_selector_input_wait(self, run_id: str) -> None:
+        await asyncio.sleep(self._SELECTOR_INPUT_TIMEOUT_SECONDS)
+        run = self._run_store.get(run_id)
+        if run is None or run.status != RunStatus.waiting_for_input:
+            return
+        LOGGER.info("Run %s: selector input timed out after %ds — closing run", run_id, self._SELECTOR_INPUT_TIMEOUT_SECONDS)
+
+        # Mark the stuck waiting_for_input step as failed, and all pending
+        # steps after it as skipped so the run ends in a clean consistent state.
+        for step in run.steps:
+            if step.status == StepStatus.waiting_for_input:
+                step.status = StepStatus.failed
+                step.error = "Selector input timed out — no selector was provided in time."
+                step.message = "Step failed: browser closed after waiting 40s for selector input."
+                step.user_input_kind = None
+                step.user_input_prompt = None
+                step.requested_selector_target = None
+            elif step.status == StepStatus.pending:
+                step.status = StepStatus.skipped
+                step.message = "Skipped because the run timed out waiting for selector input."
+
+        run.status = RunStatus.failed
+        run.summary = (
+            "Run finished: no selector was provided within the allowed time. "
+            "The browser has been closed."
+        )
+        run.finished_at = utc_now()
+        self._run_store.persist(run)
+        await self._write_html_report(run)
+        await self._browser.close_run(run_id)
         self._mark_run_viewer_closed(run)
         self._run_store.persist(run)
 
@@ -1386,7 +1459,7 @@ class AgentExecutor:
             # Hard-exclude post-action outcome failures — these mean the element WAS
             # found and actioned but the page reacted unexpectedly (form rejected,
             # navigation didn't happen). A different selector won't fix those.
-            _INTERACTION_STEP_TYPES = {"click", "type", "select", "drag", "handle_popup"}
+            _INTERACTION_STEP_TYPES = {"click", "type", "select", "drag", "handle_popup", "verify_text"}
             _error_lower = compact.lower()
             # Hard excludes take priority — even if a "not found" phrase also appears
             _OUTCOME_FAILURE_PHRASES = (
@@ -1414,6 +1487,10 @@ class AgentExecutor:
                 not _is_outcome_failure
                 and any(p in _error_lower for p in _LOCATOR_FAILURE_PHRASES)
             )
+            # verify_text failures mean the selector pointed at the wrong element —
+            # treat as a selector problem so the user can correct it.
+            if step.type == "verify_text" and "text verification failed" in _error_lower:
+                _is_element_not_found = True
             _has_selector_field = any(
                 isinstance((step.input or {}).get(f), str)
                 and bool((step.input or {}).get(f, "").strip())
@@ -1423,13 +1500,13 @@ class AgentExecutor:
                 step.type in _INTERACTION_STEP_TYPES
                 and _has_selector_field
                 and _is_element_not_found
-                and step.provided_selector is None
             ):
                 LOGGER.warning(
                     "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
                     run.run_id, step.index + 1, len(run.steps), step.type,
                     step.input.get("selector", ""), root_cause_str,
                 )
+                step.provided_selector = None  # clear so each retry is treated as fresh
                 step.status = StepStatus.waiting_for_input
                 step.error = compact
                 step.message = "Waiting for selector help"
@@ -1818,8 +1895,14 @@ class AgentExecutor:
         step = next((item for item in run.steps if item.step_id == step_id), None)
         if not step:
             return None
+        if run.status in {RunStatus.completed, RunStatus.cancelled}:
+            raise ValueError("This run has already finished and cannot be resumed.")
+        if run.status == RunStatus.failed and run.summary and "no selector was provided within" in run.summary:
+            raise ValueError("Run finished: the selector input window has expired.")
         if not self._can_accept_manual_selector_hint(step):
             raise ValueError("This step is not eligible for selector input recovery.")
+        # User provided a selector in time — cancel the auto-close countdown.
+        self._cancel_selector_input_timeout(run.run_id)
 
         requested_selector = self._requested_selector_target(step)
         if not requested_selector:
@@ -1847,6 +1930,21 @@ class AgentExecutor:
         step.user_input_kind = None
         step.user_input_prompt = None
         step.requested_selector_target = None
+
+        # If the user is providing a selector for step N but earlier steps are still
+        # in waiting_for_input, execution would break on those and never reach step N.
+        # Mark them skipped (not failed) so the execution loop bypasses them cleanly.
+        for earlier in run.steps[:step.index]:
+            if earlier.status == StepStatus.waiting_for_input:
+                LOGGER.info(
+                    "Run %s: step %d superseded by selector retry on step %d — marking skipped",
+                    run_id, earlier.index + 1, step.index + 1,
+                )
+                earlier.status = StepStatus.skipped
+                earlier.user_input_kind = None
+                earlier.user_input_prompt = None
+                earlier.requested_selector_target = None
+                earlier.message = "Skipped — user chose to retry a later step."
 
         # Reset any steps that were skipped due to this failure so they run
         # after the retry succeeds.
@@ -2500,6 +2598,16 @@ class AgentExecutor:
                 else:
                     value = str(run_context.get("last_typed_value", value))
             if selector.strip().lower() in {"h1", "h2", "h3", "body", "main", "form"}:
+                return await self._browser.verify_text(
+                    selector=selector,
+                    match=match,
+                    value=value,
+                )
+            # When the user has manually provided a selector, use it directly
+            # without the fallback pipeline. The pipeline generates its own candidates
+            # and ignores the user's choice, causing an infinite re-pause loop.
+            # _selector_help_original is only set when apply_manual_selector_hint() runs.
+            if raw_step.get("_selector_help_original"):
                 return await self._browser.verify_text(
                     selector=selector,
                     match=match,
@@ -5881,7 +5989,7 @@ class AgentExecutor:
 
     @staticmethod
     def _should_request_selector_help(step: StepRuntimeState, exc: Exception) -> bool:
-        if step.type not in {"click", "type", "select", "wait", "handle_popup"}:
+        if step.type not in {"click", "type", "select", "wait", "handle_popup", "verify_text"}:
             return False
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return step.type == "click"

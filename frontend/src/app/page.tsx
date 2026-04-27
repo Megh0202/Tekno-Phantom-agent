@@ -332,6 +332,7 @@ export default function Home() {
   const [currentRunSourceTestCaseId, setCurrentRunSourceTestCaseId] = useState<string | null>(null);
   const [selectorFixInputs, setSelectorFixInputs] = useState<Record<string, string>>({});
   const [selectorFixBusyByStepId, setSelectorFixBusyByStepId] = useState<Record<string, boolean>>({});
+  const [selectorInputCountdown, setSelectorInputCountdown] = useState<number | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [requestInfo, setRequestInfo] = useState<string | null>(null);
   const [planPreview, setPlanPreview] = useState<PlanGenerateResponse | null>(null);
@@ -633,6 +634,26 @@ export default function Home() {
       clearInterval(interval);
     };
   }, [currentRun]);
+
+  // Countdown timer shown while run is waiting for selector input (40s window)
+  useEffect(() => {
+    if (!currentRun || currentRun.status !== "waiting_for_input") {
+      setSelectorInputCountdown(null);
+      return;
+    }
+    const TIMEOUT_SECONDS = 40;
+    setSelectorInputCountdown(TIMEOUT_SECONDS);
+    const interval = setInterval(() => {
+      setSelectorInputCountdown((prev) => {
+        if (prev === null || prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [currentRun?.run_id, currentRun?.status]);
 
   useEffect(() => {
     if (!currentSuiteRun) return;
@@ -1146,6 +1167,8 @@ export default function Home() {
 
     try {
       setIsSubmitting(true);
+      // Capture generated steps BEFORE clearing them — needed for planning
+      const capturedStepLines = generatedStepLines;
       setGeneratedStepLines(null);
 
       let plan: PlanGenerateResponse;
@@ -1157,7 +1180,13 @@ export default function Home() {
         };
       } else {
         const useCachedPlan = SHOW_ADVANCED_INPUTS && Boolean(planIsFresh && planPreview);
-        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(task, testData, selectorProfile);
+        // If generated steps exist, pass them as a numbered list directly.
+        // The backend structured parser converts them to actions without calling Claude.
+        // Falls back to Claude only if the parser can't handle them.
+        const planTask = capturedStepLines && capturedStepLines.length > 0
+          ? capturedStepLines.map((s, i) => `${i + 1}. ${s}`).join("\n")
+          : task;
+        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(planTask, testData, selectorProfile);
         if (!useCachedPlan) {
           setPlanPreview(plan);
           setPlanSignature(buildPlanSignature(prompt, testDataInput, selectorProfileInput));
@@ -2367,7 +2396,14 @@ export default function Home() {
                     ) : null}
                     {(step.status === "failed" || step.status === "waiting_for_input") && editableSelectorField(step) ? (
                       <div className={styles.selectorFixBox}>
-                        <p className={styles.selectorFixTitle}>Selector Recovery</p>
+                        <p className={styles.selectorFixTitle}>
+                          Selector Recovery
+                          {selectorInputCountdown !== null && selectorInputCountdown > 0 && (
+                            <span style={{ marginLeft: 8, fontSize: "0.8em", color: selectorInputCountdown <= 10 ? "#ff4444" : "#f5a623", fontWeight: "normal" }}>
+                              — browser closes in {selectorInputCountdown}s
+                            </span>
+                          )}
+                        </p>
                         <p className={styles.selectorFixHint}>
                           {step.user_input_prompt
                             ? step.user_input_prompt

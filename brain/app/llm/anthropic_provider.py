@@ -27,10 +27,10 @@ class AnthropicProvider:
     def _normalize_model_name(model_name: str) -> str:
         normalized = (model_name or "").strip()
         aliases = {
-            "claude-sonnet-4.6": "claude-sonnet-4-5-20250929",
-            "sonnet-4.6": "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4.6": "claude-sonnet-4-6",
+            "sonnet-4.6": "claude-sonnet-4-6",
         }
-        return aliases.get(normalized.lower(), normalized or "claude-sonnet-4-5-20250929")
+        return aliases.get(normalized.lower(), normalized or "claude-sonnet-4-6")
 
     async def healthcheck(self) -> dict[str, str]:
         if not self._settings.anthropic_api_key:

@@ -842,7 +842,13 @@ def build_app() -> FastAPI:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
-    app = FastAPI(title="Tekno Phantom Agent API", version="0.1.0")
+    app = FastAPI(
+        title="Tekno Phantom Agent API",
+        version="0.1.0",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        redoc_url="/api/redoc",
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -1276,11 +1282,55 @@ def build_app() -> FastAPI:
         LOGGER.info("Run created from test case: %s (test_case_id=%s)", run.run_id, test_case_id)
         return run
 
+    async def _execute_and_persist_selector(run_id: str, step_id: str) -> None:
+        """Background task: resume execution after selector recovery, then persist
+        the working selector back to the test case's selector_profile."""
+        try:
+            await executor.execute(run_id)
+        except Exception:
+            LOGGER.exception("Background selector execution failed for run %s", run_id)
+            return
+
+        refreshed = run_store.get(run_id)
+        if refreshed is None:
+            return
+
+        succeeded_step = next((s for s in refreshed.steps if s.step_id == step_id), None)
+        if (
+            succeeded_step is not None
+            and succeeded_step.status == StepStatus.completed
+            and succeeded_step.provided_selector
+            and refreshed.source_test_case_id
+        ):
+            recovery_key = succeeded_step.input.get("_recovery_selector_key") if succeeded_step.input else None
+            if isinstance(recovery_key, str) and recovery_key.strip():
+                template_match = re.fullmatch(r"\{\{\s*selector\.([a-zA-Z0-9_.-]+)\s*\}\}", recovery_key.strip())
+                profile_key = template_match.group(1) if template_match else None
+                if not profile_key:
+                    profile_key = re.sub(r"[^a-z0-9_]", "_", recovery_key.strip().lower())[:64].strip("_") or None
+                if profile_key:
+                    test_case = test_case_store.get(refreshed.source_test_case_id)
+                    if test_case is not None:
+                        updated_profile = dict(test_case.selector_profile)
+                        existing_selectors = list(updated_profile.get(profile_key, []))
+                        new_selector = succeeded_step.provided_selector
+                        if new_selector not in existing_selectors:
+                            updated_profile[profile_key] = [new_selector] + existing_selectors
+                            test_case.selector_profile = updated_profile
+                            test_case_store.persist(test_case)
+                            LOGGER.info(
+                                "Persisted user selector %r to test case %s selector_profile[%r]",
+                                new_selector,
+                                refreshed.source_test_case_id,
+                                profile_key,
+                            )
+
     @app.post("/api/runs/{run_id}/steps/{step_id}/selector", response_model=RunState)
     async def submit_step_selector(
         run_id: str,
         step_id: str,
         request: StepSelectorHelpRequest,
+        background_tasks: BackgroundTasks,
         actor: User | None = Depends(require_api_access),
     ) -> RunState:
         existing = run_store.get(run_id)
@@ -1292,48 +1342,10 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if run is None:
             raise HTTPException(status_code=404, detail="Run or step not found")
-        await executor.execute(run.run_id)
-        refreshed = run_store.get(run.run_id)
-        if refreshed is None:
-            raise HTTPException(status_code=404, detail="Run not found after selector retry")
-
-        # Persist the working user-provided selector to the test case's selector_profile
-        # so future runs automatically use it without requiring manual input.
-        succeeded_step = next((s for s in refreshed.steps if s.step_id == step_id), None)
-        if (
-            succeeded_step is not None
-            and succeeded_step.status == StepStatus.completed
-            and succeeded_step.provided_selector
-            and refreshed.source_test_case_id
-        ):
-            recovery_key = succeeded_step.input.get("_recovery_selector_key") if succeeded_step.input else None
-            if isinstance(recovery_key, str) and recovery_key.strip():
-                # Extract profile key if selector was a template like {{selector.KEY}}
-                template_match = re.fullmatch(r"\{\{\s*selector\.([a-zA-Z0-9_.-]+)\s*\}\}", recovery_key.strip())
-                profile_key = template_match.group(1) if template_match else None
-
-                if not profile_key:
-                    # For non-template selectors, normalise the raw selector text into a key
-                    profile_key = re.sub(r"[^a-z0-9_]", "_", recovery_key.strip().lower())[:64].strip("_") or None
-
-                if profile_key:
-                    test_case = test_case_store.get(refreshed.source_test_case_id)
-                    if test_case is not None:
-                        updated_profile = dict(test_case.selector_profile)
-                        existing = list(updated_profile.get(profile_key, []))
-                        new_selector = succeeded_step.provided_selector
-                        if new_selector not in existing:
-                            updated_profile[profile_key] = [new_selector] + existing
-                            test_case.selector_profile = updated_profile
-                            test_case_store.persist(test_case)
-                            LOGGER.info(
-                                "Persisted user selector %r to test case %s selector_profile[%r]",
-                                new_selector,
-                                refreshed.source_test_case_id,
-                                profile_key,
-                            )
-
-        return refreshed
+        # Fire-and-forget: execution runs in background so the HTTP response
+        # returns immediately, avoiding 504 gateway timeouts on long-running steps.
+        background_tasks.add_task(_execute_and_persist_selector, run.run_id, step_id)
+        return run_store.get(run.run_id) or run
 
     @app.post("/api/plan", response_model=PlanGenerateResponse)
     async def generate_plan(

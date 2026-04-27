@@ -7,7 +7,10 @@ from typing import Any
 _LINE_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).:-]\s*|[-*]\s+)")
 _URL_RE = re.compile(r"https?://[^\s\"'>]+", flags=re.IGNORECASE)
 _QUOTED_RE = re.compile(r"['\"]([^'\"]+)['\"]")
-_TYPE_INTO_RE = re.compile(r"^\s*(?:type|enter)\s+(.+?)\s+into\s+(.+?)\s*$", flags=re.IGNORECASE)
+_TYPE_INTO_RE = re.compile(
+    r"^\s*(?:type|enter|input|fill)\s+(.+?)\s+(?:into|in(?:\s+the)?)\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
 _DRAG_TO_RE = re.compile(r"^\s*drag\s+(.+?)\s+to\s+(.+?)\s*$", flags=re.IGNORECASE)
 _CLICK_RE = re.compile(r"^\s*click(?:\s+on)?\s+(.+?)\s*$", flags=re.IGNORECASE)
 _WAIT_MS_RE = re.compile(r"\bwait\s+(\d{2,6})\s*ms\b", flags=re.IGNORECASE)
@@ -267,6 +270,9 @@ def _parse_explicit_click(line: str) -> dict[str, Any] | None:
     if not raw_target:
         return None
     normalized_target = _strip_wrapping_quotes(raw_target).strip()
+    # Strip leading "the " added by LLM-generated steps (e.g. "Click the Submit button")
+    if normalized_target.lower().startswith("the "):
+        normalized_target = normalized_target[4:].strip()
     lowered_target = normalized_target.lower()
 
     if not _looks_like_explicit_selector(normalized_target):

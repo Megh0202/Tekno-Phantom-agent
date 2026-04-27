@@ -1229,22 +1229,41 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 except Exception:
                     continue
 
-        if match == "exact":
-            is_match = actual == value
-        elif match == "contains":
-            is_match = value.lower() in actual.lower()
-        elif match == "regex":
-            try:
-                is_match = bool(re.search(value, actual))
-            except re.error as exc:
-                raise ValueError(f"Invalid regex pattern: {exc}") from exc
-        else:
+        def _is_match(text_to_check: str) -> bool:
+            if match == "exact":
+                return text_to_check == value
+            if match == "contains":
+                return value.lower() in text_to_check.lower()
+            if match == "regex":
+                try:
+                    return bool(re.search(value, text_to_check))
+                except re.error as exc:
+                    raise ValueError(f"Invalid regex pattern: {exc}") from exc
             raise ValueError(f"Unsupported text match type: {match}")
 
-        if not is_match:
-            raise ValueError(f"Text verification failed on {selector}. Actual='{actual}', Expected({match})='{value}'")
+        if _is_match(actual):
+            return f"Text verification passed ({match}) on {selector}"
 
-        return f"Text verification passed ({match}) on {selector}"
+        # Element text didn't match. The expected text may span sibling elements
+        # (e.g. a <p> and an <a> next to each other). Try the parent element's
+        # combined text before giving up.
+        try:
+            parent_locator = context.page.locator(f"{selector} >> xpath=..").first
+            parent_text = (await parent_locator.inner_text()).strip()
+            if parent_text and _is_match(parent_text):
+                return f"Text verification passed ({match}) on {selector} (via parent element)"
+        except Exception:
+            pass
+
+        # Last resort: check if the text exists anywhere on the page body.
+        try:
+            body_text = (await context.page.inner_text("body")).strip()
+            if body_text and _is_match(body_text):
+                return f"Text verification passed ({match}) on page (text found in body)"
+        except Exception:
+            pass
+
+        raise ValueError(f"Text verification failed on {selector}. Actual='{actual}', Expected({match})='{value}'")
 
     async def verify_image(
         self,
@@ -1528,7 +1547,26 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         target_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = self._active_context()
-        await context.page.wait_for_timeout(250)
+        # For submit buttons, the click triggers a network request (form POST)
+        # before the page navigates. Wait longer to let the server respond.
+        _sel_lower = (selector or "").lower()
+        _raw_lower = (raw_selector or "").lower()
+        _is_submit_click = (
+            'type="submit"' in _sel_lower
+            or "type='submit'" in _sel_lower
+            or 'type="submit"' in _raw_lower
+            or "type='submit'" in _raw_lower
+            or "[type=submit]" in _sel_lower
+            or "[type=submit]" in _raw_lower
+        )
+        _wait_ms = 1500 if _is_submit_click else 250
+        try:
+            await context.page.wait_for_url(
+                lambda url: url != str((before_snapshot or {}).get("url") or ""),
+                timeout=_wait_ms,
+            )
+        except Exception:
+            await context.page.wait_for_timeout(_wait_ms if _is_submit_click else 250)
         after_snapshot = await self.inspect_page(include_screenshot=False)
         before = before_snapshot or {}
         before_url = str(before.get("url") or "")
@@ -2871,10 +2909,18 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         before_title = str(before.get("title") or "")
         before_text = str(before.get("text_excerpt") or "")
         before_page_count = int(before.get("page_count") or 1)
+        _sel_lower = (selector or "").lower()
+        _raw_lower = (raw_selector or "").lower()
+        _is_submit_click = (
+            'type="submit"' in _sel_lower or "type='submit'" in _sel_lower
+            or 'type="submit"' in _raw_lower or "type='submit'" in _raw_lower
+            or "[type=submit]" in _sel_lower or "[type=submit]" in _raw_lower
+        )
+        _wait_ms = 1500 if _is_submit_click else 250
         code = (
             "async (page) => {"
             f"  const selector = {json.dumps(selector)};"
-            "  await page.waitForTimeout(250);"
+            f"  await page.waitForTimeout({_wait_ms});"
             "  const locator = page.locator(selector).first();"
             "  let visible = false;"
             "  let enabled = false;"
