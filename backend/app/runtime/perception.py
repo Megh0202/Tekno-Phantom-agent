@@ -306,6 +306,20 @@ def score_element(
     if tokens and matched == 0:
         return 0
 
+    # Phrase match bonus: all tokens appearing together in order in element text
+    # is a much stronger signal than individual token matches.
+    if len(tokens) >= 2:
+        phrase = " ".join(tokens)
+        if phrase in el_text_lower:
+            score += 22   # exact phrase in visible text — very high signal
+        elif phrase in haystack:
+            score += 10   # phrase found elsewhere in element attributes
+
+    # Exact full-text match: element text IS the intent (e.g. button says "Sign In"
+    # and intent is "sign in") — strongest possible signal.
+    if tokens and el_text_lower == " ".join(tokens):
+        score += 30
+
     # Step type alignment bonuses / penalties
     if step_type == "click":
         if el.tag in {"button", "a"}:
@@ -345,9 +359,9 @@ def score_element(
 # Confidence thresholds
 # ---------------------------------------------------------------------------
 
-_MIN_SCORE = 22        # minimum score to be a candidate at all
-_HIGH_GAP = 20         # score gap between top-1 and top-2 for "high" confidence
-_UNIQUE_GAP = 30       # score gap for "unique" (only 1 element is above threshold)
+_MIN_SCORE = 18        # minimum score to be a candidate at all
+_HIGH_GAP = 15         # score gap between top-1 and top-2 for "high" confidence
+_UNIQUE_GAP = 22       # score gap for "unique" (only 1 element is above threshold)
 
 
 # ---------------------------------------------------------------------------

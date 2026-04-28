@@ -397,6 +397,8 @@ class AgentExecutor:
                     run.viewer_status = "closing_soon"
                     self._schedule_viewer_shutdown(run.run_id)
                 else:
+                    # Brief pause so user can see the final state before the browser closes.
+                    await asyncio.sleep(5)
                     await self._browser.close_run(run_id)
                     self._mark_run_viewer_closed(run)
             elif run.status == RunStatus.waiting_for_input:
@@ -492,33 +494,29 @@ class AgentExecutor:
         run = self._run_store.get(run_id)
         if run is None or run.status != RunStatus.waiting_for_input:
             return
-        LOGGER.info("Run %s: selector input timed out after %ds — closing run", run_id, self._SELECTOR_INPUT_TIMEOUT_SECONDS)
+        LOGGER.info(
+            "Run %s: selector input timed out after %ds — marking step failed, continuing remaining steps",
+            run_id, self._SELECTOR_INPUT_TIMEOUT_SECONDS,
+        )
 
-        # Mark the stuck waiting_for_input step as failed, and all pending
-        # steps after it as skipped so the run ends in a clean consistent state.
+        # Mark the stuck waiting_for_input step as failed.
+        # The execution loop in _execute_existing_steps is polling for this
+        # status change and will continue to the next step automatically.
         for step in run.steps:
             if step.status == StepStatus.waiting_for_input:
                 step.status = StepStatus.failed
                 step.error = "Selector input timed out — no selector was provided in time."
-                step.message = "Step failed: browser closed after waiting 40s for selector input."
+                step.message = "Step failed: no selector provided within 40s. Continuing remaining steps."
                 step.user_input_kind = None
                 step.user_input_prompt = None
                 step.requested_selector_target = None
-            elif step.status == StepStatus.pending:
-                step.status = StepStatus.skipped
-                step.message = "Skipped because the run timed out waiting for selector input."
 
-        run.status = RunStatus.failed
-        run.summary = (
-            "Run finished: no selector was provided within the allowed time. "
-            "The browser has been closed."
+        run.status = RunStatus.running
+        self._run_store.persist(run)
+        LOGGER.info(
+            "Run %s: selector timeout — step marked failed, execution loop will continue remaining steps",
+            run_id,
         )
-        run.finished_at = utc_now()
-        self._run_store.persist(run)
-        await self._write_html_report(run)
-        await self._browser.close_run(run_id)
-        self._mark_run_viewer_closed(run)
-        self._run_store.persist(run)
 
     async def _record_startup_navigation_failure(self, run: RunState, exc: Exception) -> None:
         compact = self._compact_error(exc)
@@ -556,10 +554,38 @@ class AgentExecutor:
             if step.status in {StepStatus.completed, StepStatus.skipped}:
                 continue
             if step.status == StepStatus.waiting_for_input:
-                run.status = RunStatus.waiting_for_input
-                self._run_store.persist(run)
-                has_step_failure = True
-                break
+                if self._should_continue_after_failure(run):
+                    # In continue mode: wait here until the timeout resolves the
+                    # step (marks it failed) or the user provides a selector.
+                    # Poll every second for up to the full timeout window.
+                    run.status = RunStatus.waiting_for_input
+                    self._run_store.persist(run)
+                    for _ in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
+                        await asyncio.sleep(1)
+                        fresh = self._run_store.get(run.run_id)
+                        if fresh is None:
+                            break
+                        current_status = next(
+                            (s.status for s in fresh.steps if s.step_id == step.step_id),
+                            step.status,
+                        )
+                        if current_status != StepStatus.waiting_for_input:
+                            # Step resolved — sync state and continue loop
+                            for s in fresh.steps:
+                                for rs in run.steps:
+                                    if rs.step_id == s.step_id:
+                                        rs.status = s.status
+                                        rs.message = s.message
+                                        rs.error = s.error
+                            break
+                    has_step_failure = True
+                    run.status = RunStatus.running
+                    continue
+                else:
+                    run.status = RunStatus.waiting_for_input
+                    self._run_store.persist(run)
+                    has_step_failure = True
+                    break
             if self._run_store.is_cancelled(run.run_id):
                 step.status = StepStatus.cancelled
                 run.status = RunStatus.cancelled
@@ -584,10 +610,67 @@ class AgentExecutor:
             )
             self._run_store.persist(run)
             if step.status == StepStatus.waiting_for_input:
-                run.status = RunStatus.waiting_for_input
-                self._run_store.persist(run)
-                has_step_failure = True
-                break
+                if self._should_continue_after_failure(run):
+                    run.status = RunStatus.waiting_for_input
+                    self._run_store.persist(run)
+                    # Start the 40s external timeout task so it marks the step
+                    # failed in the store — the polling loop below detects that.
+                    self._schedule_selector_input_timeout(run.run_id)
+                    user_provided_selector = False
+                    for _ in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
+                        await asyncio.sleep(1)
+                        fresh = self._run_store.get(run.run_id)
+                        if fresh is None:
+                            break
+                        fresh_step = next(
+                            (s for s in fresh.steps if s.step_id == step.step_id),
+                            None,
+                        )
+                        if fresh_step is None:
+                            break
+                        if fresh_step.status == StepStatus.pending:
+                            # User provided a selector — sync updated input and re-execute
+                            step.status = fresh_step.status
+                            step.input = dict(fresh_step.input or step.input)
+                            step.message = fresh_step.message
+                            step.error = fresh_step.error
+                            step.provided_selector = fresh_step.provided_selector
+                            user_provided_selector = True
+                            break
+                        if fresh_step.status != StepStatus.waiting_for_input:
+                            # Timeout fired — step marked failed, move on
+                            step.status = fresh_step.status
+                            step.message = fresh_step.message
+                            step.error = fresh_step.error
+                            break
+                    # Cancel external timeout task (may have already fired — that's fine).
+                    self._cancel_selector_input_timeout(run.run_id)
+                    # Safety net: if polling exhausted without any status change,
+                    # mark step failed explicitly so it doesn't stay waiting_for_input.
+                    if not user_provided_selector and step.status == StepStatus.waiting_for_input:
+                        step.status = StepStatus.failed
+                        step.error = "Selector input timed out — no selector was provided in time."
+                        step.message = "Step failed: no selector provided within 40s."
+                        step.user_input_kind = None
+                        step.user_input_prompt = None
+                        step.requested_selector_target = None
+                        self._run_store.persist(run)
+                    run.status = RunStatus.running
+                    if user_provided_selector:
+                        # Re-execute the step with the user's selector
+                        LOGGER.info(
+                            "Run %s: step %d — user provided selector, retrying",
+                            run.run_id, step.index + 1,
+                        )
+                        await self._execute_step(run, step)
+                        self._run_store.persist(run)
+                    has_step_failure = True
+                    continue
+                else:
+                    run.status = RunStatus.waiting_for_input
+                    self._run_store.persist(run)
+                    has_step_failure = True
+                    break
             if step.status == StepStatus.failed:
                 has_step_failure = True
                 # Agentic fallback: only attempt when failure_mode is "continue".
@@ -1134,7 +1217,38 @@ class AgentExecutor:
             )
             return result
         except Exception as exc:
-            trace_group["final_error"] = self._compact_error(exc)
+            compact = self._compact_error(exc)
+            # "Execution context was destroyed" means the click triggered a page
+            # navigation — the action SUCCEEDED.  Don't escalate; return success.
+            if "execution context was destroyed" in compact.lower():
+                result = f"Clicked {resolved_selector} (navigation detected)"
+                self._remember_selector_success(
+                    run_domain=run_domain,
+                    step_type=step_type,
+                    raw_selector=selector,
+                    resolved_selector=resolved_selector,
+                    text_hint=text_hint,
+                )
+                self._remember_selector_signature(
+                    run_domain=run_domain,
+                    step_type=step_type,
+                    raw_selector=selector,
+                    text_hint=text_hint,
+                )
+                trace_group["result"] = result
+                self._record_group_attempt(
+                    trace_group,
+                    {
+                        "phase": "fast_path",
+                        "selector": resolved_selector,
+                        "status": "success_navigation",
+                        "elapsed_ms": self._elapsed_ms(attempt_started),
+                        "total_attempt_ms": self._elapsed_ms(attempt_started),
+                        "result": result,
+                    },
+                )
+                return result
+            trace_group["final_error"] = compact
             self._record_group_attempt(
                 trace_group,
                 {
@@ -1144,10 +1258,10 @@ class AgentExecutor:
                     "elapsed_ms": self._elapsed_ms(attempt_started),
                     "post_validate_ms": post_validate_ms,
                     "total_attempt_ms": self._elapsed_ms(attempt_started),
-                    "error": self._compact_error(exc),
+                    "error": compact,
                 },
             )
-            raise _FastPathEscalation(self._compact_error(exc)) from exc
+            raise _FastPathEscalation(compact) from exc
 
     async def _perceive_before_act(
         self,
@@ -1170,7 +1284,18 @@ class AgentExecutor:
         raw_selector = str(step_input.get("selector", "")).strip() or self._selector_seed_from_target(step_input, step.type)
         text_hint = self._step_text_hint(step_input)
 
-        intent_text = " ".join(p for p in [raw_selector, text_hint or ""] if p).strip()
+        # If the selector embeds a :has-text() value (e.g. button:has-text('SIGN IN')),
+        # extract that string as the primary text hint so the tokenizer works on the
+        # exact visible label rather than polluted CSS syntax.
+        if not text_hint and raw_selector:
+            _ht = re.search(r":has-text\(['\"]([^'\"]+)['\"]\)", raw_selector, re.IGNORECASE)
+            if _ht:
+                text_hint = _ht.group(1).strip()
+        # Also handle text= prefix (e.g. text=Ceiling Fans)
+        if not text_hint and raw_selector and raw_selector.lower().startswith("text="):
+            text_hint = raw_selector[5:].strip().strip("'\"")
+
+        intent_text = " ".join(p for p in [text_hint or raw_selector] if p).strip()
         if not intent_text:
             return None
 
@@ -1295,12 +1420,35 @@ class AgentExecutor:
                             perception_match.score, perception_match.alternative_count,
                             perception_match.element.text[:50],
                         )
-                    elif perception_match.confidence == "ambiguous":
-                        LOGGER.warning(
-                            "Run %s step %d (type=%s): perception is AMBIGUOUS "
-                            "(top=%r alternatives=%d) — full fallback pipeline will run",
+                    elif perception_match.confidence == "medium":
+                        # Good match but not decisive — prepend as a strong hint in the
+                        # fallback pipeline without skipping the page assertion.
+                        step.input = {
+                            **step.input,
+                            "_grounded_selector": perception_match.selector,
+                            "_grounded_signature": perception_match.element.signature(),
+                        }
+                        LOGGER.info(
+                            "Run %s step %d (type=%s): perception MEDIUM selector=%r "
+                            "(score=%d alternatives=%d element=%r) — used as grounded hint",
                             run.run_id, step.index + 1, step.type,
-                            perception_match.selector, perception_match.alternative_count,
+                            perception_match.selector, perception_match.score,
+                            perception_match.alternative_count,
+                            perception_match.element.text[:50],
+                        )
+                    elif perception_match.confidence == "ambiguous":
+                        # Multiple close-scoring elements — still prepend the best guess
+                        # to the fallback pipeline as a soft hint.
+                        step.input = {
+                            **step.input,
+                            "_grounded_selector": perception_match.selector,
+                        }
+                        LOGGER.warning(
+                            "Run %s step %d (type=%s): perception AMBIGUOUS "
+                            "(top=%r score=%d alternatives=%d) — best guess prepended to pipeline",
+                            run.run_id, step.index + 1, step.type,
+                            perception_match.selector, perception_match.score,
+                            perception_match.alternative_count,
                         )
 
             if strong_live_grounding:
@@ -4275,18 +4423,47 @@ class AgentExecutor:
 
     async def _probe_element_present(self, selector: str, timeout_ms: int = 1500) -> bool:
         """
-        Fast-fail DOM probe: returns True if the selector resolves to a visible
-        element within timeout_ms, False otherwise.
+        Fast-fail DOM probe: returns True if the selector resolves to at least
+        one visible element, False otherwise.
 
-        This is called BEFORE the full candidate operation so that wrong
-        selectors are discarded in ~1.5 s instead of consuming the full
-        candidate_timeout budget (2.5–4 s).  Only used for interactive-action
-        step types (click / type / select).
+        Uses an immediate is_visible() check on ALL matches (not just DOM-first)
+        to avoid false failures caused by a hidden element appearing before a
+        visible one in DOM order.  Falls back to a short wait_for_selector if
+        none are immediately visible.
         """
         browser = getattr(self, "_browser", None)
-        if browser is None or not hasattr(browser, "wait_for"):
+        if browser is None:
             return True
 
+        # Try immediate is_visible() check on each matching locator first.
+        # This avoids waiting for a hidden first-match when a later match is
+        # already visible (common when nav and form both have the same button text).
+        try:
+            page = browser._active_context().page  # type: ignore[attr-defined]
+            locators = page.locator(selector)
+            count = await locators.count()
+            for i in range(min(count, 6)):
+                try:
+                    if await locators.nth(i).is_visible():
+                        return True
+                except Exception:
+                    continue
+            # If none are immediately visible, give a short wait for slow renders.
+            if count > 0:
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_selector(selector, state="visible", timeout=min(timeout_ms, 1500)),
+                        timeout=min(timeout_ms, 1500) / 1000 + 0.5,
+                    )
+                    return True
+                except Exception:
+                    return False
+        except AttributeError:
+            pass
+
+        # Fallback: original wait_for path (for non-Playwright browser clients).
+        if not hasattr(browser, "wait_for"):
+            return True
         try:
             await asyncio.wait_for(
                 browser.wait_for(

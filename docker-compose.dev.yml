@@ -28,18 +28,5 @@ services:
       - --reload-dir
       - /app/app
 
-  frontend:
-    volumes:
-      - ./frontend/src:/app/src          # live-sync Next.js source
-      - ./frontend/public:/app/public
-    environment:
-      NODE_ENV: development
-    command:
-      - npm
-      - run
-      - dev
-      - --
-      - -H
-      - "0.0.0.0"
-      - -p
-      - "3000"
+  # Frontend intentionally left in production mode.
+  # Only the backend is overridden for live-reload.

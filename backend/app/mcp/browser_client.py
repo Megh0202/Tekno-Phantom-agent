@@ -1559,14 +1559,25 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             or "[type=submit]" in _sel_lower
             or "[type=submit]" in _raw_lower
         )
-        _wait_ms = 1500 if _is_submit_click else 250
+        _wait_ms = 3000 if _is_submit_click else 250
+        _url_changed = False
         try:
             await context.page.wait_for_url(
                 lambda url: url != str((before_snapshot or {}).get("url") or ""),
                 timeout=_wait_ms,
             )
+            _url_changed = True
         except Exception:
             await context.page.wait_for_timeout(_wait_ms if _is_submit_click else 250)
+        # After a form submission navigates to a new page, wait for the page to
+        # finish loading before taking the post-click snapshot.  Without this,
+        # the next step's element probe runs against a half-loaded page and the
+        # target element appears to be missing even though it will appear shortly.
+        if _url_changed:
+            try:
+                await context.page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
         after_snapshot = await self.inspect_page(include_screenshot=False)
         before = before_snapshot or {}
         before_url = str(before.get("url") or "")
@@ -2916,7 +2927,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             or 'type="submit"' in _raw_lower or "type='submit'" in _raw_lower
             or "[type=submit]" in _sel_lower or "[type=submit]" in _raw_lower
         )
-        _wait_ms = 1500 if _is_submit_click else 250
+        _wait_ms = 3000 if _is_submit_click else 250
         code = (
             "async (page) => {"
             f"  const selector = {json.dumps(selector)};"
