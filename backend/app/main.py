@@ -167,7 +167,6 @@ def _sanitize_plan_steps(
     generic_click_targets = {"body", "html", "main", "h1", "h2", "h3"}
 
     sanitized: list[dict[str, object]] = []
-    seen_step_tokens: set[str] = set()
     for step in steps:
         step_type = _clean_text(step.get("type")).lower()
         if not step_type:
@@ -242,10 +241,13 @@ def _sanitize_plan_steps(
             normalized_step["source_selector"] = source_selector
             normalized_step["target_selector"] = target_selector
 
+        # Only suppress a step if it is identical to the immediately preceding step.
+        # Global deduplication incorrectly drops legitimate repeated actions such as
+        # clicking the same dropdown selector twice (for two different dropdowns) or
+        # typing in a field that shares a selector with an earlier step.
         token = json.dumps(normalized_step, sort_keys=True, ensure_ascii=False)
-        if token in seen_step_tokens:
+        if sanitized and json.dumps(sanitized[-1], sort_keys=True, ensure_ascii=False) == token:
             continue
-        seen_step_tokens.add(token)
         sanitized.append(normalized_step)
 
     return sanitized
@@ -1817,7 +1819,7 @@ def build_app() -> FastAPI:
         websocket_path = f"/api/runs/{run_id}/viewer/ws?token={quote(validated_token, safe='')}"
         iframe_src = (
             "/viewer/vnc.html"
-            f"?autoconnect=1&resize=remote&reconnect=0&path={quote(websocket_path, safe='')}"
+            f"?autoconnect=1&resize=scale&reconnect=0&path={quote(websocket_path, safe='')}"
         )
         status_url = f"/viewer/run/{run_id}/status?token={quote(validated_token, safe='')}"
         run_name = escape(run.run_name)

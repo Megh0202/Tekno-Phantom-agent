@@ -13,6 +13,20 @@ _TYPE_INTO_RE = re.compile(
 )
 _DRAG_TO_RE = re.compile(r"^\s*drag\s+(.+?)\s+to\s+(.+?)\s*$", flags=re.IGNORECASE)
 _CLICK_RE = re.compile(r"^\s*click(?:\s+on)?\s+(.+?)\s*$", flags=re.IGNORECASE)
+_SELECT_FROM_RE = re.compile(
+    r"^\s*(?:select|choose|pick)\s+(.+?)\s+from\s+(?:the\s+)?(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+# Trailing noise words stripped from the source element in "Select X from Y dropdown"
+_SELECT_SOURCE_NOISE_RE = re.compile(
+    r"\s*(?:dropdown|drop-down|list|listbox|suggestions?|field|menu|autocomplete|combo(?:box)?)\s*$",
+    flags=re.IGNORECASE,
+)
+# Strip "in the Login form / section / panel" from type-target when field is over-specified
+_TYPE_LOCATION_TRIM_RE = re.compile(
+    r"\s+in\s+(?:the\s+)?.*?(?:form|section|panel|page|modal|dialog|area|container|header|footer)\s*$",
+    flags=re.IGNORECASE,
+)
 _WAIT_MS_RE = re.compile(r"\bwait\s+(\d{2,6})\s*ms\b", flags=re.IGNORECASE)
 _VERIFY_CONTAINS_ON_RE = re.compile(
     r"^\s*verify(?:\s+text)?\s+contains\s+(.+?)\s+on\s+(.+?)\s*$",
@@ -137,6 +151,10 @@ def _parse_line(
     if explicit_drag is not None:
         return explicit_drag
 
+    explicit_select = _parse_explicit_select(line)
+    if explicit_select is not None:
+        return explicit_select
+
     explicit_type = _parse_explicit_type(line)
     if explicit_type is not None:
         return explicit_type
@@ -235,7 +253,7 @@ def _parse_explicit_type(line: str) -> dict[str, Any] | None:
     if not match:
         return None
     raw_value = match.group(1).strip()
-    raw_selector = match.group(2).strip()
+    raw_selector = _TYPE_LOCATION_TRIM_RE.sub("", match.group(2).strip()).strip()
     text = _first_quoted(raw_value) or _strip_wrapping_quotes(raw_value)
     raw_sel_clean = _normalize_selector_text(raw_selector)
     if not text or not raw_sel_clean:
@@ -245,6 +263,31 @@ def _parse_explicit_type(line: str) -> dict[str, Any] | None:
         if profile_sel:
             return {"type": "type", "selector": profile_sel, "text": text, "clear_first": True}
     return {"type": "type", "selector": raw_sel_clean, "text": text, "clear_first": True}
+
+
+def _parse_explicit_select(line: str) -> dict[str, Any] | None:
+    """
+    Handle ``"Select X from [the] Y dropdown/list/menu"`` patterns generically.
+    Returns a ``select`` step with the option value and a best-effort selector
+    for the source element.
+    """
+    match = _SELECT_FROM_RE.match(line)
+    if not match:
+        return None
+    raw_value = match.group(1).strip()
+    raw_source = match.group(2).strip()
+    value = _first_quoted(raw_value) or _strip_wrapping_quotes(raw_value)
+    # Strip trailing noise ("dropdown", "list", "menu", …) from source name
+    source = _SELECT_SOURCE_NOISE_RE.sub("", raw_source).strip()
+    source = _normalize_selector_text(source)
+    if not value or not source:
+        return None
+    if not _looks_like_explicit_selector(source):
+        profile_sel = _field_name_to_profile_selector(source)
+        selector = profile_sel if profile_sel else f"text={source}"
+    else:
+        selector = source
+    return {"type": "select", "selector": selector, "value": value}
 
 
 def _parse_explicit_drag(line: str) -> dict[str, Any] | None:
@@ -323,7 +366,7 @@ def _parse_generic_verify_text(line: str) -> dict[str, Any] | None:
 
 def _parse_named_field_entry(line: str) -> dict[str, Any] | None:
     match = re.match(
-        r"^\s*(?:enter|type)\s+(.+?)\s+as(?:\s*[-:])?\s*(.+?)\s*$",
+        r"^\s*(?:enter|type)\s+(.+?)\s+(?:as(?:\s*[-:])?|-)\s+(.+?)\s*$",
         line,
         flags=re.IGNORECASE,
     )

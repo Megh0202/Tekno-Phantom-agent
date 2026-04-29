@@ -13,6 +13,11 @@
 
 services:
   backend:
+    environment:
+      PLAYWRIGHT_DEFAULT_TIMEOUT_MS: 30000
+      EXECUTION_FAST_PATH_SELECTOR_TIMEOUT_MS: 5000
+      EXECUTION_FAST_PATH_ACTION_TIMEOUT_SECONDS: 10
+      STRUCTURED_SELECTOR_WAIT_MS: 10000
     volumes:
       - ./backend/app:/app/app          # live-sync Python source
       - backend_data:/app/data
