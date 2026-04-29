@@ -265,6 +265,7 @@ class BrowserMCPClient:
             "title": "",
             "aria": "",
             "href": "",
+            "parent_select_value": None,
         }
 
     async def assess_click_effect(
@@ -1505,6 +1506,9 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                         aria: (el.getAttribute("aria-label") || "").slice(0, 160),
                         href: (el.getAttribute("href") || "").slice(0, 200),
                         tag: (el.tagName || "").toLowerCase(),
+                        parent_select_value: (el.tagName.toLowerCase() === "option" && el.parentElement instanceof HTMLSelectElement)
+                            ? (el.parentElement.value || null)
+                            : null,
                     };
                 }
                 """
@@ -1717,6 +1721,65 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             return {
                 "status": "passed",
                 "detail": f"Form input element (<{tag}>) clicked — focus/activation only, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Clicking a <select> opens the native browser dropdown.
+        # No URL/title/text change or element visibility change is expected.
+        if tag == "select":
+            return {
+                "status": "passed",
+                "detail": "Select element clicked — dropdown opened, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Clicking an <option> should change the parent <select> value.
+        # Use strict pre-vs-post comparison when pre-click state is available
+        # (captured by _capture_click_pre_state via get_element_context).
+        # Fall back to checking whether the option is now the active selection
+        # when no pre-click state was captured (e.g. fast path, manual recovery).
+        if tag == "option":
+            pre_select_value = (target_context or {}).get("parent_select_value")
+            try:
+                post_select_value = await locator.evaluate(
+                    "el => el.parentElement instanceof HTMLSelectElement ? el.parentElement.value : null"
+                )
+            except Exception:
+                post_select_value = None
+            if pre_select_value is not None and post_select_value is not None:
+                if post_select_value != pre_select_value:
+                    return {
+                        "status": "passed",
+                        "detail": "Option clicked — parent select value changed.",
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+                return {
+                    "status": "failed",
+                    "detail": "Option click did not change the selected value (option may have already been selected).",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            # Fallback: no pre-click state — verify the option is now active
+            try:
+                option_value = await locator.evaluate("el => el.value")
+            except Exception:
+                option_value = None
+            if option_value is not None and option_value == post_select_value:
+                return {
+                    "status": "passed",
+                    "detail": "Option clicked — option is now the active selection (no pre-state available for strict comparison).",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "failed",
+                "detail": "Option click did not result in the option being selected.",
                 "selector": selector,
                 "before_url": before_url,
                 "after_url": after_url,
@@ -2891,6 +2954,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "        aria: (el.getAttribute('aria-label') || '').slice(0, 160),"
             "        href: (el.getAttribute('href') || '').slice(0, 200),"
             "        tag: (el.tagName || '').toLowerCase(),"
+            "        parent_select_value: (el.tagName.toLowerCase() === 'option' && el.parentElement instanceof HTMLSelectElement) ? (el.parentElement.value || null) : null,"
             "      };"
             "    });"
             "    return JSON.stringify(payload);"
@@ -2936,9 +3000,15 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "  let visible = false;"
             "  let enabled = false;"
             "  let tag = '';"
+            "  let post_select_value = null;"
+            "  let option_value = null;"
             "  try { visible = await locator.isVisible(); } catch (error) {}"
             "  try { enabled = await locator.isEnabled(); } catch (error) {}"
             "  try { tag = await locator.evaluate('el => el.tagName.toLowerCase()'); } catch (error) {}"
+            "  if (tag === 'option') {"
+            "    try { post_select_value = await locator.evaluate('el => el.parentElement instanceof HTMLSelectElement ? el.parentElement.value : null'); } catch (e) {}"
+            "    try { option_value = await locator.evaluate('el => el.value'); } catch (e) {}"
+            "  }"
             "  const textExcerpt = ((document.body?.innerText || '').replace(/\\s+/g, ' ').trim()).slice(0, 3000);"
             "  return JSON.stringify({"
             "    url: page.url(),"
@@ -2947,7 +3017,9 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    page_count: 1,"
             "    visible,"
             "    enabled,"
-            "    tag"
+            "    tag,"
+            "    post_select_value,"
+            "    option_value"
             "  });"
             "}"
         )
@@ -2963,6 +3035,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         visible = bool(after.get("visible", True))
         enabled = bool(after.get("enabled", True))
         element_tag = str(after.get("tag") or "").lower().strip()
+        post_select_value_mcp = after.get("post_select_value")
+        option_value_mcp = after.get("option_value")
         intent_text = " ".join(part for part in (selector, raw_selector or "", text_hint or "") if part).lower()
         target_terms = PlaywrightBrowserMCPClient._context_match_terms(target_context)
         after_haystack = " ".join(part for part in (after_url, after_title, after_text) if part).lower()
@@ -3073,6 +3147,51 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             return {
                 "status": "passed",
                 "detail": f"Form input element (<{element_tag}>) clicked — focus/activation only, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Clicking a <select> opens the native browser dropdown.
+        # No URL/title/text change or element visibility change is expected.
+        if element_tag == "select":
+            return {
+                "status": "passed",
+                "detail": "Select element clicked — dropdown opened, no navigation expected.",
+                "selector": selector,
+                "before_url": before_url,
+                "after_url": after_url,
+            }
+        # Clicking an <option> should change the parent <select> value.
+        if element_tag == "option":
+            pre_select_value = (target_context or {}).get("parent_select_value")
+            if pre_select_value is not None and post_select_value_mcp is not None:
+                if post_select_value_mcp != pre_select_value:
+                    return {
+                        "status": "passed",
+                        "detail": "Option clicked — parent select value changed.",
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+                return {
+                    "status": "failed",
+                    "detail": "Option click did not change the selected value (option may have already been selected).",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            # Fallback: no pre-click state — verify option is now active
+            if option_value_mcp is not None and option_value_mcp == post_select_value_mcp:
+                return {
+                    "status": "passed",
+                    "detail": "Option clicked — option is now the active selection (no pre-state available for strict comparison).",
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                }
+            return {
+                "status": "failed",
+                "detail": "Option click did not result in the option being selected.",
                 "selector": selector,
                 "before_url": before_url,
                 "after_url": after_url,

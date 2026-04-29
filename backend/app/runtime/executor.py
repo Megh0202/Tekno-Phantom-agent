@@ -578,7 +578,11 @@ class AgentExecutor:
                                         rs.message = s.message
                                         rs.error = s.error
                             break
-                    has_step_failure = True
+                    # Only count as failure if the step did not complete successfully.
+                    # A background-task retry that clicked and navigated must not
+                    # poison the final run status.
+                    if step.status != StepStatus.completed:
+                        has_step_failure = True
                     run.status = RunStatus.running
                     continue
                 else:
@@ -664,7 +668,13 @@ class AgentExecutor:
                         )
                         await self._execute_step(run, step)
                         self._run_store.persist(run)
-                    has_step_failure = True
+                        # Only count as a failure if the retry itself failed.
+                        # A successful retry must not poison the final run status.
+                        if step.status != StepStatus.completed:
+                            has_step_failure = True
+                    else:
+                        # Timeout / no selector provided — step was already marked failed.
+                        has_step_failure = True
                     continue
                 else:
                     run.status = RunStatus.waiting_for_input
@@ -1284,18 +1294,18 @@ class AgentExecutor:
         raw_selector = str(step_input.get("selector", "")).strip() or self._selector_seed_from_target(step_input, step.type)
         text_hint = self._step_text_hint(step_input)
 
-        # If the selector embeds a :has-text() value (e.g. button:has-text('SIGN IN')),
-        # extract that string as the primary text hint so the tokenizer works on the
-        # exact visible label rather than polluted CSS syntax.
+        # Extract clean visible text from selector syntax (text=..., :has-text(...),
+        # :text(...), :text-is(...)) so the tokenizer receives the exact visible label
+        # rather than polluted CSS syntax.
         if not text_hint and raw_selector:
-            _ht = re.search(r":has-text\(['\"]([^'\"]+)['\"]\)", raw_selector, re.IGNORECASE)
-            if _ht:
-                text_hint = _ht.group(1).strip()
-        # Also handle text= prefix (e.g. text=Ceiling Fans)
-        if not text_hint and raw_selector and raw_selector.lower().startswith("text="):
-            text_hint = raw_selector[5:].strip().strip("'\"")
+            text_hint = self._extract_selector_text(raw_selector)
 
         intent_text = " ".join(p for p in [text_hint or raw_selector] if p).strip()
+        if intent_text:
+            LOGGER.debug(
+                "Perception: intent_text=%r (text_hint=%r raw_selector=%r) step_type=%s",
+                intent_text[:80], (text_hint or "")[:80], (raw_selector or "")[:80], step.type,
+            )
         if not intent_text:
             return None
 
@@ -1319,6 +1329,70 @@ class AgentExecutor:
             step_type=step.type,
             element_index=element_index,
         )
+
+    @staticmethod
+    def _validate_medium_grounding(
+        match: PerceptionMatch,
+        step_type: str,
+        step_intent: "StepIntent | None",
+    ) -> tuple[bool, str]:
+        """
+        Validate a medium-confidence perception match before trusting it as a
+        grounded selector hint.
+
+        Checks:
+          1. Element is enabled (visibility is guaranteed by build_element_index).
+          2. Element tag/role is plausible for the intended action type.
+          3. At least one meaningful word from step_intent.target_text appears in the
+             element's visible text, aria label, placeholder, or name.
+
+        Returns (passed: bool, reason: str).
+        """
+        el = match.element
+
+        # 1. Enabled check
+        if not el.enabled:
+            return False, "element_disabled"
+
+        # 2. Role/tag plausibility per action type
+        if step_type == "click":
+            plausible = (
+                el.tag in {"button", "a", "input", "label"}
+                or el.role in {"button", "link", "menuitem", "tab", "checkbox", "radio", "option", "switch"}
+                or el.el_type in {"submit", "button", "checkbox", "radio"}
+            )
+            if not plausible:
+                return False, f"not_clickable tag={el.tag!r} role={el.role!r}"
+        elif step_type == "type":
+            if el.tag == "button" or el.role == "button":
+                return False, "is_button_not_typeable"
+            if not (
+                el.tag in {"input", "textarea"}
+                or el.role in {"textbox", "searchbox", "combobox"}
+            ):
+                return False, f"not_typeable tag={el.tag!r} role={el.role!r}"
+        elif step_type == "select":
+            if not (el.tag == "select" or el.role in {"combobox", "listbox"}):
+                return False, f"not_selectable tag={el.tag!r} role={el.role!r}"
+
+        # 3. Text/label alignment: at least one word from target_text must appear
+        #    in the element's searchable text surface.
+        if step_intent and step_intent.target_text:
+            target_words = {
+                w for w in re.findall(r"[a-z0-9]+", step_intent.target_text.lower())
+                if len(w) >= 3
+            }
+            if target_words:
+                haystack = " ".join([
+                    el.text, el.aria, el.placeholder, el.name, el.title,
+                ]).lower()
+                if not any(w in haystack for w in target_words):
+                    return False, (
+                        f"no_label_overlap target={step_intent.target_text!r} "
+                        f"element_text={el.text[:40]!r}"
+                    )
+
+        return True, "ok"
 
     async def _execute_step(self, run: RunState, step: StepRuntimeState) -> None:
         step_started_perf = perf_counter()
@@ -1421,31 +1495,50 @@ class AgentExecutor:
                             perception_match.element.text[:50],
                         )
                     elif perception_match.confidence == "medium":
-                        # Good match but not decisive — prepend as a strong hint in the
-                        # fallback pipeline without skipping the page assertion.
-                        step.input = {
-                            **step.input,
-                            "_grounded_selector": perception_match.selector,
-                            "_grounded_signature": perception_match.element.signature(),
-                        }
-                        LOGGER.info(
-                            "Run %s step %d (type=%s): perception MEDIUM selector=%r "
-                            "(score=%d alternatives=%d element=%r) — used as grounded hint",
-                            run.run_id, step.index + 1, step.type,
-                            perception_match.selector, perception_match.score,
-                            perception_match.alternative_count,
-                            perception_match.element.text[:50],
+                        # Medium confidence: validate the candidate before trusting it.
+                        # An invalid medium match must not pollute the fallback pipeline.
+                        med_valid, med_reason = self._validate_medium_grounding(
+                            perception_match, step.type, step_intent
                         )
+                        step_trace["perception"]["validation_passed"] = med_valid
+                        step_trace["perception"]["validation_reason"] = med_reason
+                        if med_valid:
+                            step.input = {
+                                **step.input,
+                                "_grounded_selector": perception_match.selector,
+                                "_grounded_signature": perception_match.element.signature(),
+                            }
+                            LOGGER.info(
+                                "Run %s step %d (type=%s): perception MEDIUM VALIDATED selector=%r "
+                                "(score=%d alternatives=%d element=%r) — used as grounded hint",
+                                run.run_id, step.index + 1, step.type,
+                                perception_match.selector, perception_match.score,
+                                perception_match.alternative_count,
+                                perception_match.element.text[:50],
+                            )
+                        else:
+                            LOGGER.warning(
+                                "Run %s step %d (type=%s): perception MEDIUM REJECTED selector=%r "
+                                "(score=%d reason=%r element=%r) — falling back to selector pipeline",
+                                run.run_id, step.index + 1, step.type,
+                                perception_match.selector, perception_match.score,
+                                med_reason, perception_match.element.text[:50],
+                            )
                     elif perception_match.confidence == "ambiguous":
-                        # Multiple close-scoring elements — still prepend the best guess
-                        # to the fallback pipeline as a soft hint.
-                        step.input = {
-                            **step.input,
-                            "_grounded_selector": perception_match.selector,
-                        }
+                        # Ambiguous: multiple elements scored similarly — we cannot
+                        # reliably identify the intended target.  Do NOT set
+                        # _grounded_selector: injecting an unreliable selector would
+                        # either trigger the fast path on a wrong element or bias the
+                        # slow pipeline toward the wrong candidate.
+                        # Let the full selector pipeline run clean.
+                        step_trace["perception"]["grounding_action"] = "suppressed"
+                        step_trace["perception"]["grounding_reason"] = (
+                            f"ambiguous — {perception_match.alternative_count} alternative(s) "
+                            f"scored similarly (top_score={perception_match.score})"
+                        )
                         LOGGER.warning(
-                            "Run %s step %d (type=%s): perception AMBIGUOUS "
-                            "(top=%r score=%d alternatives=%d) — best guess prepended to pipeline",
+                            "Run %s step %d (type=%s): perception AMBIGUOUS SUPPRESSED "
+                            "(top=%r score=%d alternatives=%d) — full selector pipeline used",
                             run.run_id, step.index + 1, step.type,
                             perception_match.selector, perception_match.score,
                             perception_match.alternative_count,
@@ -1489,6 +1582,7 @@ class AgentExecutor:
                 if key not in {"path", "reason"}
             }
 
+            slow_path_pre_state: dict[str, Any] | None = None
             if classification.get("path") == "fast":
                 LOGGER.debug(
                     "Run %s step %d type=%s: taking FAST path (reason=%s selector=%r)",
@@ -1521,6 +1615,14 @@ class AgentExecutor:
                 )
                 if step.type != "handle_popup":
                     await self._auto_handle_known_popups(run)
+                # Capture pre-click element context (incl. parent_select_value for
+                # option elements) before the dispatch mutates the page.  Only done
+                # for click steps that already have a provided_selector so the call
+                # is narrow and the result is None-safe if the element isn't found.
+                if step.type == "click" and step.provided_selector:
+                    slow_path_pre_state = await self._capture_click_pre_state(
+                        step.provided_selector
+                    )
                 message = await asyncio.wait_for(
                     self._dispatch_step(run, step.input),
                     timeout=self._settings.step_timeout_seconds,
@@ -1531,6 +1633,7 @@ class AgentExecutor:
                 step,
                 message,
                 before_snapshot=before_snapshot,
+                click_pre_state=slow_path_pre_state,
             )
             step_trace["page_state_verification"] = outcome_verification
             step_trace["page_state_after"] = outcome_verification.get("after_state")
@@ -2277,7 +2380,10 @@ class AgentExecutor:
 
     def _build_step_intent(self, step_type: str, raw_selector: str | None, text_hint: str | None = None) -> StepIntent:
         selector = (raw_selector or "").strip()
-        source = " ".join(part for part in (selector, text_hint or "") if part).strip()
+        # Prefer clean visible text over raw CSS selector syntax when computing
+        # ordinal/scope signals — raw selectors pollute intent extraction.
+        extracted_text = self._extract_selector_text(selector) if selector else None
+        source = " ".join(part for part in (extracted_text or selector, text_hint or "") if part).strip()
         return StepIntent(
             action=step_type,
             element_type=self._intent_element_type(step_type, selector, text_hint),
@@ -3170,6 +3276,7 @@ class AgentExecutor:
         message: str,
         *,
         before_snapshot: dict[str, Any] | None,
+        click_pre_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         after_snapshot = await self._safe_page_snapshot()
         verification: dict[str, Any] = {
@@ -3199,11 +3306,15 @@ class AgentExecutor:
             )
 
         if step.type == "click" and step.provided_selector:
+            _click_target_context = (
+                click_pre_state.get("element_context") if click_pre_state else None
+            )
             assessment = await self._browser.assess_click_effect(
                 selector=step.provided_selector,
                 before_snapshot=before_snapshot,
                 raw_selector=str(step.input.get("selector", "")) or None,
                 text_hint=self._step_text_hint(step.input),
+                target_context=_click_target_context,
             )
             verification["assessment"] = assessment
             if str(assessment.get("status", "")).strip().lower() == "passed":
@@ -3751,6 +3862,47 @@ class AgentExecutor:
                 except Exception as exc:
                     last_error = exc
                     compact_error = self._compact_error(exc)
+                    # "Execution context was destroyed" means the click triggered a
+                    # page navigation — the action SUCCEEDED.  Return immediately so
+                    # we don't try further candidates on a page that has already moved on.
+                    if (
+                        step_type == "click"
+                        and "execution context was destroyed" in compact_error.lower()
+                    ):
+                        result = f"Clicked {selector} (navigation detected)"
+                        self._remember_selector_success(
+                            run_domain=run_domain,
+                            step_type=step_type,
+                            raw_selector=raw_selector,
+                            resolved_selector=selector,
+                            text_hint=text_hint,
+                        )
+                        self._remember_selector_signature(
+                            run_domain=run_domain,
+                            step_type=step_type,
+                            raw_selector=raw_selector,
+                            text_hint=text_hint,
+                        )
+                        active_step = self._active_step_state()
+                        if active_step is not None:
+                            active_step.provided_selector = selector
+                        trace_group["resolved_selector"] = selector
+                        trace_group["final_selected_selector"] = selector
+                        trace_group["result"] = result
+                        self._record_group_attempt(
+                            trace_group,
+                            {
+                                "phase": "candidate",
+                                "cycle": cycle,
+                                "selector": selector,
+                                "status": "success_navigation",
+                                "elapsed_ms": self._elapsed_ms(attempt_started),
+                                "browser_action_ms": browser_action_ms,
+                                "total_attempt_ms": self._elapsed_ms(attempt_started),
+                                "result": result,
+                            },
+                        )
+                        return result
                     LOGGER.warning(
                         "Selector fallback: candidate FAILED (cycle=%d step_type=%s selector=%r) -> %s",
                         cycle + 1, step_type, selector, compact_error,

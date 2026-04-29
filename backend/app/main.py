@@ -1399,6 +1399,7 @@ def build_app() -> FastAPI:
             "Planner constraints:\n"
             "- Return only runnable steps supported by this runtime.\n"
             "- Supported step types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image.\n"
+            "- For drag-and-drop actions use type='drag' with fields 'source_selector' (element to drag) and 'target_selector' (drop destination). Example: {\"type\": \"drag\", \"source_selector\": \"text=Short answer\", \"target_selector\": \".form-canvas\"}\n"
             "- Cover every explicit user instruction in order when max_steps allows.\n"
             "- Do not invent extra requirements that are not explicitly requested.\n"
             "- Use Playwright-compatible selectors only.\n"
