@@ -258,12 +258,20 @@ class PlanGenerateRequest(BaseModel):
     start_url: str | None = None
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
+    pre_expanded_steps: list[str] | None = None
 
 
 class PlanGenerateResponse(BaseModel):
     run_name: str
     start_url: str | None = None
     steps: list[ActionStep] = Field(min_length=1)
+    # Traceability map: one entry per executable action, recording which
+    # generated step it came from.  Populated when pre_expanded_steps were used.
+    # Format: [{"action_index": 0, "action_type": "navigate",
+    #            "src_step": 1, "src_step_text": "Go to https://..."}]
+    # Dropped generated steps appear in dropped_steps.
+    step_source_map: list[dict[str, Any]] | None = None
+    dropped_steps: list[dict[str, Any]] | None = None
 
 
 class PromptToStepsRequest(BaseModel):

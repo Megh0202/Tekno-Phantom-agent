@@ -167,9 +167,12 @@ def _sanitize_plan_steps(
     generic_click_targets = {"body", "html", "main", "h1", "h2", "h3"}
 
     sanitized: list[dict[str, object]] = []
-    for step in steps:
+    for step_idx, step in enumerate(steps):
         step_type = _clean_text(step.get("type")).lower()
         if not step_type:
+            LOGGER.warning(
+                "_sanitize_plan_steps: step[%d] dropped — missing or empty type field", step_idx
+            )
             continue
 
         normalized_step = dict(step)
@@ -187,8 +190,16 @@ def _sanitize_plan_steps(
         if step_type == "click":
             selector = _to_click_selector(normalized_step.get("selector"))
             if not selector and target is None:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=click dropped — selector is empty and no semantic target",
+                    step_idx,
+                )
                 continue
             if selector.lower() in generic_click_targets:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=click dropped — selector %r is a generic element name",
+                    step_idx, selector,
+                )
                 continue
             normalized_step["selector"] = selector
 
@@ -196,6 +207,11 @@ def _sanitize_plan_steps(
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             text_value = _clean_text(normalized_step.get("text"))
             if (not selector and target is None) or not text_value:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=type dropped — %s",
+                    step_idx,
+                    "selector empty and no target" if (not selector and target is None) else f"text value is empty (selector={selector!r})",
+                )
                 continue
             normalized_step["selector"] = selector
             normalized_step["text"] = text_value
@@ -205,6 +221,11 @@ def _sanitize_plan_steps(
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             value = _clean_text(normalized_step.get("value"))
             if (not selector and target is None) or not value:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=select dropped — %s",
+                    step_idx,
+                    "selector empty and no target" if (not selector and target is None) else f"value is empty (selector={selector!r})",
+                )
                 continue
             normalized_step["selector"] = selector
             normalized_step["value"] = value
@@ -212,6 +233,10 @@ def _sanitize_plan_steps(
         if step_type == "verify_text":
             raw_value = _clean_text(normalized_step.get("value")).lower()
             if raw_value in {"example", "example domain"} and has_explicit_start_url and not is_example_site:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=verify_text dropped — value %r looks like placeholder text for a non-example.com site",
+                    step_idx, raw_value,
+                )
                 continue
             selector = _to_text_wait_selector(normalized_step.get("selector"))
             if not is_example_site and selector.lower() in {"body", "html", "main", "h1", "h2", "h3"}:
@@ -219,6 +244,10 @@ def _sanitize_plan_steps(
                 if value_text:
                     selector = f"text={value_text}"
             if not selector and target is None:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=verify_text dropped — selector empty and no semantic target",
+                    step_idx,
+                )
                 continue
             normalized_step["selector"] = selector
 
@@ -230,6 +259,10 @@ def _sanitize_plan_steps(
             if until in {"selector_visible", "selector_hidden"}:
                 selector = _to_text_wait_selector(normalized_step.get("selector"))
                 if not selector:
+                    LOGGER.warning(
+                        "_sanitize_plan_steps: step[%d] type=wait until=%s dropped — no selector provided",
+                        step_idx, until,
+                    )
                     continue
                 normalized_step["selector"] = selector
 
@@ -237,6 +270,12 @@ def _sanitize_plan_steps(
             source_selector = _to_text_wait_selector(normalized_step.get("source_selector"))
             target_selector = _to_text_wait_selector(normalized_step.get("target_selector"))
             if not source_selector or not target_selector:
+                LOGGER.warning(
+                    "_sanitize_plan_steps: step[%d] type=drag dropped — %s",
+                    step_idx,
+                    f"source_selector missing (target_selector={target_selector!r})" if not source_selector
+                    else f"target_selector missing (source_selector={source_selector!r})",
+                )
                 continue
             normalized_step["source_selector"] = source_selector
             normalized_step["target_selector"] = target_selector
@@ -247,10 +286,91 @@ def _sanitize_plan_steps(
         # typing in a field that shares a selector with an earlier step.
         token = json.dumps(normalized_step, sort_keys=True, ensure_ascii=False)
         if sanitized and json.dumps(sanitized[-1], sort_keys=True, ensure_ascii=False) == token:
+            LOGGER.warning(
+                "_sanitize_plan_steps: step[%d] type=%s dropped — exact duplicate of preceding step",
+                step_idx, step_type,
+            )
             continue
         sanitized.append(normalized_step)
 
     return sanitized
+
+
+def _build_step_source_map(
+    normalized_steps: list[dict[str, object]],
+    pre_expanded_steps: list[str] | None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Build a step_source_map and dropped_steps list from normalized (pre-Pydantic) steps.
+
+    Returns (step_source_map, dropped_steps).  Each entry in step_source_map
+    describes one executable action:
+        {action_index, action_type, src_step, src_step_text}
+    Each entry in dropped_steps describes a generated step with no corresponding
+    action (only meaningful when pre_expanded_steps are provided):
+        {src_step, src_step_text, reason}
+    """
+    step_source_map: list[dict[str, object]] = []
+    for action_idx, step in enumerate(normalized_steps):
+        src = step.get("src_step")
+        src_int: int | None = None
+        if src is not None:
+            try:
+                src_int = int(src)
+            except (TypeError, ValueError):
+                pass
+        src_text: str | None = None
+        if src_int is not None and pre_expanded_steps and 1 <= src_int <= len(pre_expanded_steps):
+            src_text = pre_expanded_steps[src_int - 1]
+        step_source_map.append({
+            "action_index": action_idx,
+            "action_type": str(step.get("type") or ""),
+            "src_step": src_int,
+            "src_step_text": src_text,
+        })
+
+    # Find generated steps that have no action pointing to them.
+    dropped_steps: list[dict[str, object]] = []
+    if pre_expanded_steps:
+        covered = {int(e["src_step"]) for e in step_source_map if e["src_step"] is not None}
+        for i, text in enumerate(pre_expanded_steps, start=1):
+            if i not in covered:
+                dropped_steps.append({
+                    "src_step": i,
+                    "src_step_text": text,
+                    "reason": "no action produced by planner for this instruction",
+                })
+
+    return step_source_map, dropped_steps
+
+
+def _log_step_source_map(
+    step_source_map: list[dict[str, object]],
+    dropped_steps: list[dict[str, object]],
+) -> None:
+    for entry in step_source_map:
+        src = entry.get("src_step")
+        src_text = entry.get("src_step_text")
+        if src is not None:
+            LOGGER.info(
+                "step_trace: action[%d] type=%-14s <- src_step[%d]: %s",
+                entry["action_index"],
+                entry["action_type"],
+                src,
+                (str(src_text or ""))[:80],
+            )
+        else:
+            LOGGER.info(
+                "step_trace: action[%d] type=%-14s <- src_step=unknown (no src_step tag from planner)",
+                entry["action_index"],
+                entry["action_type"],
+            )
+    for entry in dropped_steps:
+        LOGGER.warning(
+            "step_trace: src_step[%d] DROPPED — %s — %s",
+            entry["src_step"],
+            entry.get("reason", ""),
+            (str(entry.get("src_step_text") or ""))[:80],
+        )
 
 
 def _resolve_start_url(
@@ -385,72 +505,62 @@ def _can_access_owned_resource(actor: User | None, owner_id: int) -> bool:
 
 
 def _validate_generated_plan(task: str, normalized_steps: list[dict[str, object]]) -> dict[str, object]:
+    """Validate a generated plan.
+
+    Hard rejection: plan is completely empty (no runnable steps produced).
+    Everything else is a soft warning — logged but never blocks execution.
+    Keyword-based heuristics are unreliable because the LLM may use different
+    selectors/step-types than the narrow token list expects.
+    """
     errors: list[str] = []
-    missing_steps: list[str] = []
-    rejection_reasons: list[str] = []
+    warnings: list[str] = []
     lowered_task = task.lower()
     step_types = [str(step.get("type") or "").strip().lower() for step in normalized_steps]
 
+    # ── Hard check: plan must not be empty ─────────────────────────────────
     if not normalized_steps:
         errors.append("Planner response was dropped during normalization or produced no runnable steps.")
-        rejection_reasons.append("Normalized plan is empty after dropping invalid steps.")
 
+    # ── Soft heuristic checks (warn only, never reject) ────────────────────
     if "wait" in lowered_task and "wait" not in step_types:
-        errors.append("Prompt requested a wait step, but no wait step was generated.")
-        missing_steps.append("wait step")
-        rejection_reasons.append("Missing required wait step from the user prompt.")
+        warnings.append("Prompt mentioned 'wait' but no wait step was generated.")
 
     if "verify" in lowered_task and not any(step_type.startswith("verify_") for step_type in step_types):
-        errors.append("Prompt requested verify/verification behavior, but no verify step was generated.")
-        missing_steps.append("verify step")
-        rejection_reasons.append("Missing requested verification step.")
+        warnings.append("Prompt mentioned 'verify' but no verify step was generated.")
 
     if ("login" in lowered_task or "sign in" in lowered_task) and "password" in lowered_task:
         if not any(
             step_type == "type" and "password" in str(step.get("selector") or "").lower()
             for step, step_type in zip(normalized_steps, step_types)
         ):
-            missing_steps.append("password entry")
-            rejection_reasons.append("Missing password entry for login workflow.")
+            warnings.append("Login workflow detected but no password type step found.")
+        _LOGIN_CLICK_TOKENS = (
+            "login", "sign in", "signin", "log in", "submit",
+            "selector.login_button",
+        )
         if not any(
-            step_type == "click" and any(token in str(step.get("selector") or "").lower() for token in ("login", "sign in"))
+            step_type == "click" and any(
+                token in str(step.get("selector") or "").lower()
+                for token in _LOGIN_CLICK_TOKENS
+            )
             for step, step_type in zip(normalized_steps, step_types)
         ):
-            missing_steps.append("login submit click")
-            rejection_reasons.append("Missing login submit click.")
+            warnings.append("Login workflow detected but no login submit click step found.")
 
     if "drag" in lowered_task and "drag" not in step_types:
-        missing_steps.append("drag step")
-        rejection_reasons.append("Missing drag step for drag-and-drop workflow.")
-
-    if any(token in lowered_task for token in ("form name", "enter form name")) and "type" not in step_types:
-        missing_steps.append("form fill step")
-        rejection_reasons.append("Missing form fill step for the requested workflow.")
-
-    if any(token in lowered_task for token in ("verify", "is visible", "visible in the editor")):
-        verify_steps = [step for step, step_type in zip(normalized_steps, step_types) if step_type == "verify_text"]
-        if not verify_steps:
-            missing_steps.append("specific verification target")
-            rejection_reasons.append("Missing verification step with a specific target.")
-        else:
-            has_specific_target = any(
-                str(step.get("selector") or "").strip()
-                and str(step.get("selector") or "").strip().lower() not in {"h1", "body"}
-                for step in verify_steps
-            )
-            if not has_specific_target:
-                missing_steps.append("specific verification target")
-                rejection_reasons.append("Verification target is too generic for the requested check.")
+        warnings.append("Prompt mentioned 'drag' but no drag step was generated.")
 
     if any(token in lowered_task for token in ("extract", "return the details", "return details")):
-        errors.append("Extraction/output requests are not supported by the current planner contract.")
-        rejection_reasons.append("Unsupported extraction/output request in prompt.")
+        warnings.append("Prompt contains extraction/output request; planner may not support this.")
+
+    if warnings:
+        LOGGER.warning("_validate_generated_plan soft warnings: %s", "; ".join(warnings))
 
     return {
-        "valid": not errors and not missing_steps and not rejection_reasons,
+        "valid": not errors,
         "errors": errors,
-        "missing_steps": missing_steps,
-        "rejection_reasons": rejection_reasons,
+        "missing_steps": [],
+        "rejection_reasons": errors,
     }
 
 
@@ -1365,39 +1475,78 @@ def build_app() -> FastAPI:
             "validation": None,
         }
 
-        structured_attempt = _build_structured_plan_attempt(
-            request,
-            max_steps=max_steps,
-            settings=settings,
-        )
-        if structured_attempt is not None:
-            trace["structured_attempt"] = structured_attempt
-            structured_validation = structured_attempt["validation"]
-            if bool(structured_validation.get("valid")):
-                try:
-                    validated = RunCreateRequest.model_validate(
-                        {
-                            "run_name": structured_attempt["run_name"],
-                            "start_url": structured_attempt["start_url"],
-                            "steps": structured_attempt["normalized_steps"],
-                            "test_data": request.test_data,
-                            "selector_profile": request.selector_profile,
-                        }
-                    )
-                except Exception as exc:
-                    raise HTTPException(status_code=502, detail=f"Invalid structured plan: {exc}") from exc
+        # If the caller already has pre-expanded steps (e.g. from the Generate Steps UI),
+        # skip the structured parser and the human_steps LLM call entirely — go straight
+        # to plan_task with the numbered list.  This preserves all 48 steps the user saw
+        # and prevents the instruction_parser from silently dropping drag/select/verify steps.
+        structured_attempt: dict[str, object] | None = None
+        if request.pre_expanded_steps and len(request.pre_expanded_steps) >= 2:
+            LOGGER.info(
+                "generate_plan[pre_expanded]: %d steps provided, skipping structured parser and human_steps",
+                len(request.pre_expanded_steps),
+            )
+            expanded_task = "\n".join(
+                f"{i + 1}. {line}" for i, line in enumerate(request.pre_expanded_steps)
+            )
+        else:
+            structured_attempt = _build_structured_plan_attempt(
+                request,
+                max_steps=max_steps,
+                settings=settings,
+            )
+            # LOG POINT 1 — structured parser result
+            LOGGER.info(
+                "generate_plan[structured]: present=%s, steps=%d, valid=%s",
+                structured_attempt is not None,
+                len(structured_attempt["normalized_steps"]) if structured_attempt else 0,
+                bool(structured_attempt["validation"]["valid"]) if structured_attempt else "n/a",
+            )
+            if structured_attempt is not None:
+                trace["structured_attempt"] = structured_attempt
+                structured_validation = structured_attempt["validation"]
+                if bool(structured_validation.get("valid")):
+                    try:
+                        validated = RunCreateRequest.model_validate(
+                            {
+                                "run_name": structured_attempt["run_name"],
+                                "start_url": structured_attempt["start_url"],
+                                "steps": structured_attempt["normalized_steps"],
+                                "test_data": request.test_data,
+                                "selector_profile": request.selector_profile,
+                            }
+                        )
+                    except Exception as exc:
+                        raise HTTPException(status_code=502, detail=f"Invalid structured plan: {exc}") from exc
 
-                trace["normalized_plan"] = [step.model_dump(exclude_none=True) for step in validated.steps]
-                trace["validation"] = structured_validation
-                _write_plan_trace(trace_dir, trace)
-                return PlanGenerateResponse(
-                    run_name=validated.run_name,
-                    start_url=validated.start_url,
-                    steps=validated.steps[:max_steps],
-                )
+                    trace["normalized_plan"] = [step.model_dump(exclude_none=True) for step in validated.steps]
+                    trace["validation"] = structured_validation
+                    _write_plan_trace(trace_dir, trace)
+                    return PlanGenerateResponse(
+                        run_name=validated.run_name,
+                        start_url=validated.start_url,
+                        steps=validated.steps[:max_steps],
+                    )
+
+            # Pre-expand the raw prompt into plain-English action lines using the same
+            # LLM call that powers "Generate Steps".  This ensures every action the LLM
+            # identified is present as an explicit line before the planner converts them
+            # to JSON steps — preventing the planner from merging or skipping actions.
+            # Cap at 30 so the planner is not overwhelmed; fall back to raw prompt if
+            # the expansion returns nothing useful.
+            try:
+                expanded_lines = await brain_client.human_steps(request.task, max_steps=30)
+            except Exception:
+                expanded_lines = []
+            expanded_task = "\n".join(expanded_lines) if len(expanded_lines) >= 2 else request.task
+            # LOG POINT 2 — human_steps expansion result
+            LOGGER.info(
+                "generate_plan[human_steps]: lines=%d, using_expanded=%s",
+                len(expanded_lines),
+                expanded_task != request.task,
+            )
 
         planning_task = (
-            f"{request.task}\n\n"
+            f"{expanded_task}\n\n"
             "Planner constraints:\n"
             "- Return only runnable steps supported by this runtime.\n"
             "- Supported step types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image.\n"
@@ -1413,6 +1562,9 @@ def build_app() -> FastAPI:
             "- Keep action order aligned to the prompt; do not verify post-login controls before login actions complete.\n"
             "- For login pages, prefer '#username' or input[name='username'] for username/email fields,\n"
             "  and '#password' or input[name='password'] for password fields if present.\n"
+            "- CRITICAL: Each selector field must contain exactly ONE selector string. Never use comma-separated\n"
+            "  fallback lists (e.g. 'a, b, c'). Pick the single best selector. Short, precise selectors keep\n"
+            "  the JSON response small and prevent truncation.\n"
         )
 
         if request.test_data:
@@ -1431,6 +1583,10 @@ def build_app() -> FastAPI:
                 f"{json.dumps(request.selector_profile, ensure_ascii=False)}\n"
                 "Prefer these selectors for matching fields."
             )
+
+        # Build a fallback planning task from the original raw prompt in case the
+        # expanded task produces an empty plan.
+        _raw_planning_task = planning_task.replace(expanded_task, request.task, 1)
 
         last_validation: dict[str, object] | None = None
         for attempt_index in range(2):
@@ -1461,7 +1617,52 @@ def build_app() -> FastAPI:
                     default_wait_ms=settings.planner_default_wait_ms,
                 )
                 normalized_steps = _sanitize_plan_steps(normalized_steps, start_url=payload.get("start_url"))
+
+                # LOG POINT 3 — step count after sanitize, before fallback
+                LOGGER.info(
+                    "generate_plan[attempt=%d]: normalized_steps=%d after sanitize (before fallback)",
+                    attempt_index, len(normalized_steps),
+                )
+
+                # If the expanded task produced no steps, fall back to the raw prompt
+                # once before running validation, to avoid all-validators-firing on empty plans.
+                if not normalized_steps and expanded_task != request.task and attempt_index == 0:
+                    LOGGER.warning(
+                        "generate_plan: expanded task produced empty plan, retrying with raw prompt"
+                    )
+                    fallback_payload = await brain_client.plan_task(_raw_planning_task, max_steps=max_steps)
+                    fallback_steps = normalize_plan_steps(
+                        fallback_payload.get("steps"),
+                        max_steps=max_steps,
+                        default_wait_ms=settings.planner_default_wait_ms,
+                    )
+                    fallback_steps = _sanitize_plan_steps(fallback_steps, start_url=fallback_payload.get("start_url"))
+                    # LOG POINT 4 — fallback branch result
+                    LOGGER.info(
+                        "generate_plan[fallback]: fallback_steps=%d, accepted=%s",
+                        len(fallback_steps), bool(fallback_steps),
+                    )
+                    if fallback_steps:
+                        payload = fallback_payload
+                        normalized_steps = fallback_steps
+                else:
+                    # LOG POINT 4 (skipped) — why fallback was not attempted
+                    LOGGER.info(
+                        "generate_plan[fallback]: skipped (steps=%d, expanded_differs=%s, attempt=%d)",
+                        len(normalized_steps), expanded_task != request.task, attempt_index,
+                    )
+
+                # LOG POINT 5 — input to _validate_generated_plan
+                LOGGER.info(
+                    "generate_plan[validate attempt=%d]: task_len=%d, steps=%d",
+                    attempt_index, len(request.task), len(normalized_steps),
+                )
                 validation = _validate_generated_plan(request.task, normalized_steps)
+                # LOG POINT 6 — validation result
+                LOGGER.info(
+                    "generate_plan[validate attempt=%d]: valid=%s, errors=%s",
+                    attempt_index, validation["valid"], validation["errors"],
+                )
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
 
@@ -1478,6 +1679,14 @@ def build_app() -> FastAPI:
 
             if not validation["valid"]:
                 continue
+
+            # Build traceability map BEFORE model_validate strips src_step from dicts.
+            step_source_map, dropped_steps = _build_step_source_map(
+                normalized_steps, request.pre_expanded_steps
+            )
+            _log_step_source_map(step_source_map, dropped_steps)
+            trace["step_source_map"] = step_source_map
+            trace["dropped_steps"] = dropped_steps
 
             try:
                 validated = RunCreateRequest.model_validate(
@@ -1499,6 +1708,8 @@ def build_app() -> FastAPI:
                 run_name=validated.run_name,
                 start_url=validated.start_url,
                 steps=validated.steps[:max_steps],
+                step_source_map=step_source_map or None,
+                dropped_steps=dropped_steps or None,
             )
 
         trace["validation"] = last_validation

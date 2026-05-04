@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
+LOGGER = logging.getLogger("tekno.phantom.plan_normalizer")
 
 ACTION_TYPE_KEYS = ("type", "action", "step_type", "name", "tool")
 
@@ -30,16 +32,40 @@ def normalize_plan_steps(
         return []
 
     normalized: list[dict[str, Any]] = []
-    for raw_step in raw_steps:
+    for idx, raw_step in enumerate(raw_steps):
         step: dict[str, Any] | None = None
         if isinstance(raw_step, dict):
-            step = _normalize_step(raw_step)
+            step = _normalize_step(raw_step, step_index=idx)
         elif isinstance(raw_step, str):
             step = _normalize_string_step(raw_step, default_wait_ms=default_wait_ms)
+            if step is None:
+                LOGGER.warning(
+                    "normalize_plan_steps: step[%d] dropped — string step %r did not match any known verb pattern",
+                    idx, raw_step[:80],
+                )
+        else:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] dropped — unexpected type %s",
+                idx, type(raw_step).__name__,
+            )
         if step is None:
             continue
+        # Carry src_step (traceability tag from the LLM) through normalization.
+        if isinstance(raw_step, dict):
+            src = raw_step.get("src_step") or raw_step.get("_src_step")
+            if src is not None:
+                try:
+                    step["src_step"] = int(src)
+                except (TypeError, ValueError):
+                    pass
         normalized.append(step)
         if len(normalized) >= max_steps:
+            remaining = len(raw_steps) - (idx + 1)
+            if remaining > 0:
+                LOGGER.warning(
+                    "normalize_plan_steps: truncated at max_steps=%d — %d remaining steps dropped",
+                    max_steps, remaining,
+                )
             break
 
     return normalized
@@ -63,9 +89,14 @@ def build_recovery_steps(
     return steps[: max(1, max_steps)]
 
 
-def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
-    step_type = _normalize_type(_get_step_type(raw_step))
+def _normalize_step(raw_step: dict[str, Any], step_index: int = -1) -> dict[str, Any] | None:
+    raw_type = _get_step_type(raw_step)
+    step_type = _normalize_type(raw_type)
     if not step_type:
+        LOGGER.warning(
+            "normalize_plan_steps: step[%d] dropped — unrecognized type %r",
+            step_index, raw_type,
+        )
         return None
 
     if step_type == "navigate":
@@ -78,6 +109,10 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
             or _extract_url(_as_str(raw_step.get("value")) or "")
         )
         if not url:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=navigate dropped — no URL field found in %r",
+                step_index, list(raw_step.keys()),
+            )
             return None
         return {"type": "navigate", "url": url}
 
@@ -87,6 +122,10 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
         if not selector and target:
             selector = _selector_seed_from_target(target, step_type="click")
         if not selector and not target:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=click dropped — no selector and no semantic target in %r",
+                step_index, list(raw_step.keys()),
+            )
             return None
         step = {"type": "click", "selector": selector or ""}
         if target:
@@ -105,6 +144,11 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
             or _as_str(raw_step.get("query"))
         )
         if (not selector and not target) or text is None:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=type dropped — %s",
+                step_index,
+                "no selector and no target" if (not selector and not target) else "text value is empty/None",
+            )
             return None
         step = {
             "type": "type",
@@ -128,6 +172,11 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
             or _as_str(raw_step.get("choice"))
         )
         if (not selector and not target) or value is None:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=select dropped — %s",
+                step_index,
+                "no selector and no target" if (not selector and not target) else "value/option is empty/None",
+            )
             return None
         step = {"type": "select", "selector": selector or "", "value": value}
         if target:
@@ -138,6 +187,11 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
         source_selector = _pick_drag_source_selector(raw_step)
         target_selector = _pick_drag_target_selector(raw_step)
         if not source_selector or not target_selector:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=drag dropped — %s",
+                step_index,
+                "source_selector missing" if not source_selector else "target_selector missing",
+            )
             return None
         step: dict[str, Any] = {
             "type": "drag",
@@ -223,6 +277,11 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
         if not selector and value:
             selector = _to_text_selector(value)
         if (not selector and not target) or value is None:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=verify_text dropped — %s",
+                step_index,
+                "no selector and no target" if (not selector and not target) else "verify value is empty/None",
+            )
             return None
         match = (
             _as_str(raw_step.get("match"))
@@ -260,6 +319,11 @@ def _normalize_step(raw_step: dict[str, Any]) -> dict[str, Any] | None:
             step["threshold"] = threshold
         return step
 
+    # step_type is recognized but has no handler — should not happen
+    LOGGER.warning(
+        "normalize_plan_steps: step[%d] type=%r dropped — recognized type but no normalization handler",
+        step_index, step_type,
+    )
     return None
 
 

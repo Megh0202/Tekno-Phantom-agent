@@ -316,6 +316,20 @@ class AgentExecutor:
             LOGGER.warning("execute() called for unknown run_id=%s", run_id)
             return
 
+        # Guard: if a concurrent execute() call queued up while the primary
+        # execution was running (e.g. from _execute_and_persist_selector background
+        # tasks), skip re-execution once the run has reached a terminal state.
+        # The primary while-True loop in _execute_existing_steps already handled
+        # all selector retries inline; the queued call is only needed for its
+        # selector-persistence side-effect, which runs after executor.execute() returns.
+        if run.status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}:
+            LOGGER.info(
+                "Run %s: execute() called on already-terminal run (status=%s), skipping re-execution",
+                run_id,
+                run.status.value,
+            )
+            return
+
         is_new_run = run.started_at is None
         LOGGER.info(
             "Run %s: starting execution (mode=%s, steps=%d, url=%s)",
@@ -614,51 +628,74 @@ class AgentExecutor:
             )
             self._run_store.persist(run)
             if step.status == StepStatus.waiting_for_input:
-                if self._should_continue_after_failure(run):
-                    run.status = RunStatus.waiting_for_input
-                    self._run_store.persist(run)
-                    # Start the 40s external timeout task so it marks the step
-                    # failed in the store — the polling loop below detects that.
-                    self._schedule_selector_input_timeout(run.run_id)
-                    user_provided_selector = False
-                    for _ in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
-                        await asyncio.sleep(1)
-                        fresh = self._run_store.get(run.run_id)
-                        if fresh is None:
-                            break
-                        fresh_step = next(
-                            (s for s in fresh.steps if s.step_id == step.step_id),
-                            None,
-                        )
-                        if fresh_step is None:
-                            break
-                        if fresh_step.status == StepStatus.pending:
-                            # User provided a selector — sync updated input and re-execute
-                            step.status = fresh_step.status
-                            step.input = dict(fresh_step.input or step.input)
-                            step.message = fresh_step.message
-                            step.error = fresh_step.error
-                            step.provided_selector = fresh_step.provided_selector
-                            user_provided_selector = True
-                            break
-                        if fresh_step.status != StepStatus.waiting_for_input:
-                            # Timeout fired — step marked failed, move on
-                            step.status = fresh_step.status
-                            step.message = fresh_step.message
-                            step.error = fresh_step.error
-                            break
-                    # Cancel external timeout task (may have already fired — that's fine).
-                    self._cancel_selector_input_timeout(run.run_id)
-                    # Safety net: if polling exhausted without any status change,
-                    # mark step failed explicitly so it doesn't stay waiting_for_input.
-                    if not user_provided_selector and step.status == StepStatus.waiting_for_input:
-                        step.status = StepStatus.failed
-                        step.error = "Selector input timed out — no selector was provided in time."
-                        step.message = "Step failed: no selector provided within 40s."
-                        step.user_input_kind = None
-                        step.user_input_prompt = None
-                        step.requested_selector_target = None
+                # Always block on the failing step regardless of failure_mode.
+                # Keep asking the user for selectors until the step passes or the
+                # user lets the 40s window expire without providing a selector.
+                # Each failed retry that leaves the step in waiting_for_input
+                # immediately opens a fresh 40s window for the same step.
+                while True:
+                    # Guard: the user may have already submitted a selector while
+                    # _execute_step was finishing its async failure diagnosis.
+                    # apply_manual_selector_hint writes 'pending' to the store, but
+                    # persist(run) below would overwrite it with the stale in-memory
+                    # waiting_for_input state — check first and skip the wait setup.
+                    _pre = self._run_store.get(run.run_id)
+                    _pre_step = next(
+                        (_s for _s in (_pre.steps if _pre else []) if _s.step_id == step.step_id),
+                        None,
+                    ) if _pre else None
+                    if _pre_step and _pre_step.status == StepStatus.pending:
+                        step.input = dict(_pre_step.input or step.input)
+                        step.message = _pre_step.message
+                        step.error = _pre_step.error
+                        step.provided_selector = _pre_step.provided_selector
+                        user_provided_selector = True
+                    else:
+                        run.status = RunStatus.waiting_for_input
                         self._run_store.persist(run)
+                        # Start the 40s external timeout task so it marks the step
+                        # failed in the store — the polling loop below detects that.
+                        self._schedule_selector_input_timeout(run.run_id)
+                        user_provided_selector = False
+                    if not user_provided_selector:
+                        for _ in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
+                            await asyncio.sleep(1)
+                            fresh = self._run_store.get(run.run_id)
+                            if fresh is None:
+                                break
+                            fresh_step = next(
+                                (s for s in fresh.steps if s.step_id == step.step_id),
+                                None,
+                            )
+                            if fresh_step is None:
+                                break
+                            if fresh_step.status == StepStatus.pending:
+                                # User provided a selector — sync updated input and re-execute
+                                step.status = fresh_step.status
+                                step.input = dict(fresh_step.input or step.input)
+                                step.message = fresh_step.message
+                                step.error = fresh_step.error
+                                step.provided_selector = fresh_step.provided_selector
+                                user_provided_selector = True
+                                break
+                            if fresh_step.status != StepStatus.waiting_for_input:
+                                # Timeout fired — step marked failed, move on
+                                step.status = fresh_step.status
+                                step.message = fresh_step.message
+                                step.error = fresh_step.error
+                                break
+                        # Cancel external timeout task (may have already fired — that's fine).
+                        self._cancel_selector_input_timeout(run.run_id)
+                        # Safety net: if polling exhausted without any status change,
+                        # mark step failed explicitly so it doesn't stay waiting_for_input.
+                        if not user_provided_selector and step.status == StepStatus.waiting_for_input:
+                            step.status = StepStatus.failed
+                            step.error = "Selector input timed out — no selector was provided in time."
+                            step.message = "Step failed: no selector provided within 40s."
+                            step.user_input_kind = None
+                            step.user_input_prompt = None
+                            step.requested_selector_target = None
+                            self._run_store.persist(run)
                     run.status = RunStatus.running
                     if user_provided_selector:
                         # Re-execute the step with the user's selector
@@ -668,19 +705,31 @@ class AgentExecutor:
                         )
                         await self._execute_step(run, step)
                         self._run_store.persist(run)
-                        # Only count as a failure if the retry itself failed.
-                        # A successful retry must not poison the final run status.
-                        if step.status != StepStatus.completed:
+                        if step.status == StepStatus.completed:
+                            # Retry succeeded — exit inner loop and continue to next step.
+                            break
+                        elif step.status == StepStatus.waiting_for_input:
+                            # Retry failed and step is asking for input again —
+                            # loop back and give the user another chance.
+                            LOGGER.info(
+                                "Run %s: step %d — retry failed, asking user for another selector",
+                                run.run_id, step.index + 1,
+                            )
+                            continue
+                        else:
+                            # Retry failed in a definitive way (not selector-related).
                             has_step_failure = True
+                            break
                     else:
-                        # Timeout / no selector provided — step was already marked failed.
+                        # Timeout — user did not provide a selector in time.
                         has_step_failure = True
+                        break
+                # Only advance to the next step if the step actually passed.
+                # If the user gave up (timeout) or retry failed, stop the run.
+                if step.status == StepStatus.completed:
                     continue
-                else:
-                    run.status = RunStatus.waiting_for_input
-                    self._run_store.persist(run)
-                    has_step_failure = True
-                    break
+                self._mark_remaining_steps_skipped(run, step.index + 1)
+                break
             if step.status == StepStatus.failed:
                 has_step_failure = True
                 # Agentic fallback: only attempt when failure_mode is "continue".

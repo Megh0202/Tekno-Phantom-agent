@@ -684,6 +684,7 @@ export default function Home() {
     task: string,
     testData: JsonObject,
     selectorProfile: JsonObject,
+    preExpandedSteps?: string[],
   ): Promise<PlanGenerateResponse> {
     const planResponse = await fetch(`${API_BASE_URL}/api/plan`, {
       method: "POST",
@@ -693,6 +694,7 @@ export default function Home() {
         max_steps: config?.max_steps_per_run ?? DEFAULT_MAX_STEPS,
         test_data: testData,
         selector_profile: selectorProfile,
+        ...(preExpandedSteps && preExpandedSteps.length > 0 && { pre_expanded_steps: preExpandedSteps }),
       }),
     });
     if (!planResponse.ok) {
@@ -1180,13 +1182,15 @@ export default function Home() {
         };
       } else {
         const useCachedPlan = SHOW_ADVANCED_INPUTS && Boolean(planIsFresh && planPreview);
-        // If generated steps exist, pass them as a numbered list directly.
-        // The backend structured parser converts them to actions without calling Claude.
-        // Falls back to Claude only if the parser can't handle them.
-        const planTask = capturedStepLines && capturedStepLines.length > 0
-          ? capturedStepLines.map((s, i) => `${i + 1}. ${s}`).join("\n")
-          : task;
-        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(planTask, testData, selectorProfile);
+        // When generated steps exist, send them as pre_expanded_steps so the backend
+        // bypasses the structured parser and human_steps re-expansion, going directly
+        // to plan_task with all steps intact.  The original prompt is kept as task.
+        plan = useCachedPlan && planPreview ? planPreview : await requestPlan(
+          task,
+          testData,
+          selectorProfile,
+          capturedStepLines ?? undefined,
+        );
         if (!useCachedPlan) {
           setPlanPreview(plan);
           setPlanSignature(buildPlanSignature(prompt, testDataInput, selectorProfileInput));

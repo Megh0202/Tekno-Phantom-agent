@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
 import httpx
+
+LOGGER = logging.getLogger("tekno.phantom.brain.anthropic")
 
 from app.config import Settings
 from app.llm.utils import (
@@ -61,15 +64,26 @@ class AnthropicProvider:
                 "You are a web automation planner. "
                 "Return ONLY strict JSON with keys: run_name, start_url, steps. "
                 "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
-                "Cover every explicit user instruction in order when max_steps allows. "
-                "Do not invent extra requirements not present in the task."
+                "CRITICAL: Preserve every instruction in the task list as a separate step. "
+                "Do NOT merge, combine, or skip any numbered instruction. "
+                "Each numbered instruction must map to at least one step in your output. "
+                "Cover every explicit user instruction in order. "
+                "Do not invent extra requirements not present in the task. "
+                "IMPORTANT: Each selector field must be a single concise Playwright selector string. "
+                "Never use comma-separated fallback lists in selectors. "
+                "Keep every selector under 80 characters. "
+                "TRACEABILITY: Add a 'src_step' field (integer) to every step. "
+                "Set it to the 1-based index of the numbered instruction that step implements. "
+                "If one instruction expands into multiple steps, all of them share the same src_step value."
             ),
             user=(
                 f"Task: {task}\n"
                 f"Max steps: {max_steps}\n"
-                "Return compact valid JSON only."
+                "Return compact valid JSON only. One selector per step, no fallback lists. "
+                "Every numbered instruction must appear as at least one step. "
+                "Include src_step in every step object."
             ),
-            max_tokens=1800,
+            max_tokens=8192,
         )
 
         if text.strip():
@@ -78,8 +92,13 @@ class AnthropicProvider:
                 normalized = normalize_plan(payload, task, max_steps)
                 normalized["raw_llm_response"] = text
                 return normalized
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.warning(
+                    "plan_task: JSON extraction/normalization failed (%s) — raw response length=%d, falling back to stub plan",
+                    exc, len(text),
+                )
+        else:
+            LOGGER.warning("plan_task: LLM returned empty response — falling back to stub plan")
         result = fallback_plan(task, max_steps)
         result["raw_llm_response"] = text or None
         return result

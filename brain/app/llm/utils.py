@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+
+LOGGER = logging.getLogger("tekno.phantom.brain.utils")
 
 _VALID_STEP_TYPES = frozenset({
     "navigate", "click", "type", "select", "drag",
@@ -74,18 +77,36 @@ def normalize_plan(payload: dict[str, Any], task: str, max_steps: int) -> dict[s
         start_url = start_url.strip()
 
     steps: list[dict[str, Any]] = []
-    for step in (payload.get("steps") or []):
+    for idx, step in enumerate(payload.get("steps") or []):
         if not isinstance(step, dict):
+            LOGGER.warning(
+                "normalize_plan: step[%d] dropped — not a dict (got %s)",
+                idx, type(step).__name__,
+            )
             continue
-        if step.get("type") not in _VALID_STEP_TYPES:
+        step_type = step.get("type")
+        if step_type not in _VALID_STEP_TYPES:
+            LOGGER.warning(
+                "normalize_plan: step[%d] dropped — unsupported type %r (supported: %s)",
+                idx, step_type, ", ".join(sorted(_VALID_STEP_TYPES)),
+            )
             continue
         steps.append(step)
         if len(steps) >= max_steps:
+            remaining = len(payload.get("steps") or []) - (idx + 1)
+            if remaining > 0:
+                LOGGER.warning(
+                    "normalize_plan: truncated at max_steps=%d — %d steps beyond the limit were dropped",
+                    max_steps, remaining,
+                )
             break
 
     steps = enforce_task_constraints(task, steps, max_steps)
 
     if not steps:
+        LOGGER.warning(
+            "normalize_plan: no valid steps after enforce_task_constraints — triggering fallback_plan"
+        )
         return fallback_plan(task, max_steps)
 
     return {"run_name": run_name, "start_url": start_url, "steps": steps}
@@ -107,6 +128,10 @@ def extract_selector_list(text: str, max_candidates: int) -> list[str]:
 
 def fallback_plan(task: str, max_steps: int) -> dict[str, Any]:
     """Return a minimal safe plan when LLM generation fails."""
+    LOGGER.warning(
+        "fallback_plan triggered — all generated steps are lost. task=%r",
+        task[:120],
+    )
     url_match = re.search(r"https?://[^\s]+", task)
     start_url = url_match.group(0) if url_match else "https://example.com"
     steps: list[dict[str, Any]] = [
@@ -162,6 +187,10 @@ def enforce_task_constraints(
         if len(steps) < max_steps:
             steps.append(image_step)
         elif steps:
+            LOGGER.warning(
+                "enforce_task_constraints: max_steps=%d already reached — last step %r replaced with verify_image",
+                max_steps, steps[-1].get("type"),
+            )
             steps[-1] = image_step
         else:
             steps = [image_step]
