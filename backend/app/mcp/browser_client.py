@@ -398,12 +398,17 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def navigate(self, url: str) -> str:
         context = self._active_context()
-        navigation_timeout_ms = max(self._settings.playwright_default_timeout_ms, 0)
+        # Use step_timeout_seconds as the navigation budget — it reflects how
+        # long the operator expects a full page load to take, while
+        # playwright_default_timeout_ms is tuned for element interactions and
+        # is too short for slow networks or redirect-heavy pages.
+        nav_budget_ms = max(int(self._settings.step_timeout_seconds * 1000), 30000)
+        first_attempt_ms = nav_budget_ms // 2
         try:
             await context.page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=navigation_timeout_ms,
+                timeout=first_attempt_ms,
             )
         except Exception as exc:
             LOGGER.warning(
@@ -411,16 +416,15 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 url,
                 self._compact_click_error(exc),
             )
-            fallback_timeout_ms = max(navigation_timeout_ms, 15000)
             await context.page.goto(
                 url,
                 wait_until="commit",
-                timeout=fallback_timeout_ms,
+                timeout=nav_budget_ms,
             )
             try:
                 await context.page.wait_for_load_state(
                     "domcontentloaded",
-                    timeout=min(fallback_timeout_ms, 4000),
+                    timeout=min(nav_budget_ms // 4, 8000),
                 )
             except Exception:
                 pass
@@ -1316,6 +1320,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
   };
   const detectScope = (el) => {
     const scopes = [
+      ["[role='listbox'], .oxd-select-dropdown, [class*='dropdown-menu'], [class*='select-dropdown']", "listbox"],
       ["form", "form"],
       ["[role='search']", "search"],
       ["main, [role='main']", "main"],
@@ -1366,6 +1371,32 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     } catch (error) {}
     return null;
   };
+  const detectLabel = (el) => {
+    // 1. Native label association via el.labels (input[id] + label[for])
+    try {
+      if (el.labels && el.labels.length > 0) {
+        const t = Array.from(el.labels).map(l => (l.innerText || l.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+        if (t) return t;
+      }
+    } catch (e) {}
+    // 2. Nearby label in the closest form-field container (covers component-based UIs
+    //    like OrangeHRM where label and input share a wrapper div but have no for/id link)
+    try {
+      const container = el.closest([
+        ".oxd-input-group", ".oxd-form-row", ".form-group",
+        "[class*='input-group']", "[class*='form-field']", "[class*='field-row']",
+        "fieldset", "li", "td",
+      ].join(","));
+      if (container) {
+        const label = container.querySelector("label, .oxd-label, [class*='label']:not(input):not(button)");
+        if (label && label !== el) {
+          const t = (label.innerText || label.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) return t;
+        }
+      }
+    } catch (e) {}
+    return "";
+  };
   const pick = (elements) => elements
     .map((el) => {
       const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
@@ -1379,6 +1410,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
       const title = el.getAttribute("title") || "";
       const inputType = el.getAttribute("type") || "";
       const tag = el.tagName.toLowerCase();
+      const nearbyLabel = detectLabel(el);
       const scope = detectScope(el);
       const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
       const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
@@ -1403,7 +1435,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         const safeHref = href.slice(0, 120).replace(/"/g, '\\"');
         selectors.push(`a[href*="${safeHref}"]`);
       }
-      if (!(text || aria || name || id || testid || placeholder || title)) return null;
+      if (!(text || aria || name || id || testid || placeholder || title || nearbyLabel)) return null;
       return {
         tag,
         type: inputType,
@@ -1415,6 +1447,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         role,
         placeholder,
         title,
+        label: nearbyLabel.slice(0, 80),
         href: href.slice(0, 120),
         scope,
         visible,
@@ -2789,6 +2822,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "  };"
             "  const detectScope = (el) => {"
             "    const scopes = ["
+            "      [\"[role='listbox'], .oxd-select-dropdown, [class*='dropdown-menu'], [class*='select-dropdown']\", 'listbox'],"
             "      ['form', 'form'],"
             "      [\"[role='search']\", 'search'],"
             "      ['main, [role=\"main\"]', 'main'],"

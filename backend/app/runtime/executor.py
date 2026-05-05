@@ -361,13 +361,29 @@ class AgentExecutor:
                         should_navigate_to_start = True
 
             if should_navigate_to_start and run.start_url:
-                try:
-                    await asyncio.wait_for(
-                        self._browser.navigate(run.start_url),
-                        timeout=self._settings.step_timeout_seconds,
-                    )
-                except Exception as exc:
-                    await self._record_startup_navigation_failure(run, exc)
+                _NAV_MAX_ATTEMPTS = 2
+                _nav_exc: Exception | None = None
+                for _nav_attempt in range(1, _NAV_MAX_ATTEMPTS + 1):
+                    try:
+                        await asyncio.wait_for(
+                            self._browser.navigate(run.start_url),
+                            timeout=self._settings.step_timeout_seconds,
+                        )
+                        _nav_exc = None
+                        break
+                    except Exception as exc:
+                        _nav_exc = exc
+                        if _nav_attempt < _NAV_MAX_ATTEMPTS:
+                            LOGGER.warning(
+                                "Run %s: initial navigation attempt %d/%d failed (%s) — retrying in 3s",
+                                run.run_id,
+                                _nav_attempt,
+                                _NAV_MAX_ATTEMPTS,
+                                self._compact_error(exc),
+                            )
+                            await asyncio.sleep(3)
+                if _nav_exc is not None:
+                    await self._record_startup_navigation_failure(run, _nav_exc)
                     return
 
             has_step_failure = False
@@ -2522,13 +2538,29 @@ class AgentExecutor:
             raw_selector = str((step.input or {}).get("selector", "")).strip()
             if raw_selector and step.type in {"click", "type", "select", "verify_text"}:
                 page_snapshot = await self._safe_page_snapshot() or {}
+                text_hint = self._step_text_hint(step.input or {})
+                # Focus the snapshot to only intent-relevant elements and derive
+                # an element_hint from the best match so Claude targets the right
+                # element instead of suggesting generic fallbacks.
+                focused_snapshot, element_hint = self._focused_snapshot_for_suggestion(
+                    page_snapshot, raw_selector, step.type, text_hint
+                )
+                LOGGER.debug(
+                    "Run %s step %d: suggestion snapshot focused to %d element(s) "
+                    "(was %d total) element_hint=%s",
+                    run.run_id, step.index + 1,
+                    len((focused_snapshot.get("interactive_elements") or [])),
+                    len((page_snapshot.get("interactive_elements") or [])),
+                    bool(element_hint),
+                )
                 suggestions = await self._brain.suggest_selectors(
                     step_type=step.type,
                     failed_selector=raw_selector,
                     error_message=str(step.error or step.message or "unknown error"),
-                    page=page_snapshot,
-                    text_hint=self._step_text_hint(step.input or {}),
+                    page=focused_snapshot,
+                    text_hint=text_hint,
                     max_candidates=3,
+                    element_hint=element_hint,
                 )
                 if suggestions:
                     step.failure_selector_suggestions = suggestions
@@ -3024,6 +3056,64 @@ class AgentExecutor:
             "page_count": int(snapshot.get("page_count") or 1),
             "interactive_sample": sample,
         }
+
+    def _focused_snapshot_for_suggestion(
+        self,
+        snapshot: dict[str, Any],
+        raw_selector: str,
+        step_type: str,
+        text_hint: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """
+        Return a focused version of the page snapshot for the selector suggestion
+        call, plus an element_hint dict for the best-matching element.
+
+        Instead of sending Claude all 50+ interactive elements, we send only the
+        top-N that score above zero against the step intent.  This reduces noise
+        and makes Claude's suggestions specific to the intended target.
+
+        Returns:
+            focused_snapshot  — copy of snapshot with interactive_elements filtered
+                                to the top matching elements (max 10)
+            element_hint      — attribute dict of the single best-matching element,
+                                or None if no match found
+        """
+        intent = self._build_step_intent(step_type, raw_selector, text_hint)
+        target_terms = self._selector_search_terms(raw_selector, text_hint, intent)
+
+        elements = snapshot.get("interactive_elements")
+        if not isinstance(elements, list) or not target_terms:
+            # No filtering possible — return the snapshot as-is, no hint
+            return snapshot, None
+
+        # Score every element and keep those with score > 0
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for item in elements:
+            if not isinstance(item, dict):
+                continue
+            s = self._snapshot_match_score(item, target_terms, step_type, intent)
+            if s > 0:
+                scored.append((s, item))
+
+        if not scored:
+            return snapshot, None
+
+        scored.sort(key=lambda e: e[0], reverse=True)
+        top_items = [item for _, item in scored[:10]]
+
+        focused = dict(snapshot)
+        focused["interactive_elements"] = top_items
+
+        # Build element_hint from the single best match — gives Claude a precise
+        # identity description of the intended target element.
+        best_item = scored[0][1]
+        element_hint: dict[str, Any] = {}
+        for field in ("tag", "role", "text", "aria", "name", "id", "testid", "placeholder", "title"):
+            val = str(best_item.get(field, "")).strip()
+            if val:
+                element_hint[field] = val
+
+        return focused, element_hint or None
 
     @staticmethod
     def _looks_like_explicit_selector(selector: str) -> bool:
@@ -3674,6 +3764,100 @@ class AgentExecutor:
 
         return self._dedupe(candidates)
 
+    @staticmethod
+    def _build_snapshot_selector_index(
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Build a mapping from each selector string produced by a snapshot item
+        back to that item's attribute dict.  Used by the pre-action semantic
+        gate to validate a resolved selector against the intended element.
+
+        Only indexes items that were actually present in the live snapshot;
+        profile-generated selectors that don't appear in the snapshot will not
+        be found (that's intentional — we only gate on elements we know about).
+        """
+        index: dict[str, dict[str, Any]] = {}
+        if not isinstance(snapshot, dict):
+            return index
+        for item in snapshot.get("interactive_elements") or []:
+            if not isinstance(item, dict):
+                continue
+            for sel in item.get("selectors") or []:
+                s = str(sel).strip()
+                if s:
+                    index[s] = item
+        return index
+
+    def _pre_action_semantic_gate(
+        self,
+        selector: str,
+        step_type: str,
+        intent: "StepIntent | None",
+        snapshot_index: dict[str, dict[str, Any]],
+        *,
+        explicit_selector: bool,
+    ) -> tuple[bool, str]:
+        """
+        Lightweight semantic check run after _probe_element_present passes but
+        before the browser action fires.
+
+        Returns (allow: bool, reason: str).
+
+        Rules:
+        1. Always allow explicit selectors — the user wrote them intentionally.
+        2. Allow if the selector is not in the snapshot index — it came from the
+           profile or LLM, we can't validate it here without extra I/O.
+        3. Role/tag plausibility: a button must not be targeted by 'type';
+           a plain text input must not be the target of a navigation 'click'
+           when the intent clearly identifies a button or link.
+        4. Label alignment: at least one meaningful word from intent.target_text
+           must appear in the element's text/aria/placeholder/name surface.
+           Skip this check when target_text is absent or very short.
+        """
+        if explicit_selector:
+            return True, "explicit_selector_skip"
+
+        item = snapshot_index.get(selector)
+        if item is None:
+            return True, "not_in_snapshot_skip"
+
+        tag = str(item.get("tag", "")).lower()
+        role = str(item.get("role", "")).lower()
+
+        # Rule 3 — role/tag plausibility
+        if step_type == "type":
+            if tag == "button" or role in {"button", "menuitem", "tab", "link"}:
+                return False, f"semantic_gate: type on non-input element tag={tag!r} role={role!r}"
+            if tag not in {"input", "textarea", "select", ""} and role not in {
+                "textbox", "searchbox", "combobox", "spinbutton", ""
+            }:
+                return False, f"semantic_gate: type on unexpected element tag={tag!r} role={role!r}"
+        elif step_type == "select":
+            if tag not in {"select", ""} and role not in {"combobox", "listbox", ""}:
+                return False, f"semantic_gate: select on non-select element tag={tag!r} role={role!r}"
+
+        # Rule 4 — label alignment (only when we have a meaningful target_text)
+        if intent and intent.target_text:
+            target_words = {
+                w for w in re.findall(r"[a-z0-9]+", intent.target_text.lower())
+                if len(w) >= 4
+            }
+            if len(target_words) >= 1:
+                haystack = " ".join(
+                    str(item.get(f, "")).lower()
+                    for f in ("label", "text", "aria", "placeholder", "name", "title", "id")
+                )
+                matched = [w for w in target_words if w in haystack]
+                if not matched:
+                    return False, (
+                        f"semantic_gate: no label overlap — "
+                        f"target_words={sorted(target_words)} "
+                        f"element_text={str(item.get('text',''))[:40]!r}"
+                    )
+
+        return True, "ok"
+
     async def _run_with_selector_fallback(
         self,
         raw_selector: str,
@@ -3699,6 +3883,9 @@ class AgentExecutor:
             retained_count=0,
         )
         live_snapshot = await self._safe_page_snapshot()
+        snapshot_selector_index = self._build_snapshot_selector_index(
+            live_snapshot if isinstance(live_snapshot, dict) else None
+        )
         if not explicit_selector and isinstance(live_snapshot, dict):
             live_snapshot_candidates = self._page_snapshot_selector_candidates(
                 live_snapshot,
@@ -3857,6 +4044,42 @@ class AgentExecutor:
                             },
                         )
                         continue
+                    # Pre-action semantic gate: confirm this element is actually
+                    # the intended target before firing the browser action.
+                    # Runs after probe_ok (element is visible) but before the
+                    # action.  Grounded selectors (perception-matched) skip the
+                    # gate — they were already validated at grounding time.
+                    if not is_grounded and step_type in {"click", "type", "select"}:
+                        gate_ok, gate_reason = self._pre_action_semantic_gate(
+                            selector,
+                            step_type,
+                            intent,
+                            snapshot_selector_index,
+                            explicit_selector=explicit_selector,
+                        )
+                        if not gate_ok:
+                            compact_error = f"semantic_gate: {gate_reason}"
+                            LOGGER.warning(
+                                "Selector fallback: semantic gate REJECTED "
+                                "(cycle=%d step_type=%s selector=%r reason=%r) — skipping",
+                                cycle + 1, step_type, selector, gate_reason,
+                            )
+                            attempts.append(f"pass {cycle + 1}: {selector} -> {compact_error}")
+                            last_error = ValueError(compact_error)
+                            self._record_group_attempt(
+                                trace_group,
+                                {
+                                    "phase": "candidate",
+                                    "cycle": cycle,
+                                    "selector": selector,
+                                    "status": "semantic_gate_rejected",
+                                    "gate_reason": gate_reason,
+                                    "grounded": False,
+                                    "elapsed_ms": self._elapsed_ms(attempt_started),
+                                    "error": compact_error,
+                                },
+                            )
+                            continue
                 try:
                     if pre_attempt is not None:
                         pre_started = perf_counter()
@@ -4270,6 +4493,24 @@ class AgentExecutor:
         if not isinstance(elements, list):
             return []
 
+        # When a listbox/dropdown is open, its options (role='option') are the
+        # only valid click targets — nav links and other page elements must not
+        # win the scoring race just because they share the same visible text.
+        if step_type == "click":
+            open_listbox_options = [
+                item for item in elements
+                if isinstance(item, dict)
+                and str(item.get("role", "")).lower() == "option"
+                and bool(item.get("visible", True))
+            ]
+            if open_listbox_options:
+                LOGGER.debug(
+                    "_page_snapshot_selector_candidates: open listbox detected (%d options) — "
+                    "restricting click candidates to role='option' elements only",
+                    len(open_listbox_options),
+                )
+                elements = open_listbox_options
+
         target_terms = self._selector_search_terms(raw_selector, text_hint, intent)
         if not target_terms:
             return []
@@ -4317,6 +4558,13 @@ class AgentExecutor:
                 return self._rank_live_snapshot_selectors(self._dedupe(selected), intent)
 
         ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+        # Drop elements that score much lower than the top match — they are
+        # almost certainly not the target and only inject noisy selectors into
+        # the candidate pool fed to _rank_live_snapshot_selectors.
+        if ranked:
+            top_element_score = ranked[0][0]
+            score_floor = max(top_element_score - 20, 4)
+            ranked = [entry for entry in ranked if entry[0] >= score_floor]
         flattened: list[str] = []
         for _, _, selectors in ranked[:8]:
             flattened.extend(selectors)
@@ -4346,6 +4594,8 @@ class AgentExecutor:
         if scope in preferred:
             rank = preferred.index(scope)
             return max(18 - rank * 4, 4)
+        if scope == "listbox" and intent.action == "click":
+            return 20  # Strong bonus — element is inside an open dropdown
         if scope in {"nav", "aside", "footer"} and intent.element_type in {"input", "button", "listitem"}:
             return -8
         if scope == "header" and intent.element_type == "listitem":
@@ -4359,8 +4609,11 @@ class AgentExecutor:
         visible = bool(item.get("visible", True))
         haystack = " ".join(
             str(item.get(field, "")).lower()
-            for field in ("text", "aria", "name", "id", "testid", "placeholder", "title", "href")
+            for field in ("text", "aria", "name", "id", "testid", "placeholder", "title", "label", "href")
         )
+        # Listbox dropdown options are always valid click targets if visible.
+        if role == "option" and intent.action == "click":
+            return visible
         if not visible and intent.element_type in {"input", "button", "link", "listitem"}:
             return False
         preferred_scopes = self._preferred_scopes_for_intent(intent)
@@ -4423,13 +4676,22 @@ class AgentExecutor:
                     "third",
                     "type",
                     "videoid",
+                    # Generic tokens common in CSS class/id names but carrying
+                    # no discriminating signal about element identity.
+                    "page",
+                    "btn",
+                    "field",
+                    "val",
                 }:
                     tokens.append(part)
         return self._dedupe(tokens)
 
     @staticmethod
     def _snapshot_item_label(item: dict[str, Any]) -> str:
-        for field in ("text", "aria", "title", "name", "placeholder"):
+        # "label" is the nearby <label> element text — checked before "text"
+        # because for plain inputs it is more descriptive than the input's own
+        # innerText (which is usually empty).
+        for field in ("label", "text", "aria", "title", "name", "placeholder"):
             value = str(item.get(field, "")).strip().lower()
             if value:
                 return value[:120]
@@ -4451,20 +4713,18 @@ class AgentExecutor:
         intent: StepIntent | None = None,
         duplicate_counts: dict[str, int] | None = None,
     ) -> int:
-        haystack_parts = [
-            str(item.get("tag", "")),
-            str(item.get("type", "")),
-            str(item.get("text", "")),
-            str(item.get("aria", "")),
-            str(item.get("name", "")),
-            str(item.get("id", "")),
-            str(item.get("testid", "")),
-            str(item.get("role", "")),
-            str(item.get("placeholder", "")),
-            str(item.get("href", "")),
-            str(item.get("title", "")),
-        ]
-        haystack = " ".join(part.lower() for part in haystack_parts if part).strip()
+        # Field priority weights: stable identity attributes score much higher
+        # than visible text or href. A term in id/testid is a strong identity
+        # signal; the same term buried in text or href is weak and noisy.
+        # "label" is the nearby visible <label> text captured from the DOM —
+        # high weight because it directly names the field for the user.
+        _FIELD_WEIGHTS = (
+            ("id", 24), ("testid", 22), ("name", 18), ("aria", 16),
+            ("label", 20), ("placeholder", 14), ("text", 10), ("title", 8),
+            ("href", 6), ("role", 5), ("type", 4), ("tag", 4),
+        )
+        field_vals: dict[str, str] = {f: str(item.get(f, "")).lower() for f, _ in _FIELD_WEIGHTS}
+        haystack = " ".join(v for v in field_vals.values() if v).strip()
         if not haystack:
             return 0
 
@@ -4475,9 +4735,21 @@ class AgentExecutor:
         if duplicate_counts and label:
             duplicate_count = int(duplicate_counts.get(label, 0))
         for term in target_terms:
-            if term in haystack:
+            best_field_score = 0
+            escaped_term = re.escape(term)
+            for field, weight in _FIELD_WEIGHTS:
+                fval = field_vals[field]
+                if fval and term in fval:
+                    # +5 when the term lands at a word/separator boundary within
+                    # the field value — e.g. "search" in "search-input" earns
+                    # the bonus; "search" embedded in "researching" does not.
+                    at_boundary = bool(re.search(
+                        r'(?:^|[\s\-_/])' + escaped_term + r'(?:[\s\-_/]|$)', fval
+                    ))
+                    best_field_score = max(best_field_score, weight + (5 if at_boundary else 0))
+            if best_field_score > 0:
                 keyword_matches += 1
-                score += max(8, len(term))
+                score += best_field_score
 
         if target_terms and keyword_matches == 0:
             return 0
@@ -4488,10 +4760,55 @@ class AgentExecutor:
             score += self._scope_score(str(item.get("scope", "")), intent)
             target_text = (intent.target_text or "").strip().lower()
             if target_text and label:
+                target_words = set(re.findall(r"[a-z0-9]+", target_text))
+                label_words = set(re.findall(r"[a-z0-9]+", label))
                 if target_text == label:
-                    score += 24
+                    score += 30  # strongest: exact phrase match
+                elif target_words == label_words:
+                    score += 26  # same words, different surface order
                 elif target_text in label:
-                    score += 12
+                    # Target phrase is embedded in a longer label.
+                    # Extra meaningful words in the label suggest this is a
+                    # different/more-specific element than the intended one.
+                    extra_label_words = [w for w in label_words - target_words if len(w) >= 4]
+                    score += 6 if extra_label_words else 14
+                elif label in target_text:
+                    score += 10  # label is a prefix/subset of target
+
+                # Penalty for spurious words in the label that are not in the
+                # target — each extra meaningful word pushes this element away
+                # from the intended target (e.g. "Employee" in "Employee Name"
+                # when the target is "Username").
+                if target_words:
+                    spurious = [w for w in label_words - target_words if len(w) >= 4]
+                    score -= min(len(spurious) * 4, 16)
+
+                # Confusable pair table: when the intent clearly targets one
+                # side of a known confusable pair and the element clearly shows
+                # the other side, apply a strong disambiguation penalty.
+                _CONFUSABLE = (
+                    ({"sign in", "signin", "login", "log in"},
+                     {"sign up", "signup", "register", "create account"}),
+                    ({"login", "log in", "sign in"},
+                     {"logout", "log out", "sign out"}),
+                    ({"username", "user name"},
+                     {"employee name", "full name", "first name", "last name"}),
+                    ({"password"},
+                     {"username", "email", "email address"}),
+                    ({"save"},
+                     {"save changes", "save as", "save draft"}),
+                    ({"delete", "remove"},
+                     {"cancel", "close", "dismiss"}),
+                )
+                for _grp_a, _grp_b in _CONFUSABLE:
+                    _t_in_a = any(t in target_text for t in _grp_a)
+                    _t_in_b = any(t in target_text for t in _grp_b)
+                    _l_in_a = any(t in label for t in _grp_a)
+                    _l_in_b = any(t in label for t in _grp_b)
+                    if (_t_in_a and _l_in_b and not _l_in_a) or (_t_in_b and _l_in_a and not _l_in_b):
+                        score -= 28
+                        break
+
             stable_attrs = sum(
                 1
                 for field in ("id", "testid", "name")
