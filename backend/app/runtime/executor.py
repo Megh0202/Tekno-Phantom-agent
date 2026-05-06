@@ -319,10 +319,11 @@ class AgentExecutor:
         # Guard: if a concurrent execute() call queued up while the primary
         # execution was running (e.g. from _execute_and_persist_selector background
         # tasks), skip re-execution once the run has reached a terminal state.
-        # The primary while-True loop in _execute_existing_steps already handled
-        # all selector retries inline; the queued call is only needed for its
-        # selector-persistence side-effect, which runs after executor.execute() returns.
-        if run.status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}:
+        # Exception: if apply_manual_selector_hint reset a step to pending and
+        # changed run.status back to running, we must allow re-execution even if
+        # the run previously reached a terminal state (failed after 40s timeout).
+        _has_pending_step = any(s.status == StepStatus.pending for s in run.steps)
+        if run.status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled} and not _has_pending_step:
             LOGGER.info(
                 "Run %s: execute() called on already-terminal run (status=%s), skipping re-execution",
                 run_id,
@@ -2751,6 +2752,19 @@ class AgentExecutor:
 
         if step_type == "type":
             selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
+            # Build a set of selectors already used by earlier completed type steps
+            # so the fallback pipeline never re-uses them for a different field.
+            _used_type_selectors: set[str] = set()
+            _current_step_idx = raw_step.get("index", -1)
+            for _prev in run.steps:
+                if (
+                    _prev.type == "type"
+                    and _prev.status.value == "completed"
+                    and (_current_step_idx < 0 or _prev.index < _current_step_idx)
+                    and _prev.provided_selector
+                    and _prev.provided_selector.strip() != selector.strip()
+                ):
+                    _used_type_selectors.add(_prev.provided_selector.strip())
             raw_text = str(raw_step["text"])
             text = self._apply_template(raw_text, test_data, run_id=run.run_id)
             clear_first = bool(raw_step.get("clear_first", True))
@@ -2778,6 +2792,7 @@ class AgentExecutor:
                     clear_first=clear_first,
                 ),
                 grounded_selector=raw_step.get("_grounded_selector"),
+                exclude_selectors=_used_type_selectors or None,
             )
 
         if step_type == "select":
@@ -3870,6 +3885,7 @@ class AgentExecutor:
         pre_attempt: Callable[[str], Awaitable[Any]] | None = None,
         post_validate: Callable[[str, str, Any], Awaitable[str | None]] | None = None,
         grounded_selector: str | None = None,
+        exclude_selectors: set[str] | None = None,
     ) -> str:
         intent = self._build_step_intent(step_type, raw_selector, text_hint)
         selector_generation_started = perf_counter()
@@ -3942,6 +3958,19 @@ class AgentExecutor:
                 )
             elif candidates[0] != grounded_selector:
                 candidates = [grounded_selector] + [c for c in candidates if c != grounded_selector]
+        # Remove selectors already successfully used by earlier steps in this run.
+        # This prevents the fallback from re-using e.g. input[name='password'] for
+        # a confirm-password step just because the field accepted the same text.
+        if exclude_selectors:
+            filtered = [c for c in candidates if c not in exclude_selectors]
+            if filtered:
+                removed = len(candidates) - len(filtered)
+                if removed:
+                    LOGGER.debug(
+                        "Selector fallback: excluded %d already-used candidate(s) for step_type=%s raw_selector=%r",
+                        removed, step_type, raw_selector,
+                    )
+                candidates = filtered
         if not explicit_selector and live_snapshot_candidates:
             candidate_confidence = grounded_confidence
         else:

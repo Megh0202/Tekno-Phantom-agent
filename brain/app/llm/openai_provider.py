@@ -62,7 +62,7 @@ class OpenAIProvider:
                     "content": (
                         "You are a web automation planner. "
                         "Return ONLY strict JSON with keys: run_name, start_url, steps. "
-                        "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                        "steps may only use these step types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
                         "Cover every explicit user instruction in order when max_steps allows. "
                         "Do not invent extra requirements not present in the task."
                     ),

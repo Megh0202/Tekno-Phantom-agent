@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     selector_recovery_enabled: bool = True
     selector_recovery_attempts: int = 2
     selector_recovery_delay_ms: int = 350
-    selector_llm_recovery_enabled: bool = False
+    selector_llm_recovery_enabled: bool = True
     selector_llm_max_candidates: int = 3
     execution_fast_path_enabled: bool = True
     execution_fast_path_action_timeout_seconds: int = 4

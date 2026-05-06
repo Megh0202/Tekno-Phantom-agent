@@ -151,48 +151,6 @@ def enforce_task_constraints(
     steps: list[dict[str, Any]],
     max_steps: int,
 ) -> list[dict[str, Any]]:
-    """Inject any step types the task explicitly requires but the LLM omitted."""
-    task_lower = task.lower()
-
-    if "image" in task_lower and not any(s.get("type") == "verify_image" for s in steps):
-        image_step: dict[str, Any] = {"type": "verify_image"}
-
-        baseline_match = re.search(
-            r"(artifacts/[^\s\"']+\.(?:png|jpg|jpeg))",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if baseline_match:
-            image_step["baseline_path"] = baseline_match.group(1)
-
-        threshold_match = re.search(
-            r"threshold\s*[:=]?\s*([0-9]*\.?[0-9]+)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if threshold_match:
-            try:
-                image_step["threshold"] = float(threshold_match.group(1))
-            except ValueError:
-                pass
-
-        selector_match = re.search(
-            r"image(?:\s+verification)?\s+on\s+([#.\w:-]+)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if selector_match:
-            image_step["selector"] = selector_match.group(1)
-
-        if len(steps) < max_steps:
-            steps.append(image_step)
-        elif steps:
-            LOGGER.warning(
-                "enforce_task_constraints: max_steps=%d already reached — last step %r replaced with verify_image",
-                max_steps, steps[-1].get("type"),
-            )
-            steps[-1] = image_step
-        else:
-            steps = [image_step]
-
+    """Validate steps produced by the LLM. No auto-injection — the LLM decides which
+    step types are needed based on the task. Steps are returned as-is."""
     return steps

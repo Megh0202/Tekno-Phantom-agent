@@ -63,7 +63,7 @@ class AnthropicProvider:
             system=(
                 "You are a web automation planner. "
                 "Return ONLY strict JSON with keys: run_name, start_url, steps. "
-                "steps must use types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                "steps may only use these step types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
                 "CRITICAL: Preserve every instruction in the task list as a separate step. "
                 "Do NOT merge, combine, or skip any numbered instruction. "
                 "Each numbered instruction must map to at least one step in your output. "
