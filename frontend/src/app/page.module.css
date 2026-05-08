@@ -127,9 +127,9 @@
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .primaryColumn {
@@ -150,6 +150,10 @@
 .resultPanel {
   position: sticky;
   top: 16px;
+  align-self: stretch;
+  min-height: calc(100vh - 36px);
+  display: flex;
+  flex-direction: column;
 }
 
 .panel h2 {
@@ -792,8 +796,11 @@
   margin-top: 10px;
   display: grid;
   gap: 8px;
-  max-height: calc(100vh - 290px);
-  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  max-height: calc(100vh - 180px);
+  overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 4px;
 }
 
@@ -805,6 +812,7 @@
   display: grid;
   gap: 6px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  min-width: 0;
 }
 
 .timelineTop {
@@ -902,6 +910,9 @@
   color: var(--ink-700);
   font-size: 14px;
   line-height: 1.5;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .diagnosisBox {
@@ -932,6 +943,8 @@
   font-size: 13px;
   color: #e0e0e0;
   line-height: 1.5;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .selectorSuggestions {
@@ -951,6 +964,8 @@
   padding: 3px 8px;
   cursor: pointer;
   transition: background 0.15s ease;
+  word-break: break-all;
+  max-width: 100%;
 }
 
 .selectorSuggestionChip:hover {
@@ -1007,6 +1022,8 @@
   font-size: 14px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .infoText {
@@ -1026,10 +1043,12 @@
 
   .resultPanel {
     position: static;
+    height: auto;
   }
 
   .timeline {
     max-height: 430px;
+    flex: none;
   }
 }
 
