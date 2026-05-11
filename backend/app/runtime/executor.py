@@ -1142,7 +1142,7 @@ class AgentExecutor:
         test_data = run.test_data or {}
         selector_profile = run.selector_profile or {}
         run_domain = self._extract_run_domain(run)
-        intent = self._build_step_intent(step_type, str(raw_step.get("selector") or ""), self._step_text_hint(raw_step))
+        intent = self._build_step_intent(step_type, str(raw_step.get("selector") or ""), self._step_text_hint(raw_step), self._step_context_hint(raw_step))
 
         if step_type == "navigate":
             target_url = self._apply_template(str(raw_step["url"]), test_data, run_id=run.run_id)
@@ -1450,7 +1450,7 @@ class AgentExecutor:
             }
             if target_words:
                 haystack = " ".join([
-                    el.text, el.aria, el.placeholder, el.name, el.title,
+                    el.text, el.aria, el.placeholder, el.name, el.title, el.label,
                 ]).lower()
                 if not any(w in haystack for w in target_words):
                     return False, (
@@ -1489,7 +1489,7 @@ class AgentExecutor:
                 break
         if selector_probe is None:
             selector_probe = self._selector_seed_from_target(step.input, step.type) or None
-        step_intent = self._build_step_intent(step.type, selector_probe, self._step_text_hint(step.input))
+        step_intent = self._build_step_intent(step.type, selector_probe, self._step_text_hint(step.input), self._step_context_hint(step.input))
         step_trace["intent"] = self._serialize_step_intent(step_intent)
         trace_token = self._step_trace_context.set(step_trace)
         step_token = self._step_state_context.set(step)
@@ -2307,10 +2307,21 @@ class AgentExecutor:
                 return value.strip()
         target = step_input.get("target")
         if isinstance(target, dict):
-            for field in ("text", "label", "placeholder", "context", "kind", "role"):
+            for field in ("text", "label", "placeholder", "kind", "role"):
                 value = target.get(field)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+        return None
+
+    @staticmethod
+    def _step_context_hint(step_input: dict[str, Any]) -> str | None:
+        """Extract target.context from step input — the named section the element
+        sits in (e.g. 'Login form', 'Search bar'). Used for scope_hint."""
+        target = step_input.get("target")
+        if isinstance(target, dict):
+            value = target.get("context")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return None
 
     @staticmethod
@@ -2361,7 +2372,11 @@ class AgentExecutor:
         return None
 
     @staticmethod
-    def _intent_scope_hint(value: str) -> str | None:
+    def _intent_scope_hint(value: str, context_hint: str | None = None) -> str | None:
+        # Prefer the plan's explicit target.context (e.g. "Login form", "Search bar")
+        # over structural keywords parsed from the selector string.
+        if context_hint and context_hint.strip():
+            return context_hint.strip().lower()
         lowered = value.lower()
         for scope in ("form", "main", "nav", "article", "header", "footer", "dialog"):
             if scope in lowered:
@@ -2394,7 +2409,7 @@ class AgentExecutor:
             if phrase in lowered:
                 return phrase
 
-        if step_type == "verify_text" and text_hint and text_hint.strip():
+        if step_type in {"verify_text", "type", "select"} and text_hint and text_hint.strip():
             return text_hint.strip()
 
         cleaned = re.sub(r"[\[\]#.:>'\"=_()-]+", " ", lowered)
@@ -2444,7 +2459,7 @@ class AgentExecutor:
             return "input"
         return "any"
 
-    def _build_step_intent(self, step_type: str, raw_selector: str | None, text_hint: str | None = None) -> StepIntent:
+    def _build_step_intent(self, step_type: str, raw_selector: str | None, text_hint: str | None = None, context_hint: str | None = None) -> StepIntent:
         selector = (raw_selector or "").strip()
         # Prefer clean visible text over raw CSS selector syntax when computing
         # ordinal/scope signals — raw selectors pollute intent extraction.
@@ -2455,7 +2470,7 @@ class AgentExecutor:
             element_type=self._intent_element_type(step_type, selector, text_hint),
             target_text=self._intent_target_text(step_type, selector, text_hint),
             ordinal=self._intent_ordinal(source),
-            scope_hint=self._intent_scope_hint(source),
+            scope_hint=self._intent_scope_hint(source, context_hint),
             raw_selector=selector or None,
             text_hint=text_hint,
         )
@@ -3840,6 +3855,15 @@ class AgentExecutor:
         tag = str(item.get("tag", "")).lower()
         role = str(item.get("role", "")).lower()
 
+        # Rule 2a — disabled element check
+        if item.get("enabled") is False:
+            return False, f"semantic_gate: element is disabled tag={tag!r} role={role!r}"
+
+        # Rule 2b — hidden input check: type=hidden elements are never interactable
+        input_type = str(item.get("type", "")).lower()
+        if step_type in {"type", "select"} and input_type == "hidden":
+            return False, f"semantic_gate: type/select on hidden input tag={tag!r}"
+
         # Rule 3 — role/tag plausibility
         if step_type == "type":
             if tag == "button" or role in {"button", "menuitem", "tab", "link"}:
@@ -3856,7 +3880,7 @@ class AgentExecutor:
         if intent and intent.target_text:
             target_words = {
                 w for w in re.findall(r"[a-z0-9]+", intent.target_text.lower())
-                if len(w) >= 4
+                if len(w) >= 3
             }
             if len(target_words) >= 1:
                 haystack = " ".join(
@@ -4837,6 +4861,46 @@ class AgentExecutor:
                     if (_t_in_a and _l_in_b and not _l_in_a) or (_t_in_b and _l_in_a and not _l_in_b):
                         score -= 28
                         break
+
+            # Generic label-alignment quality for input-like steps.
+            # Computes token coverage × precision between the intent and the
+            # element's primary identity surface (label > aria > placeholder > name).
+            # Their product rewards elements whose label fully and specifically
+            # matches the intent — without referencing any domain vocabulary.
+            #
+            #   coverage  = matched / intent_tokens  (how complete the match is)
+            #   precision = matched / label_tokens   (how focused the label is)
+            #   overlap_q = coverage × precision     (0 < q ≤ 1 for a perfect match)
+            #
+            # Falls back gracefully to 0 when label metadata is absent.
+            if step_type in {"type", "select"}:
+                _intent_txt = (intent.target_text or "").strip().lower()
+                _intent_toks: set[str] = (
+                    {w for w in re.findall(r"[a-z0-9]+", _intent_txt) if len(w) >= 3}
+                    if _intent_txt else set()
+                )
+                _label_surface = " ".join(
+                    str(item.get(f, "")).strip().lower()
+                    for f in ("label", "aria", "placeholder", "name")
+                    if str(item.get(f, "")).strip()
+                )
+                if _intent_toks and _label_surface:
+                    _label_toks = {
+                        w for w in re.findall(r"[a-z0-9]+", _label_surface)
+                        if len(w) >= 3
+                    }
+                    _matched = _intent_toks & _label_toks
+                    if _matched:
+                        _coverage  = len(_matched) / len(_intent_toks)
+                        _precision = len(_matched) / max(len(_label_toks), 1)
+                        _overlap_q = _coverage * _precision
+                        score += int(_overlap_q * 20)
+                        if _coverage >= 1.0:
+                            score += int(_precision * 10)
+                    elif len(_intent_toks) >= 2:
+                        # Label surface exists but shares no tokens with a
+                        # multi-token intent — mild penalty.
+                        score -= 6
 
             stable_attrs = sum(
                 1

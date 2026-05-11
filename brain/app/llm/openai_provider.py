@@ -63,8 +63,29 @@ class OpenAIProvider:
                         "You are a web automation planner. "
                         "Return ONLY strict JSON with keys: run_name, start_url, steps. "
                         "steps may only use these step types: navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image. "
+                        "CRITICAL: Preserve every instruction in the task list as a separate step. "
+                        "Do NOT merge, combine, or skip any numbered instruction. "
+                        "Each numbered instruction must map to at least one step in your output. "
                         "Cover every explicit user instruction in order when max_steps allows. "
-                        "Do not invent extra requirements not present in the task."
+                        "Do not invent extra requirements not present in the task. "
+                        "IMPORTANT: Each selector field must be a single concise Playwright selector string. "
+                        "Never use comma-separated fallback lists in selectors. "
+                        "Keep every selector under 80 characters. "
+                        "TRACEABILITY: Add a 'src_step' field (integer) to every step. "
+                        "Set it to the 1-based index of the numbered instruction that step implements. "
+                        "If one instruction expands into multiple steps, all of them share the same src_step value. "
+                        "TARGET METADATA: For every click, type, and select step include a 'target' object "
+                        "with human-readable identity fields for the element. "
+                        "Set 'target.text' to the visible label, button text, link text, or option text. "
+                        "Set 'target.label' if the element has an associated form label. "
+                        "Set 'target.placeholder' if the element is an input with a placeholder. "
+                        "Set 'target.role' if the element has a semantic role (e.g. button, textbox, combobox). "
+                        "Set 'target.type' if the element is an input (e.g. text, password, email, checkbox). "
+                        "Set 'target.value' if a specific value will be typed or selected. "
+                        "Set 'target.context' if the element sits inside a named section (e.g. Login form, Search bar). "
+                        "Omit target fields you are not confident about. "
+                        "Example: {\"type\": \"type\", \"selector\": \"input[name='email']\", "
+                        "\"target\": {\"label\": \"Email Address\", \"type\": \"email\", \"value\": \"user@example.com\"}, \"src_step\": 1}."
                     ),
                 },
                 {
@@ -72,7 +93,9 @@ class OpenAIProvider:
                     "content": (
                         f"Task: {task}\n"
                         f"Max steps: {max_steps}\n"
-                        "Return compact valid JSON only."
+                        "Return compact valid JSON only. One selector per step, no fallback lists. "
+                        "Every numbered instruction must appear as at least one step. "
+                        "Include src_step and target in every click, type, and select step."
                     ),
                 },
             ],

@@ -44,6 +44,7 @@ class IndexedElement:
     placeholder: str
     title: str
     el_type: str        # value of input[type]
+    label: str          # associated <label> text for the element
     visible: bool
     enabled: bool
     selectors: tuple[str, ...]   # ordered most-stable → least-stable
@@ -210,6 +211,7 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
             placeholder=str(item.get("placeholder", "")).strip(),
             title=str(item.get("title", "")).strip(),
             el_type=str(item.get("type", "")).strip(),
+            label=str(item.get("label", "")).strip()[:80],
             visible=True,
             enabled=bool(item.get("enabled", True)),
             selectors=selectors,
@@ -256,7 +258,7 @@ def _element_haystack(el: IndexedElement) -> str:
     """All searchable text for an element, lower-cased."""
     return " ".join([
         el.text, el.aria, el.name, el.el_id, el.testid,
-        el.placeholder, el.title, el.role, el.tag, el.el_type,
+        el.placeholder, el.title, el.role, el.tag, el.el_type, el.label,
     ]).lower()
 
 
@@ -301,6 +303,9 @@ def score_element(
         # name attribute
         if token in el.name.lower():
             score += 8
+        # associated label text — strong identity signal for form inputs
+        if el.label and token in el.label.lower():
+            score += 10
 
     # If we have tokens but none matched → element is irrelevant
     if tokens and matched == 0:
@@ -319,6 +324,18 @@ def score_element(
     # and intent is "sign in") — strongest possible signal.
     if tokens and el_text_lower == " ".join(tokens):
         score += 30
+
+    # Label phrase-match bonus for type/select steps: the associated <label>
+    # text is the strongest signal for identifying the correct input field.
+    # A full phrase match in the label (e.g. label="Confirm Password" when
+    # intent is "confirm password") scores higher than a partial token match.
+    if el.label and step_type in {"type", "select"}:
+        label_lower = el.label.lower()
+        phrase = " ".join(tokens)
+        if phrase and phrase in label_lower:
+            score += 20   # full phrase present in label
+        elif any(t in label_lower for t in tokens):
+            score += 8    # at least one token present in label
 
     # Step type alignment bonuses / penalties
     if step_type == "click":
