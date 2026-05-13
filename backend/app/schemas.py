@@ -41,6 +41,13 @@ class StepStatus(str, Enum):
 
 
 class SemanticTarget(BaseModel):
+    # Canonical semantic contract (v2) — populated by the new planner
+    semantic_name: str | None = None    # canonical element identity (e.g. "email", "submit button")
+    expected_role: str | None = None    # ARIA semantic role (textbox, button, combobox, link, ...)
+    accessible_name: str | None = None  # visible label / accessible name the user sees
+    scope: str | None = None            # named container context (e.g. "login form")
+
+    # Legacy fields — kept for backward compatibility with existing plans
     kind: str | None = None
     role: str | None = None
     text: str | None = None
@@ -48,13 +55,26 @@ class SemanticTarget(BaseModel):
     placeholder: str | None = None
     context: str | None = None
 
-    @field_validator("kind", "role", "text", "label", "placeholder", "context")
+    @field_validator(
+        "semantic_name", "expected_role", "accessible_name", "scope",
+        "kind", "role", "text", "label", "placeholder", "context",
+    )
     @classmethod
     def normalize_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = value.strip()
         return normalized or None
+
+    def to_canonical(self) -> dict[str, str | None]:
+        """Resolve new-or-legacy fields into the canonical semantic contract dict."""
+        return {
+            "semantic_name": self.semantic_name or self.kind or None,
+            "expected_role": self.expected_role or self.role or None,
+            "accessible_name": self.accessible_name or self.label or self.text or None,
+            "placeholder": self.placeholder,
+            "scope": self.scope or self.context or None,
+        }
 
 
 class NavigateStep(BaseModel):
@@ -169,7 +189,7 @@ class RunCreateRequest(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "continue"
+    failure_mode: Literal["stop", "continue"] = "stop"
     steps: list[ActionStep] = Field(default_factory=list)
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
@@ -626,7 +646,7 @@ class RunState(BaseModel):
     start_url: str | None = None
     prompt: str = ""
     execution_mode: Literal["plan", "autonomous"] = "plan"
-    failure_mode: Literal["stop", "continue"] = "continue"
+    failure_mode: Literal["stop", "continue"] = "stop"
     test_data: dict[str, JsonScalar] = Field(default_factory=dict)
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
     user_id: int = 0

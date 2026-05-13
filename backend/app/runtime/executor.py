@@ -3,7 +3,7 @@ import asyncio
 import contextlib
 from contextvars import ContextVar
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 import json
 import logging
@@ -25,7 +25,9 @@ from app.runtime.perception import (
     ElementIndex,
     PerceptionMatch,
     build_element_index,
+    derive_element_selectors,
     find_best_match,
+    find_best_match_for_target,
     find_by_signatures,
 )
 from app.runtime.selector_memory import SelectorMemoryStore
@@ -34,207 +36,6 @@ from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
 
 LOGGER = logging.getLogger("tekno.phantom.executor")
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")
-DEFAULT_SELECTOR_PROFILE: dict[str, list[str]] = {
-    "popup_accept": [
-        "button:has-text('Accept')",
-        "button:has-text('Accept all')",
-        "button:has-text('I agree')",
-        "button:has-text('Agree')",
-        "button:has-text('Allow all')",
-        "button:has-text('Allow')",
-        "button:has-text('Continue')",
-        "button:has-text('OK')",
-        "button:has-text('Got it')",
-        "button:has-text('Alle akzeptieren')",
-        "button:has-text('Akzeptieren')",
-        "button:has-text('Zustimmen')",
-        "[role='button']:has-text('Accept')",
-        "[role='button']:has-text('Accept all')",
-        "[role='button']:has-text('Alle akzeptieren')",
-        "[role='button']:has-text('Akzeptieren')",
-        "[id*='accept']",
-        "[data-testid*='accept']",
-        "[aria-label*='accept']",
-        "[aria-label*='cookie']",
-    ],
-    "popup_dismiss": [
-        "button[aria-label*='Close']",
-        "button[aria-label*='Dismiss']",
-        "button[aria-label*='Schlie']",
-        "button:has-text('Close')",
-        "button:has-text('Dismiss')",
-        "button:has-text('Skip')",
-        "button:has-text('Not now')",
-        "button:has-text('Later')",
-        "button:has-text('Schlie')",
-        "[role='button']:has-text('Close')",
-        "[role='button']:has-text('Dismiss')",
-        "[data-testid*='close']",
-        "[aria-label*='close']",
-    ],
-    "email": [
-        "#username",
-        "input[name='username']",
-        "input[name='email']",
-        "input[id='email']",
-        "input[type='email']",
-        "input[autocomplete='email']",
-        "input[autocomplete='username']",
-        "input[placeholder*='Email']",
-        "input[placeholder*='email']",
-        "input[type='text']",
-    ],
-    "username": [
-        "#username",
-        "input[name='username']",
-        "input[name='email']",
-        "input[id='email']",
-        "input[placeholder*='Email']",
-        "input[placeholder*='email']",
-        "input[type='text']",
-    ],
-    "password": [
-        "#password",
-        "input[name='password']",
-        "input[id='password']",
-        "input[type='password']",
-        "input[placeholder*='Password']",
-        "input[placeholder*='password']",
-    ],
-    "confirm_password": [
-        "input[name='confirm_password']",
-        "input[name='confirmPassword']",
-        "input[id='confirm_password']",
-        "input[id='confirmPassword']",
-        "input[placeholder*='Confirm Password']",
-        "input[placeholder*='confirm password']",
-        "input[autocomplete='new-password']",
-    ],
-    "first_name": [
-        "input[name='firstName']",
-        "input[name='first_name']",
-        "input[id='firstName']",
-        "input[id='first_name']",
-        "input[name='name']",
-        "input[id='name']",
-        # Placeholder-based — must NOT be inside a phone-widget wrapper
-        "input[placeholder='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
-        "input[placeholder*='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
-        "input[placeholder*='first name']:not(.iti__tel-input):not(.PhoneInputInput)",
-        "input[aria-label*='First Name']:not(.iti__tel-input):not(.PhoneInputInput)",
-        "label:has-text('First Name') + input",
-        "label:has-text('First Name') ~ input",
-    ],
-    "surname": [
-        "input[name='surname']",
-        "input[name='lastName']",
-        "input[name='last_name']",
-        "input[id='surname']",
-        "input[id='lastName']",
-        "input[placeholder='Surname']",
-        "input[placeholder*='Surname']",
-        "input[placeholder='Last Name']",
-        "input[placeholder*='Last Name']",
-        "input[aria-label*='Surname']",
-        "input[aria-label*='Last Name']",
-        "label:has-text('Surname') + input",
-        "label:has-text('Surname') ~ input",
-        "label:has-text('Last Name') + input",
-        "label:has-text('Last Name') ~ input",
-    ],
-    "email": [
-        "input[type='email']",
-        "input[name='email']",
-        "input[id='email']",
-        "input[autocomplete='email']",
-        "input[placeholder='Email Address']",
-        "input[placeholder*='Email']",
-        "input[aria-label*='Email']",
-        "label:has-text('Email') + input",
-        "label:has-text('Email') ~ input",
-    ],
-    "phone": [
-        # Named / typed attributes (most reliable)
-        "input[name='phone']",
-        "input[name='mobile']",
-        "input[name='phone_number']",
-        "input[name='phoneNumber']",
-        "input[id='phone']",
-        "input[id='mobile']",
-        "input[type='tel']",
-        "input[autocomplete='tel']",
-        # intl-tel-input library (flag + code picker) — the actual number input
-        "input.iti__tel-input",
-        ".iti input[type='tel']",
-        ".iti input[type='text']",
-        ".iti__flag-container ~ input",
-        # react-phone-number-input
-        "input.PhoneInputInput",
-        ".PhoneInput input",
-        # react-phone-input-2
-        "input.form-control[placeholder]",
-        # Generic placeholder fallback
-        "input[placeholder*='Phone']",
-        "input[placeholder*='Mobile']",
-        "input[placeholder*='phone']",
-    ],
-    "next_button": [
-        "button:has-text('Next')",
-        "[role='button']:has-text('Next')",
-        "button:has-text('NEXT')",
-        "[role='button']:has-text('NEXT')",
-        "text=Next",
-    ],
-    "create_account": [
-        "button:has-text('Create Account')",
-        "[role='button']:has-text('Create Account')",
-        "button[type='submit']",
-        "input[type='submit']",
-        "text=Create Account",
-    ],
-    "logout_link": [
-        "a:has-text('Logout')",
-        "button:has-text('Logout')",
-        "[role='menuitem']:has-text('Logout')",
-        "[aria-label*='logout']",
-        "text=Logout",
-    ],
-    "login_button": [
-        "button[name='login']",
-        "button:has-text('Log In')",
-        "button:has-text('Login')",
-        "button:has-text('Sign In')",
-        "[role='button']:has-text('Log In')",
-        "[role='button']:has-text('Login')",
-        "button[type='submit']",
-        "input[type='submit']",
-        "text=Sign In",
-        "text=Log In",
-        "text=Login",
-    ],
-    "language_switcher": [
-        "button[aria-label*='language']",
-        "[role='button'][aria-label*='language']",
-        "button[title*='language']",
-        "[title*='language']",
-        "[aria-haspopup='listbox']",
-        "[role='combobox']",
-        "select[name*='lang']",
-        "select[name*='locale']",
-        "[name*='lang']",
-        "[id*='lang']",
-        "[data-testid*='lang']",
-        "[data-testid*='locale']",
-        "button:has-text('DE')",
-        "button:has-text('EN')",
-        "button:has-text('FR')",
-        "button:has-text('ES')",
-        "text=DE",
-        "text=EN",
-        "text=FR",
-        "text=ES",
-    ],
-}
 
 
 def utc_now() -> datetime:
@@ -269,11 +70,33 @@ class GroundedCandidate:
     element: dict[str, Any]
 
 
+@dataclass
+class CandidateValidationResult:
+    status: str  # "passed" | "failed" | "skipped"
+    reason: str
+    selector: str
+    source: str
+    strictness: str
+    resolved_count: int = 0
+    resolved_elements: list[dict] = field(default_factory=list)
+
+
 class _FastPathEscalation(Exception):
     pass
 
 
 class AgentExecutor:
+    # Selectors that match by element type alone with no identity signal.
+    # Used by _validate_candidate_against_intent to apply stricter rules.
+    _GENERIC_SELECTORS: frozenset[str] = frozenset({
+        "button",
+        "input",
+        "a",
+        "body",
+        "button[type='submit']",
+        "input[type='password']",
+    })
+
     def __init__(
         self,
         settings: Settings,
@@ -362,13 +185,13 @@ class AgentExecutor:
                         should_navigate_to_start = True
 
             if should_navigate_to_start and run.start_url:
-                _NAV_MAX_ATTEMPTS = 2
+                _NAV_MAX_ATTEMPTS = 3
                 _nav_exc: Exception | None = None
                 for _nav_attempt in range(1, _NAV_MAX_ATTEMPTS + 1):
                     try:
                         await asyncio.wait_for(
                             self._browser.navigate(run.start_url),
-                            timeout=self._settings.step_timeout_seconds,
+                            timeout=float(self._settings.step_timeout_seconds),
                         )
                         _nav_exc = None
                         break
@@ -376,16 +199,19 @@ class AgentExecutor:
                         _nav_exc = exc
                         if _nav_attempt < _NAV_MAX_ATTEMPTS:
                             LOGGER.warning(
-                                "Run %s: initial navigation attempt %d/%d failed (%s) — retrying in 3s",
+                                "Run %s: initial navigation attempt %d/%d failed (%s) — retrying in 5s",
                                 run.run_id,
                                 _nav_attempt,
                                 _NAV_MAX_ATTEMPTS,
                                 self._compact_error(exc),
                             )
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(5)
                 if _nav_exc is not None:
                     await self._record_startup_navigation_failure(run, _nav_exc)
                     return
+                # After successful startup navigation, wait for the page to reach
+                # a basic interactive state before dispatching the first step.
+                await self._wait_for_page_ready(run.run_id, budget_s=12.0)
 
             has_step_failure = False
             if run.execution_mode == "autonomous" and run.prompt:
@@ -433,7 +259,7 @@ class AgentExecutor:
                     await self._browser.close_run(run_id)
                     self._mark_run_viewer_closed(run)
             elif run.status == RunStatus.waiting_for_input:
-                # Browser is kept open — start a 40-second countdown.
+                # Browser is kept open — start the recovery countdown.
                 # If the user doesn't provide a selector in time, close the run.
                 self._schedule_selector_input_timeout(run.run_id)
             self._run_store.persist(run)
@@ -494,7 +320,7 @@ class AgentExecutor:
         self._mark_run_viewer_closed(run)
         self._run_store.persist(run)
 
-    _SELECTOR_INPUT_TIMEOUT_SECONDS: int = 40
+    _SELECTOR_INPUT_TIMEOUT_SECONDS: int = 120
 
     def _schedule_selector_input_timeout(self, run_id: str) -> None:
         existing = self._selector_timeout_tasks.pop(run_id, None)
@@ -526,26 +352,34 @@ class AgentExecutor:
         if run is None or run.status != RunStatus.waiting_for_input:
             return
         LOGGER.info(
-            "Run %s: selector input timed out after %ds — marking step failed, continuing remaining steps",
+            "Run %s: selector input timed out after %ds — marking step failed, skipping remaining steps",
             run_id, self._SELECTOR_INPUT_TIMEOUT_SECONDS,
         )
 
-        # Mark the stuck waiting_for_input step as failed.
-        # The execution loop in _execute_existing_steps is polling for this
-        # status change and will continue to the next step automatically.
+        # Mark the stuck waiting_for_input step as failed, then skip all
+        # downstream pending steps so the run doesn't continue on wrong state.
+        failed_index: int | None = None
         for step in run.steps:
             if step.status == StepStatus.waiting_for_input:
                 step.status = StepStatus.failed
-                step.error = "Selector input timed out — no selector was provided in time."
-                step.message = "Step failed: no selector provided within 40s. Continuing remaining steps."
+                step.error = (
+                    f"Selector input timed out — no selector was provided within "
+                    f"{self._SELECTOR_INPUT_TIMEOUT_SECONDS}s."
+                )
+                step.message = "Step failed: selector input timed out."
                 step.user_input_kind = None
                 step.user_input_prompt = None
                 step.requested_selector_target = None
+                failed_index = step.index
+                break
+
+        if failed_index is not None:
+            self._mark_remaining_steps_skipped(run, failed_index + 1)
 
         run.status = RunStatus.running
         self._run_store.persist(run)
         LOGGER.info(
-            "Run %s: selector timeout — step marked failed, execution loop will continue remaining steps",
+            "Run %s: selector timeout — step marked failed, remaining steps skipped",
             run_id,
         )
 
@@ -644,6 +478,15 @@ class AgentExecutor:
                 (step.message or "")[:120],
             )
             self._run_store.persist(run)
+            # apply_manual_selector_hint can run on the event loop during the
+            # async awaits inside _execute_step (screenshot capture / diagnosis)
+            # and mutate step.status to 'pending' before _execute_step returns.
+            # A step that still reads 'pending' after _execute_step should never
+            # be treated as skippable — it means the user already submitted a
+            # selector and the step needs to be re-executed.  Treat it as
+            # waiting_for_input so the recovery loop below handles it.
+            if step.status == StepStatus.pending:
+                step.status = StepStatus.waiting_for_input
             if step.status == StepStatus.waiting_for_input:
                 # Always block on the failing step regardless of failure_mode.
                 # Keep asking the user for selectors until the step passes or the
@@ -708,7 +551,7 @@ class AgentExecutor:
                         if not user_provided_selector and step.status == StepStatus.waiting_for_input:
                             step.status = StepStatus.failed
                             step.error = "Selector input timed out — no selector was provided in time."
-                            step.message = "Step failed: no selector provided within 40s."
+                            step.message = f"Step failed: no selector provided within {self._SELECTOR_INPUT_TIMEOUT_SECONDS}s."
                             step.user_input_kind = None
                             step.user_input_prompt = None
                             step.requested_selector_target = None
@@ -1142,13 +985,23 @@ class AgentExecutor:
         test_data = run.test_data or {}
         selector_profile = run.selector_profile or {}
         run_domain = self._extract_run_domain(run)
-        intent = self._build_step_intent(step_type, str(raw_step.get("selector") or ""), self._step_text_hint(raw_step, step_type), self._step_context_hint(raw_step))
+        _raw_sel_for_intent = raw_step.get("selector")
+        _intent_selector = str(
+            (_raw_sel_for_intent if isinstance(_raw_sel_for_intent, str) and _raw_sel_for_intent.strip() else None)
+            or raw_step.get("_grounded_selector")
+            or self._step_text_hint(raw_step, step_type)
+            or ""
+        )
+        intent = self._build_step_intent(step_type, _intent_selector, self._step_text_hint(raw_step, step_type), self._step_context_hint(raw_step))
 
         if step_type == "navigate":
             target_url = self._apply_template(str(raw_step["url"]), test_data, run_id=run.run_id)
+            # Navigate can take considerably longer than other fast-path actions
+            # (redirect chains, slow DNS, CDN cold-start).  Use the full step
+            # timeout rather than the 4-second fast-path budget.
             return await asyncio.wait_for(
                 self._browser.navigate(target_url),
-                timeout=self._fast_path_action_timeout_seconds(),
+                timeout=float(self._settings.step_timeout_seconds),
             )
 
         if step_type == "wait":
@@ -1156,29 +1009,47 @@ class AgentExecutor:
                 self._browser.wait_for(
                     until=str(raw_step.get("until", "timeout")),
                     ms=raw_step.get("ms"),
-                    selector=str(raw_step.get("selector")) if raw_step.get("selector") else None,
+                    selector=(_ws if isinstance(_ws := raw_step.get("selector"), str) and _ws.strip() else None),
                     load_state=str(raw_step.get("load_state")) if raw_step.get("load_state") else None,
                 ),
                 timeout=self._fast_path_action_timeout_seconds(),
             )
 
-        selector = str(raw_step["selector"])
+        # Derive a clean, display-safe raw_selector string from what the step has.
+        # New semantic plans have no "selector" key — fall back to grounded selector
+        # or a text-hint-derived string so we never pass None/dict to Playwright.
+        _raw_selector_field = raw_step.get("selector")
+        grounded = raw_step.get("_grounded_selector")
         text_hint = self._step_text_hint(raw_step, step_type)
+        if isinstance(_raw_selector_field, str) and _raw_selector_field.strip():
+            selector = _raw_selector_field.strip()
+        elif isinstance(grounded, str) and grounded.strip():
+            # Semantic plan: use grounded selector as canonical identity string
+            selector = grounded.strip()
+        elif text_hint:
+            selector = text_hint
+        else:
+            selector = ""
         # Prefer perception-grounded selector (identified from live DOM) over
         # the classification's profile-generated primary_selector.
-        grounded = raw_step.get("_grounded_selector")
         resolved_selector = (
             grounded
             or classification.get("primary_selector")
-            or await self._resolve_selector(
-                selector,
-                step_type,
-                selector_profile,
-                test_data,
-                run_domain,
-                text_hint,
+            or (
+                await self._resolve_selector(
+                    selector,
+                    step_type,
+                    selector_profile,
+                    test_data,
+                    run_domain,
+                    text_hint,
+                )
+                if selector
+                else None
             )
         )
+        if not resolved_selector:
+            raise _FastPathEscalation("no resolvable selector for semantic step")
         if grounded:
             LOGGER.debug("Fast path: using perception-grounded selector=%r for step_type=%s", grounded, step_type)
 
@@ -1385,12 +1256,24 @@ class AgentExecutor:
             text_hint = self._extract_selector_text(raw_selector)
 
         intent_text = " ".join(p for p in [text_hint or raw_selector] if p).strip()
+
+        # Determine whether a structured semantic contract is present.
+        # Both new (semantic_name / accessible_name) and legacy (label / text)
+        # target fields qualify — _extract_target_canonical handles the mapping.
+        raw_target = step_input.get("target")
+        _has_semantic_contract = isinstance(raw_target, dict) and any(
+            raw_target.get(f)
+            for f in ("semantic_name", "expected_role", "accessible_name", "label", "text")
+        )
+
         if intent_text:
             LOGGER.debug(
-                "Perception: intent_text=%r (text_hint=%r raw_selector=%r) step_type=%s",
-                intent_text[:80], (text_hint or "")[:80], (raw_selector or "")[:80], step.type,
+                "Perception: intent_text=%r (text_hint=%r raw_selector=%r) "
+                "step_type=%s  semantic_contract=%s",
+                intent_text[:80], (text_hint or "")[:80], (raw_selector or "")[:80],
+                step.type, _has_semantic_contract,
             )
-        if not intent_text:
+        if not intent_text and not _has_semantic_contract:
             return None
 
         if snapshot is None:
@@ -1407,6 +1290,15 @@ class AgentExecutor:
         if element_index.count == 0:
             LOGGER.debug("Perception: no interactive elements at step %d", step.index + 1)
             return None
+
+        # Prefer structured target matching when a semantic contract is present.
+        # Falls back to tokenised intent matching for legacy steps with no target.
+        if _has_semantic_contract:
+            return find_best_match_for_target(
+                target=raw_target,
+                step_type=step.type,
+                element_index=element_index,
+            )
 
         return find_best_match(
             intent_text=intent_text,
@@ -1565,6 +1457,22 @@ class AgentExecutor:
                 perception_match = await self._perceive_before_act(
                     run, step, snapshot=before_snapshot
                 )
+                _has_target = bool((step.input or {}).get("target"))
+                _text_hint = self._step_text_hint(step.input, step.type)
+                LOGGER.info(
+                    "Run %s step %d (type=%s): perception_probe "
+                    "target_present=%s text_hint=%r selector=%r "
+                    "→ result=%s",
+                    run.run_id, step.index + 1, step.type,
+                    _has_target,
+                    (_text_hint or "")[:60],
+                    str((step.input or {}).get("selector", ""))[:60],
+                    (
+                        f"confidence={perception_match.confidence} score={perception_match.score}"
+                        if perception_match is not None
+                        else "none"
+                    ),
+                )
                 if perception_match is not None:
                     step_trace["perception"] = {
                         "confidence": perception_match.confidence,
@@ -1576,19 +1484,24 @@ class AgentExecutor:
                         "element_role": perception_match.element.role,
                     }
                     if perception_match.confidence in {"unique", "high"}:
+                        _element_selectors = derive_element_selectors(
+                            perception_match.element, step.type
+                        )
                         step.input = {
                             **step.input,
                             "_grounded_selector": perception_match.selector,
                             "_grounded_signature": perception_match.element.signature(),
+                            "_grounded_selectors": _element_selectors,
                         }
                         strong_live_grounding = True
                         LOGGER.info(
                             "Run %s step %d (type=%s): perception GROUNDED selector=%r "
-                            "(confidence=%s score=%d alternatives=%d element=%r)",
+                            "(confidence=%s score=%d alternatives=%d element=%r "
+                            "derived_selectors=%d)",
                             run.run_id, step.index + 1, step.type,
                             perception_match.selector, perception_match.confidence,
                             perception_match.score, perception_match.alternative_count,
-                            perception_match.element.text[:50],
+                            perception_match.element.text[:50], len(_element_selectors),
                         )
                     elif perception_match.confidence == "medium":
                         # Medium confidence: validate the candidate before trusting it.
@@ -1599,18 +1512,22 @@ class AgentExecutor:
                         step_trace["perception"]["validation_passed"] = med_valid
                         step_trace["perception"]["validation_reason"] = med_reason
                         if med_valid:
+                            _element_selectors = derive_element_selectors(
+                                perception_match.element, step.type
+                            )
                             step.input = {
                                 **step.input,
                                 "_grounded_selector": perception_match.selector,
                                 "_grounded_signature": perception_match.element.signature(),
+                                "_grounded_selectors": _element_selectors,
                             }
                             LOGGER.info(
                                 "Run %s step %d (type=%s): perception MEDIUM VALIDATED selector=%r "
-                                "(score=%d alternatives=%d element=%r) — used as grounded hint",
+                                "(score=%d alternatives=%d element=%r derived_selectors=%d) — used as grounded hint",
                                 run.run_id, step.index + 1, step.type,
                                 perception_match.selector, perception_match.score,
                                 perception_match.alternative_count,
-                                perception_match.element.text[:50],
+                                perception_match.element.text[:50], len(_element_selectors),
                             )
                         else:
                             LOGGER.warning(
@@ -1626,18 +1543,35 @@ class AgentExecutor:
                         # _grounded_selector: injecting an unreliable selector would
                         # either trigger the fast path on a wrong element or bias the
                         # slow pipeline toward the wrong candidate.
-                        # Let the full selector pipeline run clean.
+                        # Stamp _semantic_confidence so the fallback pipeline runs
+                        # in constrained mode (capped cycles, no LLM recovery).
                         step_trace["perception"]["grounding_action"] = "suppressed"
                         step_trace["perception"]["grounding_reason"] = (
                             f"ambiguous — {perception_match.alternative_count} alternative(s) "
                             f"scored similarly (top_score={perception_match.score})"
                         )
+                        step_trace["perception"]["top_ambiguous_element"] = (
+                            perception_match.element.text[:80] if perception_match.element else None
+                        )
+                        step.input = {**step.input, "_semantic_confidence": "ambiguous"}
                         LOGGER.warning(
                             "Run %s step %d (type=%s): perception AMBIGUOUS SUPPRESSED "
-                            "(top=%r score=%d alternatives=%d) — full selector pipeline used",
+                            "(top=%r score=%d alternatives=%d) — constrained fallback will run",
                             run.run_id, step.index + 1, step.type,
                             perception_match.selector, perception_match.score,
                             perception_match.alternative_count,
+                        )
+                else:
+                    # perception returned no match at all — if the step has a
+                    # semantic contract, stamp no_match to constrain the fallback
+                    # pipeline (capped cycles, suppressed LLM recovery).
+                    if self._step_has_semantic_contract(step.input):
+                        step.input = {**step.input, "_semantic_confidence": "no_match"}
+                        LOGGER.warning(
+                            "Run %s step %d (type=%s): perception NO_MATCH — "
+                            "semantic contract present but no candidate found; "
+                            "constrained fallback will run",
+                            run.run_id, step.index + 1, step.type,
                         )
 
             if strong_live_grounding:
@@ -1827,6 +1761,9 @@ class AgentExecutor:
                 "grounded selection failed",
                 "all selector candidates failed",
                 "does not contain a matching live element",
+                # Playwright CSS parse errors — invalid selector syntax reached locator()
+                "unsupported token",
+                "locator.count:",
             )
             # "all selector candidates failed" paired with an outcome failure means the
             # click happened but the outcome check failed — not a locator problem.
@@ -1838,10 +1775,15 @@ class AgentExecutor:
             # treat as a selector problem so the user can correct it.
             if step.type == "verify_text" and "text verification failed" in _error_lower:
                 _is_element_not_found = True
-            _has_selector_field = any(
-                isinstance((step.input or {}).get(f), str)
-                and bool((step.input or {}).get(f, "").strip())
-                for f in ("selector", "source_selector", "target_selector")
+            _step_input_map = step.input or {}
+            _has_selector_field = (
+                any(
+                    isinstance(_step_input_map.get(f), str)
+                    and bool(_step_input_map.get(f, "").strip())
+                    for f in ("selector", "source_selector", "target_selector")
+                )
+                or bool(_step_input_map.get("_grounded_selector"))
+                or self._step_has_semantic_contract(_step_input_map)
             )
             if (
                 step.type in _INTERACTION_STEP_TYPES
@@ -1863,6 +1805,12 @@ class AgentExecutor:
                 step_trace["result"] = step.message
                 # Capture screenshot + diagnosis so the UI shows "What went wrong",
                 # "Suggested fix", and "Try these selectors" even while paused.
+                # NOTE: apply_manual_selector_hint (sync) can run on the event loop
+                # during these awaits and mutate step.status to 'pending'.  That is
+                # intentional — the caller (_execute_existing_steps) normalises any
+                # 'pending' status back to waiting_for_input and enters the recovery
+                # loop, so both the waiting_for_input and pending outcomes are handled
+                # correctly without extra restoration here.
                 await self._capture_failure_screenshot(run.run_id, step)
                 await self._run_failure_diagnosis(run, step)
             else:
@@ -1880,8 +1828,15 @@ class AgentExecutor:
                     step.error = compact
                 step.message = "Step failed"
                 step_trace["result"] = step.message
+                _intended_step_status = StepStatus.failed
                 await self._capture_failure_screenshot(run.run_id, step)
                 await self._run_failure_diagnosis(run, step)
+                # Restore: if apply_manual_selector_hint ran during the awaits above,
+                # the step would have been mutated to 'pending'.  A 'failed' step
+                # that is not a selector-not-found case should not be silently retried,
+                # so restore the failed status.
+                if step.status == StepStatus.pending:
+                    step.status = _intended_step_status
         finally:
             step.ended_at = utc_now()
             step_trace["status"] = step.status.value
@@ -2059,6 +2014,23 @@ class AgentExecutor:
             candidate = suggestion.strip()
             if not candidate:
                 continue
+            dom_ok, dom_reason = self._validate_llm_recovery_candidate(
+                candidate, page_snapshot, intent, step.type
+            )
+            if not dom_ok:
+                LOGGER.info(
+                    "LLM recovery: rejecting candidate %r — DOM text mismatch: %s",
+                    candidate, dom_reason,
+                )
+                self._record_group_attempt(
+                    trace_group,
+                    {
+                        "selector": candidate,
+                        "status": "rejected_dom_mismatch",
+                        "dom_reason": dom_reason,
+                    },
+                )
+                continue
             original_input = dict(step.input)
             original_provided_selector = step.provided_selector
             dispatch_started = perf_counter()
@@ -2103,6 +2075,73 @@ class AgentExecutor:
                 continue
         trace_group["total_recovery_ms"] = self._elapsed_ms(recovery_started)
         return None
+
+    def _validate_llm_recovery_candidate(
+        self,
+        candidate: str,
+        page_snapshot: dict[str, Any],
+        intent: "StepIntent | None",
+        step_type: str,
+    ) -> tuple[bool, str]:
+        """
+        Pre-dispatch DOM validation for an LLM recovery selector candidate.
+
+        Steps:
+          1. Resolve the candidate against the already-taken page_snapshot DOM.
+          2. Compare the resolved element's visible text / aria / label / title /
+             name / href against intent.target_text.
+          3. Reject if there is no meaningful word overlap — especially for generic
+             selectors like button[type='submit'] that could silently match the
+             wrong element when target_text is present.
+
+        Returns (allow: bool, reason: str). Errors allow the candidate through.
+        """
+        if not intent or not intent.target_text:
+            return True, "no_target_text"
+
+        target_text = intent.target_text.strip().lower()
+        if len(target_text) <= 2:
+            return True, "target_text_too_short"
+
+        target_words = {
+            w for w in re.findall(r"[a-z0-9]+", target_text) if len(w) >= 3
+        }
+        if not target_words:
+            return True, "no_meaningful_target_words"
+
+        elements: list[dict[str, Any]] = page_snapshot.get("interactive_elements") or []
+        if not elements:
+            return True, "no_snapshot_elements"
+
+        matched = self._resolve_selector_in_snapshot(candidate, elements)
+        if not matched:
+            return True, "selector_not_in_snapshot"
+
+        # Determine whether the selector is generic (no stable identifying attribute).
+        # Generic selectors (e.g. button[type='submit'], input[type='text']) can
+        # resolve to any element of that shape — intent mismatch is especially
+        # dangerous here.
+        attrs = self._parse_selector_attributes(candidate)
+        selector_is_generic = not any(
+            k in attrs for k in ("id", "name", "testid", "aria-label", "placeholder")
+        )
+
+        for el in matched:
+            haystack = " ".join(
+                str(el.get(f, "")).lower()
+                for f in ("text", "aria", "label", "title", "name", "href", "placeholder")
+            )
+            if any(w in haystack for w in target_words):
+                return True, "intent_confirmed"
+
+        # No resolved element has any overlap with intent.target_text.
+        el_texts = [str(el.get("text", ""))[:40] for el in matched[:2]]
+        return False, (
+            f"target_text_mismatch "
+            f"intent={intent.target_text!r} "
+            f"resolved_texts={el_texts} "
+            f"generic={selector_is_generic}"
+        )
 
     def _filter_llm_selector_suggestions(
         self,
@@ -2339,9 +2378,11 @@ class AgentExecutor:
         # target.* fields carry element identity (label, visible text, placeholder).
         # Check these before top-level "text"/"value" which for type/select steps
         # hold the content being typed, not the element's name.
+        # New canonical fields (accessible_name, semantic_name) take priority over
+        # legacy fields (label, text) so plans from the updated planner resolve first.
         target = step_input.get("target")
         if isinstance(target, dict):
-            for field in ("text", "label", "placeholder", "kind", "role"):
+            for field in ("accessible_name", "semantic_name", "text", "label", "placeholder", "kind", "role"):
                 value = target.get(field)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
@@ -2360,14 +2401,29 @@ class AgentExecutor:
 
     @staticmethod
     def _step_context_hint(step_input: dict[str, Any]) -> str | None:
-        """Extract target.context from step input — the named section the element
-        sits in (e.g. 'Login form', 'Search bar'). Used for scope_hint."""
+        """Extract the named container section from step input (e.g. 'Login form').
+        Reads target.scope (new contract) with fallback to target.context (legacy)."""
         target = step_input.get("target")
         if isinstance(target, dict):
-            value = target.get("context")
+            value = target.get("scope") or target.get("context")
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    @staticmethod
+    def _step_has_semantic_contract(step_input: dict[str, Any]) -> bool:
+        """Return True when the step carries at least one v2 semantic target field
+        (semantic_name, accessible_name, or expected_role) that drives perception-
+        first resolution — as opposed to a bare selector or a legacy target with
+        only kind/role/text."""
+        target = step_input.get("target")
+        if not isinstance(target, dict):
+            return False
+        return bool(
+            target.get("semantic_name")
+            or target.get("accessible_name")
+            or target.get("expected_role")
+        )
 
     @staticmethod
     def _selector_seed_from_target(step_input: dict[str, Any], step_type: str) -> str:
@@ -2417,6 +2473,24 @@ class AgentExecutor:
         return None
 
     @staticmethod
+    def _infer_tag_from_selector(selector: str) -> str:
+        """Infer HTML tag from a CSS selector string (e.g. 'input[name=x]' → 'input').
+        Returns empty string if no meaningful tag can be inferred."""
+        s = selector.strip()
+        m = re.match(r"^([a-zA-Z][a-zA-Z0-9]*)(?:[^\w]|$)", s)
+        if not m:
+            return ""
+        tag = m.group(1).lower()
+        _MEANINGFUL_TAGS = {"input", "button", "textarea", "select", "a", "label"}
+        return tag if tag in _MEANINGFUL_TAGS else ""
+
+    @staticmethod
+    def _infer_type_from_selector(selector: str) -> str:
+        """Infer input[type] from a CSS selector string (e.g. 'input[type=hidden]' → 'hidden')."""
+        m = re.search(r"\[type=['\"]?([a-zA-Z]+)['\"]?\]", selector, re.IGNORECASE)
+        return m.group(1).lower() if m else ""
+
+    @staticmethod
     def _intent_scope_hint(value: str, context_hint: str | None = None) -> str | None:
         # Prefer the plan's explicit target.context (e.g. "Login form", "Search bar")
         # over structural keywords parsed from the selector string.
@@ -2432,6 +2506,24 @@ class AgentExecutor:
         explicit = self._extract_selector_text(raw_selector)
         if explicit:
             return explicit
+
+        # Target metadata from the planner is a stronger generic identity signal
+        # than selector-derived heuristics — check it before alias expansion or
+        # phrase inference so that, e.g., a full multi-word label like
+        # "Confirm Password" beats the token "password" extracted from the CSS.
+        #
+        # Exception: for type/select steps the text_hint may carry the value
+        # being typed (e.g. "qa@example.com", "https://…", a generated
+        # timestamp) rather than the element's label.  Those are typed values,
+        # not identity hints — let the alias/CSS-token path run instead.
+        if text_hint and text_hint.strip():
+            _is_typed_value = step_type in {"type", "select"} and bool(
+                re.search(r"[^@\s]+@[^@\s]+", text_hint)          # email address
+                or re.match(r"https?://|www\.", text_hint, re.IGNORECASE)  # URL
+                or re.search(r"\d{8}[_\-]\d{6}", text_hint)       # timestamp YYYYMMDD_HHMMSS
+            )
+            if not _is_typed_value:
+                return text_hint.strip()
 
         lowered = raw_selector.strip().lower()
         alias_match = re.search(r"\{\{\s*selector\.([a-z0-9_.-]+)\s*\}\}", lowered)
@@ -2453,9 +2545,6 @@ class AgentExecutor:
         ):
             if phrase in lowered:
                 return phrase
-
-        if text_hint and text_hint.strip():
-            return text_hint.strip()
 
         cleaned = re.sub(r"[\[\]#.:>'\"=_()-]+", " ", lowered)
         tokens = [
@@ -2605,8 +2694,18 @@ class AgentExecutor:
 
         # Selector suggestions — reuse existing suggest_selectors brain call
         try:
-            raw_selector = str((step.input or {}).get("selector", "")).strip()
-            if raw_selector and step.type in {"click", "type", "select", "verify_text"}:
+            _step_input_d = step.input or {}
+            raw_selector = str(_step_input_d.get("selector", "")).strip()
+            # For semantic plans there is no "selector" field — use the grounded
+            # selector as the failed_selector hint so the LLM has context.
+            if not raw_selector:
+                raw_selector = str(_step_input_d.get("_grounded_selector", "")).strip()
+            # Seed failure_selector_suggestions with element-derived selectors so
+            # the recovery UI always shows concrete options even before LLM runs.
+            _grounded_selectors: list[str] = _step_input_d.get("_grounded_selectors") or []
+            if _grounded_selectors:
+                step.failure_selector_suggestions = list(_grounded_selectors[:6])
+            if (raw_selector or _grounded_selectors) and step.type in {"click", "type", "select", "verify_text"}:
                 page_snapshot = await self._safe_page_snapshot() or {}
                 text_hint = self._step_text_hint(step.input or {}, step.type)
                 # Focus the snapshot to only intent-relevant elements and derive
@@ -2633,7 +2732,12 @@ class AgentExecutor:
                     element_hint=element_hint,
                 )
                 if suggestions:
-                    step.failure_selector_suggestions = suggestions
+                    # Merge: grounded selectors first (highest confidence), then
+                    # any LLM suggestions not already present.
+                    existing = list(step.failure_selector_suggestions or [])
+                    existing_set = set(existing)
+                    merged = existing + [s for s in suggestions if s not in existing_set]
+                    step.failure_selector_suggestions = merged
                     LOGGER.info(
                         "Run %s step %d: %d selector suggestions generated",
                         run.run_id, step.index + 1, len(suggestions),
@@ -2674,61 +2778,24 @@ class AgentExecutor:
         if step_type == "navigate":
             target_url = self._apply_template(str(raw_step["url"]), test_data, run_id=run.run_id)
             result = await self._browser.navigate(target_url)
-            try:
-                await asyncio.wait_for(
-                    self._browser.wait_for(
-                        until="selector_visible",
-                        ms=5000,
-                        selector="body *:not(script):not(style)",
-                        load_state=None,
-                    ),
-                    timeout=6.0,
-                )
-            except Exception:
-                pass
+            await self._wait_for_page_ready(run.run_id, budget_s=12.0)
             return result
 
         if step_type == "click":
-            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
+            # Prefer _grounded_selector (real CSS derived from matched element) as the
+            # raw_selector identity when the plan has no "selector" field (semantic plans).
+            _grounded_sel = raw_step.get("_grounded_selector")
+            _raw_s = raw_step.get("selector")
+            selector = str(
+                (_raw_s if isinstance(_raw_s, str) and _raw_s.strip() else None)
+                or (_grounded_sel if isinstance(_grounded_sel, str) and _grounded_sel.strip() else None)
+                or self._step_text_hint(raw_step, step_type)
+                or self._selector_seed_from_target(raw_step, step_type)
+                or ""
+            )
             alias_key = self._selector_alias_key(selector)
             text_hint = raw_step.get("text_hint")
-            if alias_key == "transition_canvas_label":
-                try:
-                    await self._run_with_selector_fallback(
-                        "{{selector.save_changes_button}}",
-                        "wait",
-                        selector_profile,
-                        test_data,
-                        run_domain,
-                        lambda resolved: self._browser.wait_for(
-                            until="selector_visible",
-                            ms=1500,
-                            selector=resolved,
-                            load_state=None,
-                        ),
-                    )
-                    return "Transition canvas click treated as non-blocking"
-                except Exception:
-                    if text_hint is not None:
-                        for label_selector in self._transition_label_signal_selectors(str(text_hint), test_data):
-                            try:
-                                await self._run_with_selector_fallback(
-                                    label_selector,
-                                    "wait",
-                                    selector_profile,
-                                    test_data,
-                                    run_domain,
-                                    lambda resolved: self._browser.wait_for(
-                                        until="selector_visible",
-                                        ms=1500,
-                                        selector=resolved,
-                                        load_state=None,
-                                    ),
-                                )
-                                return "Transition label is visible on canvas"
-                            except Exception:
-                                continue
-                    return "Transition canvas click treated as non-blocking"
+            _element_sels: list[str] | None = raw_step.get("_grounded_selectors") or None
             try:
                 click_operation = self._run_with_selector_fallback(
                     selector,
@@ -2746,8 +2813,10 @@ class AgentExecutor:
                         text_hint=str(text_hint) if text_hint is not None else None,
                     ),
                     grounded_selector=raw_step.get("_grounded_selector"),
+                    semantic_confidence=raw_step.get("_semantic_confidence"),
+                    element_candidates=_element_sels,
                 )
-                if alias_key in {"login_button", "transition_canvas_label"}:
+                if alias_key == "login_button":
                     click_budget_s = max(
                         3.0,
                         min(float(self._settings.step_timeout_seconds) * 0.2, 12.0),
@@ -2755,72 +2824,20 @@ class AgentExecutor:
                     result = await asyncio.wait_for(click_operation, timeout=click_budget_s)
                 else:
                     result = await click_operation
-                if alias_key == "login_button":
-                    try:
-                        await asyncio.wait_for(
-                            self._browser.wait_for(
-                                until="selector_visible",
-                                ms=8000,
-                                selector=(
-                                    "[href*='dashboard'], "
-                                    "nav:not(:has([href*='login'])), "
-                                    "[aria-label*='logout'], "
-                                    "[aria-label*='sign out'], "
-                                    "button:has-text('Logout'), "
-                                    "button:has-text('Sign Out')"
-                                ),
-                                load_state=None,
-                            ),
-                            timeout=10.0,
-                        )
-                    except Exception:
-                        try:
-                            await asyncio.wait_for(
-                                self._browser.wait_for(
-                                    until="selector_hidden",
-                                    ms=3000,
-                                    selector=(
-                                        "input[type='password'], "
-                                        "button:has-text('Sign In'), "
-                                        "button:has-text('Login')"
-                                    ),
-                                    load_state=None,
-                                ),
-                                timeout=4.0,
-                            )
-                        except Exception:
-                            pass
                 return result
-            except Exception as exc:
-                if alias_key == "login_button":
-                    # Do not treat later visibility checks as proof that the login click
-                    # itself succeeded. The explicit next wait/verify step must confirm
-                    # post-login state, otherwise we can silently continue on the wrong page.
-                    raise exc
-                if alias_key == "transition_canvas_label" and text_hint is not None:
-                    for label_selector in self._transition_label_signal_selectors(str(text_hint), test_data):
-                        try:
-                            await self._run_with_selector_fallback(
-                                label_selector,
-                                "wait",
-                                selector_profile,
-                                test_data,
-                                run_domain,
-                                lambda resolved: self._browser.wait_for(
-                                    until="selector_visible",
-                                    ms=8000,
-                                    selector=resolved,
-                                    load_state=None,
-                                ),
-                            )
-                            return "Transition label is visible on canvas"
-                        except Exception:
-                            continue
-                    raise exc
+            except Exception:
                 raise
 
         if step_type == "type":
-            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
+            _grounded_sel = raw_step.get("_grounded_selector")
+            _raw_s = raw_step.get("selector")
+            selector = str(
+                (_raw_s if isinstance(_raw_s, str) and _raw_s.strip() else None)
+                or (_grounded_sel if isinstance(_grounded_sel, str) and _grounded_sel.strip() else None)
+                or self._step_text_hint(raw_step, step_type)
+                or self._selector_seed_from_target(raw_step, step_type)
+                or ""
+            )
             # Build a set of selectors already used by earlier completed type steps
             # so the fallback pipeline never re-uses them for a different field.
             _used_type_selectors: set[str] = set()
@@ -2843,6 +2860,12 @@ class AgentExecutor:
                 run_context["last_typed_value"] = text
                 if selector_field_name:
                     run_context[f"last_typed_{selector_field_name}"] = text
+            # Pass the element identity hint (target.label / target.text /
+            # target.placeholder) — not the typed value — so the intent and
+            # candidate-scoring pipeline can distinguish sibling fields like
+            # "Password" vs "Confirm Password".  The typed value `text` is
+            # still passed to the operation and post-validation lambdas.
+            _type_identity_hint = self._step_text_hint(raw_step, step_type)
             return await self._run_with_selector_fallback(
                 selector,
                 step_type,
@@ -2854,19 +2877,31 @@ class AgentExecutor:
                     text=text,
                     clear_first=clear_first,
                 ),
-                text_hint=text,
+                text_hint=_type_identity_hint,
                 post_validate=lambda resolved, _result, _pre: self._validate_type_post_action(
                     resolved_selector=resolved,
                     expected_text=text,
                     clear_first=clear_first,
+                    identity_hint=_type_identity_hint,
                 ),
                 grounded_selector=raw_step.get("_grounded_selector"),
                 exclude_selectors=_used_type_selectors or None,
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
             )
 
         if step_type == "select":
-            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
+            _grounded_sel = raw_step.get("_grounded_selector")
+            _raw_s = raw_step.get("selector")
+            selector = str(
+                (_raw_s if isinstance(_raw_s, str) and _raw_s.strip() else None)
+                or (_grounded_sel if isinstance(_grounded_sel, str) and _grounded_sel.strip() else None)
+                or self._step_text_hint(raw_step, step_type)
+                or self._selector_seed_from_target(raw_step, step_type)
+                or ""
+            )
             value = self._apply_template(str(raw_step["value"]), test_data, run_id=run.run_id)
+            _select_identity_hint = self._step_text_hint(raw_step, step_type)
             return await self._run_with_selector_fallback(
                 selector,
                 step_type,
@@ -2877,12 +2912,15 @@ class AgentExecutor:
                     selector=resolved,
                     value=value,
                 ),
-                text_hint=value,
+                text_hint=_select_identity_hint,
                 post_validate=lambda resolved, _result, _pre: self._validate_select_post_action(
                     resolved_selector=resolved,
                     expected_value=value,
+                    identity_hint=_select_identity_hint,
                 ),
                 grounded_selector=raw_step.get("_grounded_selector"),
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
             )
 
         if step_type == "drag":
@@ -2902,13 +2940,14 @@ class AgentExecutor:
 
         if step_type == "scroll":
             target = str(raw_step.get("target", "page"))
-            selector = raw_step.get("selector")
+            _raw_scroll_sel = raw_step.get("selector")
+            selector = _raw_scroll_sel if isinstance(_raw_scroll_sel, str) and _raw_scroll_sel.strip() else None
             direction = str(raw_step.get("direction", "down"))
             amount = int(raw_step.get("amount", 600))
 
             if target == "selector" and selector:
                 resolved_selector = await self._resolve_selector(
-                    str(selector),
+                    selector,
                     step_type,
                     selector_profile,
                     test_data,
@@ -2930,47 +2969,26 @@ class AgentExecutor:
 
         if step_type == "wait":
             until = str(raw_step.get("until", "timeout"))
-            selector = raw_step.get("selector")
+            _raw_wait_sel = raw_step.get("selector")
+            selector = _raw_wait_sel if isinstance(_raw_wait_sel, str) and _raw_wait_sel.strip() else None
             load_state = raw_step.get("load_state")
             ms = raw_step.get("ms")
 
             if until in {"selector_visible", "selector_hidden"} and selector:
-                raw_selector = str(selector)
-                alias_key = self._selector_alias_key(raw_selector)
-                try:
-                    return await self._run_with_selector_fallback(
-                        raw_selector,
-                        step_type,
-                        selector_profile,
-                        test_data,
-                        run_domain,
-                        lambda resolved: self._browser.wait_for(
-                            until=until,
-                            ms=ms,
-                            selector=resolved,
-                            load_state=load_state,
-                        ),
-                    )
-                except Exception as exc:
-                    if alias_key == "workflow_saved_success":
-                        try:
-                            await self._run_with_selector_fallback(
-                                "{{selector.cancel_button}}",
-                                "wait",
-                                selector_profile,
-                                test_data,
-                                run_domain,
-                                lambda resolved: self._browser.wait_for(
-                                    until="selector_visible",
-                                    ms=8000,
-                                    selector=resolved,
-                                    load_state=None,
-                                ),
-                            )
-                            return "Workflow editor remained available after save"
-                        except Exception:
-                            raise exc
-                    raise
+                return await self._run_with_selector_fallback(
+                    selector,
+                    step_type,
+                    selector_profile,
+                    test_data,
+                    run_domain,
+                    lambda resolved: self._browser.wait_for(
+                        until=until,
+                        ms=ms,
+                        selector=resolved,
+                        load_state=load_state,
+                    ),
+                    semantic_confidence=raw_step.get("_semantic_confidence"),
+                )
 
             if until == "timeout":
                 return await self._smart_stabilization_wait(int(ms) if ms is not None else 500)
@@ -2978,16 +2996,17 @@ class AgentExecutor:
             return await self._browser.wait_for(
                 until=until,
                 ms=ms,
-                selector=str(selector) if selector else None,
-                load_state=str(load_state) if load_state else None,
+                selector=selector,  # already validated as str above
+                load_state=(str(load_state) if isinstance(load_state, str) and load_state.strip() else None),
             )
 
         if step_type == "handle_popup":
             policy = str(raw_step.get("policy", "dismiss"))
-            selector = raw_step.get("selector")
+            _raw_popup_sel = raw_step.get("selector")
+            selector = _raw_popup_sel if isinstance(_raw_popup_sel, str) and _raw_popup_sel.strip() else None
             if selector:
                 return await self._run_with_selector_fallback(
-                    str(selector),
+                    selector,
                     step_type,
                     selector_profile,
                     test_data,
@@ -3000,7 +3019,13 @@ class AgentExecutor:
             return await self._browser.handle_popup(policy=policy, selector=None)
 
         if step_type == "verify_text":
-            selector = str(raw_step.get("selector") or self._selector_seed_from_target(raw_step, step_type))
+            _raw_vt = raw_step.get("selector")
+            selector = str(
+                (_raw_vt if isinstance(_raw_vt, str) and _raw_vt.strip() else None)
+                or raw_step.get("_grounded_selector")
+                or self._selector_seed_from_target(raw_step, step_type)
+                or ""
+            )
             match = str(raw_step.get("match", "contains"))
             value = self._apply_template(str(raw_step["value"]), test_data, run_id=run.run_id)
             value_lower = value.lower()
@@ -3383,13 +3408,19 @@ class AgentExecutor:
             })
             break  # one warning is enough
 
-        # ---- 4. Loading state detection (warn only) -------------------------
+        # ---- 4. Loading / blank state detection (warn only) -----------------
         loading_signals = ("loading", "please wait", "spinner", "skeleton")
-        if visible_count == 0 and any(s in title for s in loading_signals):
+        _is_blank_url = current_url.lower() in {"", "about:blank", "chrome://newtab/", "edge://newtab/"}
+        if visible_count == 0 and (
+            any(s in title for s in loading_signals)
+            or _is_blank_url
+            or not title
+        ):
             issues.append({
                 "type": "loading_state",
                 "detail": (
-                    f"Page appears to still be loading (title={title!r}, "
+                    f"Page appears blank or still loading "
+                    f"(title={title!r}, url={current_url!r}, "
                     f"visible_elements={visible_count})"
                 ),
             })
@@ -3421,7 +3452,16 @@ class AgentExecutor:
         if not raw_selector:
             return {"status": "skipped", "reason": "missing_selector"}
         if self._looks_like_explicit_selector(raw_selector):
-            return {"status": "skipped", "reason": "explicit_selector"}
+            # For type/select steps, skip only when no target identity metadata
+            # is available.  If the planner provided target.label/text/placeholder
+            # we still run the page-presence check — an explicit CSS selector is
+            # no guarantee that it lands on the intended sibling field.
+            has_identity = (
+                step.type in {"type", "select"}
+                and bool(self._step_text_hint(step.input, step.type))
+            )
+            if not has_identity:
+                return {"status": "skipped", "reason": "explicit_selector"}
         selector_alias = self._selector_alias_key(raw_selector)
 
         target_terms = self._selector_search_terms(
@@ -3704,12 +3744,69 @@ class AgentExecutor:
             f"but resolved selector '{resolved_selector}' matched '{preview or actual_haystack[:80]}'."
         )
 
+    @staticmethod
+    def _type_field_identity_surface(resolved_selector: str) -> str:
+        """
+        Build a lowercase word surface from the resolved selector's stable
+        identity attributes (name, aria-label, placeholder, id, testid).
+        camelCase and snake_case values are expanded to space-separated tokens
+        so that e.g. "confirmPassword" contributes both "confirm" and "password".
+        Used by _validate_type_post_action / _validate_select_post_action.
+        """
+        parsed = AgentExecutor._parse_selector_attributes(resolved_selector)
+        parts: list[str] = []
+        for field in ("name", "aria", "placeholder", "id", "testid"):
+            val = parsed.get(field, "")
+            if not val:
+                continue
+            # camelCase → "camel case"
+            expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", val)
+            # snake_case / kebab-case → spaces
+            expanded = re.sub(r"[_\-]", " ", expanded)
+            parts.append(expanded.lower())
+        return " ".join(parts)
+
+    @staticmethod
+    def _check_field_identity_hint(resolved_selector: str, identity_hint: str) -> str | None:
+        """
+        Return an error string if the resolved selector's identity surface contains
+        at least one word from the multi-word identity hint but is missing others
+        (classic sibling-field mismatch: e.g. intent is "Confirm Password" but
+        selector resolved to the plain "Password" field).
+
+        Returns None when the check passes or cannot be applied:
+        - Single-word hints are not specific enough to enforce.
+        - If NO hint words appear in the surface the selector is identity-opaque
+          (e.g. #btn3) — do not block on insufficient evidence.
+        """
+        hint_words = {
+            w for w in re.findall(r"[a-z]+", identity_hint.lower()) if len(w) >= 3
+        }
+        if len(hint_words) < 2:
+            return None  # single-word hint — not specific enough to enforce
+
+        surface = AgentExecutor._type_field_identity_surface(resolved_selector)
+        if not surface.strip():
+            return None  # selector is identity-opaque (#xyz, .btn) — skip
+
+        matched = {w for w in hint_words if w in surface}
+        missing = hint_words - matched
+        if matched and missing:
+            # Some words present, some absent → clearly the wrong sibling field.
+            return (
+                f"Type identity mismatch for '{resolved_selector}': "
+                f"intent '{identity_hint}' — words {sorted(missing)} not in "
+                f"element surface '{surface.strip()}'."
+            )
+        return None
+
     async def _validate_type_post_action(
         self,
         *,
         resolved_selector: str,
         expected_text: str,
         clear_first: bool,
+        identity_hint: str | None = None,
     ) -> str:
         actual_value = await self._browser.get_element_value(resolved_selector)
         if actual_value is None:
@@ -3724,6 +3821,13 @@ class AgentExecutor:
                 raise ValueError(
                     f"Type validation failed for {resolved_selector}: appended text '{expected_text}' not present in final value '{actual_value}'."
                 )
+        # Identity check: verify the field's selector surface matches the planner's
+        # target label.  Catches sibling-field confusion that slipped past the
+        # pre-action semantic gate (e.g. profile/LLM candidates not in snapshot).
+        if identity_hint:
+            mismatch = self._check_field_identity_hint(resolved_selector, identity_hint)
+            if mismatch:
+                raise ValueError(mismatch)
         return f"post_validation=passed (value='{actual_value[:120]}')"
 
     async def _validate_select_post_action(
@@ -3731,6 +3835,7 @@ class AgentExecutor:
         *,
         resolved_selector: str,
         expected_value: str,
+        identity_hint: str | None = None,
     ) -> str:
         actual_value = await self._browser.get_select_value(resolved_selector)
         if actual_value is None:
@@ -3739,6 +3844,10 @@ class AgentExecutor:
             raise ValueError(
                 f"Select validation failed for {resolved_selector}: expected '{expected_value}' but found '{actual_value}'."
             )
+        if identity_hint:
+            mismatch = self._check_field_identity_hint(resolved_selector, identity_hint)
+            if mismatch:
+                raise ValueError(mismatch)
         return f"post_validation=passed (selected='{actual_value[:120]}')"
 
     async def _find_element_from_intent(
@@ -3954,6 +4063,148 @@ class AgentExecutor:
         return matched
 
     @staticmethod
+    def _validate_candidate_against_intent(
+        selector: str,
+        step_type: str,
+        intent: "StepIntent",
+        snapshot: list[dict[str, Any]] | None,
+        *,
+        source: str,
+        strictness: str = "normal",
+    ) -> "CandidateValidationResult":
+        """
+        App-agnostic pre-flight check: does *selector* appear to target the
+        element described by *intent*?
+
+        Returns a CandidateValidationResult with status one of:
+          "passed"  — selector resolves to an element whose labels overlap
+                      the intent's target_text (and passes visible/role checks).
+          "failed"  — selector resolved but content mismatches, OR selector is
+                      a generic type-only selector in strict mode that cannot be
+                      verified.
+          "skipped" — cannot make a determination (no target_text, no snapshot,
+                      or selector did not appear in the snapshot).
+
+        This method does NOT wire into execution; it is a pure analysis helper.
+        """
+        target_text = (intent.target_text or "").strip()
+        if not target_text:
+            return CandidateValidationResult(
+                status="skipped",
+                reason="no_target_text",
+                selector=selector,
+                source=source,
+                strictness=strictness,
+            )
+
+        normalized = selector.strip().replace('"', "'")
+        is_generic = normalized in AgentExecutor._GENERIC_SELECTORS
+        is_strict = strictness == "strict"
+
+        if snapshot is None:
+            if is_strict and is_generic:
+                return CandidateValidationResult(
+                    status="failed",
+                    reason="strict_generic_no_snapshot",
+                    selector=selector,
+                    source=source,
+                    strictness=strictness,
+                )
+            return CandidateValidationResult(
+                status="skipped",
+                reason="no_snapshot",
+                selector=selector,
+                source=source,
+                strictness=strictness,
+            )
+
+        resolved = AgentExecutor._resolve_selector_in_snapshot(selector, snapshot)
+
+        if not resolved:
+            if is_strict and is_generic:
+                return CandidateValidationResult(
+                    status="failed",
+                    reason="strict_generic_unresolved",
+                    selector=selector,
+                    source=source,
+                    strictness=strictness,
+                )
+            return CandidateValidationResult(
+                status="skipped",
+                reason="unresolved",
+                selector=selector,
+                source=source,
+                strictness=strictness,
+            )
+
+        meaningful_words = [
+            w for w in re.findall(r"[a-z0-9]+", target_text.lower()) if len(w) >= 3
+        ]
+
+        for el in resolved:
+            tag = str(el.get("tag", "")).lower()
+            role = str(el.get("role", "")).lower()
+
+            if el.get("enabled") is False:
+                continue
+
+            input_type = str(el.get("type", "")).lower()
+            if step_type in {"type", "select"} and input_type == "hidden":
+                continue
+
+            if step_type == "type":
+                if tag == "button" or role in {"button", "menuitem", "tab", "link"}:
+                    continue
+            elif step_type == "select":
+                if tag not in {"select", ""} and role not in {"combobox", "listbox", ""}:
+                    continue
+
+            if not meaningful_words:
+                return CandidateValidationResult(
+                    status="passed",
+                    reason="no_meaningful_words",
+                    selector=selector,
+                    source=source,
+                    strictness=strictness,
+                    resolved_count=len(resolved),
+                    resolved_elements=resolved,
+                )
+
+            haystack = " ".join(
+                str(el.get(f, "")).lower()
+                for f in ("label", "text", "aria", "placeholder", "name", "title", "href")
+            )
+
+            matched_words = [w for w in meaningful_words if w in haystack]
+
+            if not matched_words:
+                continue
+
+            if is_strict and len(meaningful_words) >= 2 and len(matched_words) < len(meaningful_words):
+                continue
+
+            return CandidateValidationResult(
+                status="passed",
+                reason="ok",
+                selector=selector,
+                source=source,
+                strictness=strictness,
+                resolved_count=len(resolved),
+                resolved_elements=resolved,
+            )
+
+        # All resolved elements failed visible/role/label checks → mismatch.
+        return CandidateValidationResult(
+            status="failed",
+            reason="mismatch",
+            selector=selector,
+            source=source,
+            strictness=strictness,
+            resolved_count=len(resolved),
+            resolved_elements=resolved,
+        )
+
+    @staticmethod
     def _gate_element_vs_intent(
         item: dict[str, Any],
         step_type: str,
@@ -4128,11 +4379,27 @@ class AgentExecutor:
            must appear in the element's text/aria/placeholder/name surface.
            Skip this check when target_text is absent or very short.
         """
-        if explicit_selector:
+        # Skip semantic gate for explicit selectors UNLESS the intent carries
+        # target identity metadata (target.label/text/placeholder).  With
+        # identity metadata available the gate can and should validate label
+        # alignment even when the selector itself is a precise CSS expression —
+        # explicit selector ≠ correct sibling field.
+        has_target_text = bool(intent and intent.target_text and len(intent.target_text) >= 3)
+        if explicit_selector and not (step_type in {"type", "select"} and has_target_text):
             return True, "explicit_selector_skip"
 
         item = snapshot_index.get(selector)
         if item is None:
+            # Gap 1: for selectors not in the snapshot (profile/LLM candidates),
+            # apply conservative checks using tag/type inferred from the selector string.
+            inferred_tag = self._infer_tag_from_selector(selector)
+            inferred_type = self._infer_type_from_selector(selector)
+            if step_type in {"type", "select"} and inferred_type == "hidden":
+                return False, f"gap1: type/select on inferred hidden input selector={selector[:60]!r}"
+            if step_type == "type" and inferred_tag == "button":
+                return False, f"gap1: type on inferred button tag selector={selector[:60]!r}"
+            if step_type == "select" and inferred_tag not in {"select", ""}:
+                return False, f"gap1: select on non-select inferred tag={inferred_tag!r} selector={selector[:60]!r}"
             return True, "not_in_snapshot_skip"
 
         tag = str(item.get("tag", "")).lower()
@@ -4158,6 +4425,23 @@ class AgentExecutor:
         elif step_type == "select":
             if tag not in {"select", ""} and role not in {"combobox", "listbox", ""}:
                 return False, f"semantic_gate: select on non-select element tag={tag!r} role={role!r}"
+        elif step_type == "click":
+            # Gap 2: Click plausibility.
+            # When intent expects a button or link but the resolved element is a
+            # static heading/paragraph with no interactive role, reject so the
+            # fallback pipeline can surface the correct interactive element.
+            if intent and intent.element_type in {"button", "link"}:
+                _STATIC_CONTENT_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p"}
+                _INTERACTIVE_ROLES = {
+                    "button", "link", "menuitem", "tab", "option",
+                    "checkbox", "radio", "switch", "treeitem",
+                    "menuitemcheckbox", "menuitemradio",
+                }
+                if tag in _STATIC_CONTENT_TAGS and role not in _INTERACTIVE_ROLES:
+                    return False, (
+                        f"semantic_gate: click on static content element — "
+                        f"intent expects {intent.element_type!r} but tag={tag!r} role={role!r}"
+                    )
 
         # Rule 4 — label alignment (only when we have a meaningful target_text)
         if intent and intent.target_text:
@@ -4204,7 +4488,18 @@ class AgentExecutor:
         post_validate: Callable[[str, str, Any], Awaitable[str | None]] | None = None,
         grounded_selector: str | None = None,
         exclude_selectors: set[str] | None = None,
+        semantic_confidence: str | None = None,
+        element_candidates: list[str] | None = None,
     ) -> str:
+        # ------------------------------------------------------------------
+        # element_candidates — constrained execution path
+        # When perception identified the element with strong confidence,
+        # element_candidates holds ALL selectors derived from that specific
+        # element.  Skip ALL broad candidate generation; retry only within
+        # this pre-identified element's selectors.
+        # ------------------------------------------------------------------
+        _element_constrained = bool(element_candidates)
+
         intent = self._build_step_intent(step_type, raw_selector, text_hint)
         selector_generation_started = perf_counter()
         explicit_selector = self._looks_like_explicit_selector(raw_selector)
@@ -4216,88 +4511,118 @@ class AgentExecutor:
             score_gap=0,
             retained_count=0,
         )
-        live_snapshot = await self._safe_page_snapshot()
-        snapshot_selector_index = self._build_snapshot_selector_index(
-            live_snapshot if isinstance(live_snapshot, dict) else None
-        )
-        if not explicit_selector and isinstance(live_snapshot, dict):
-            live_snapshot_candidates = self._page_snapshot_selector_candidates(
-                live_snapshot,
+
+        if _element_constrained:
+            # Constrained path: use element-derived selectors directly.
+            # Still fetch a snapshot for trace/signature purposes but skip all
+            # candidate generation from profile/DOM heuristics.
+            live_snapshot = await self._safe_page_snapshot()
+            snapshot_selector_index = self._build_snapshot_selector_index(
+                live_snapshot if isinstance(live_snapshot, dict) else None
+            )
+            profile_candidates: list[str] = []
+            grounded_failure_reason: str | None = None
+            selector_alias = None
+        else:
+            live_snapshot = await self._safe_page_snapshot()
+            snapshot_selector_index = self._build_snapshot_selector_index(
+                live_snapshot if isinstance(live_snapshot, dict) else None
+            )
+            if not explicit_selector and isinstance(live_snapshot, dict):
+                live_snapshot_candidates = self._page_snapshot_selector_candidates(
+                    live_snapshot,
+                    raw_selector,
+                    step_type,
+                    text_hint,
+                )
+                live_snapshot_candidates, grounded_confidence = self._confidence_gate_candidates(
+                    live_snapshot_candidates,
+                    intent,
+                    step_type=step_type,
+                    source="live",
+                )
+
+            profile_candidates = self._selector_candidates(
                 raw_selector,
                 step_type,
+                selector_profile,
+                test_data,
+                run_domain,
                 text_hint,
             )
-            live_snapshot_candidates, grounded_confidence = self._confidence_gate_candidates(
-                live_snapshot_candidates,
-                intent,
-                step_type=step_type,
-                source="live",
-            )
+            selector_alias = self._selector_alias_key(raw_selector)
 
-        profile_candidates = self._selector_candidates(
-            raw_selector,
-            step_type,
-            selector_profile,
-            test_data,
-            run_domain,
-            text_hint,
-        )
-        selector_alias = self._selector_alias_key(raw_selector)
-
-        grounded_failure_reason: str | None = None
-        if not explicit_selector and isinstance(live_snapshot, dict) and not live_snapshot_candidates:
-            grounded_failure_reason = "no_grounded_candidates"
-            if selector_alias and not grounded_selector:
-                alias_label = selector_alias.replace("_", " ").strip() or raw_selector
-                raise ValueError(
-                    f"Grounded selection failed for '{alias_label}': "
-                    "the current page does not contain a matching live element."
-                )
-
-        # Slow-path stage order:
-        # 1) template/profile candidates
-        # 2) prepend strong live DOM candidates for non-explicit selectors
-        # 3) prepend perception-grounded selector (if present)
-        candidates = list(profile_candidates)
-        if not explicit_selector and live_snapshot_candidates:
-            prioritized_live_candidates = self._rank_live_snapshot_selectors(
-                live_snapshot_candidates,
-                intent,
-            )
-            candidates = prioritized_live_candidates + [
-                c for c in candidates if c not in live_snapshot_candidates
-            ]
-        if grounded_selector:
-            if grounded_selector not in candidates:
-                candidates = [grounded_selector] + candidates
-                LOGGER.debug(
-                    "Selector fallback: perception selector prepended ahead of profile candidates: %r (step_type=%s)",
-                    grounded_selector, step_type,
-                )
-            elif candidates[0] != grounded_selector:
-                candidates = [grounded_selector] + [c for c in candidates if c != grounded_selector]
-        # Remove selectors already successfully used by earlier steps in this run.
-        # This prevents the fallback from re-using e.g. input[name='password'] for
-        # a confirm-password step just because the field accepted the same text.
-        if exclude_selectors:
-            filtered = [c for c in candidates if c not in exclude_selectors]
-            if filtered:
-                removed = len(candidates) - len(filtered)
-                if removed:
-                    LOGGER.debug(
-                        "Selector fallback: excluded %d already-used candidate(s) for step_type=%s raw_selector=%r",
-                        removed, step_type, raw_selector,
+            grounded_failure_reason = None
+            if not explicit_selector and isinstance(live_snapshot, dict) and not live_snapshot_candidates:
+                grounded_failure_reason = "no_grounded_candidates"
+                if selector_alias and not grounded_selector:
+                    alias_label = selector_alias.replace("_", " ").strip() or raw_selector
+                    raise ValueError(
+                        f"Grounded selection failed for '{alias_label}': "
+                        "the current page does not contain a matching live element."
                     )
-                candidates = filtered
-        if not explicit_selector and live_snapshot_candidates:
-            candidate_confidence = grounded_confidence
-        else:
-            candidates, candidate_confidence = self._confidence_gate_candidates(
-                candidates,
-                intent,
-                step_type=step_type,
-                source="initial",
+
+        if _element_constrained:
+            # Element-constrained: use the derived selectors directly, ordered
+            # most-stable → least-stable (derive_element_selectors guarantees this).
+            # Exclude previously-used selectors to prevent re-use on sibling fields.
+            _ec = list(element_candidates)  # type: ignore[arg-type]
+            if exclude_selectors:
+                _ec = [s for s in _ec if s not in exclude_selectors] or _ec
+            candidates = _ec
+            candidate_confidence = CandidateConfidence(
+                level="high",
+                top_score=100,
+                second_score=None,
+                score_gap=100,
+                retained_count=len(candidates),
             )
+        else:
+            # Slow-path stage order:
+            # 1) template/profile candidates
+            # 2) prepend strong live DOM candidates for non-explicit selectors
+            # 3) prepend perception-grounded selector (if present)
+            candidates = list(profile_candidates)
+            if not explicit_selector and live_snapshot_candidates:
+                prioritized_live_candidates = self._rank_live_snapshot_selectors(
+                    live_snapshot_candidates,
+                    intent,
+                )
+                candidates = prioritized_live_candidates + [
+                    c for c in candidates if c not in live_snapshot_candidates
+                ]
+            if grounded_selector:
+                if grounded_selector not in candidates:
+                    candidates = [grounded_selector] + candidates
+                    LOGGER.debug(
+                        "Selector fallback: perception selector prepended ahead of profile candidates: %r (step_type=%s)",
+                        grounded_selector, step_type,
+                    )
+                elif candidates[0] != grounded_selector:
+                    candidates = [grounded_selector] + [c for c in candidates if c != grounded_selector]
+        if not _element_constrained:
+            # Remove selectors already successfully used by earlier steps in this run.
+            # This prevents the fallback from re-using e.g. input[name='password'] for
+            # a confirm-password step just because the field accepted the same text.
+            if exclude_selectors:
+                filtered = [c for c in candidates if c not in exclude_selectors]
+                if filtered:
+                    removed = len(candidates) - len(filtered)
+                    if removed:
+                        LOGGER.debug(
+                            "Selector fallback: excluded %d already-used candidate(s) for step_type=%s raw_selector=%r",
+                            removed, step_type, raw_selector,
+                        )
+                    candidates = filtered
+            if not explicit_selector and live_snapshot_candidates:
+                candidate_confidence = grounded_confidence
+            else:
+                candidates, candidate_confidence = self._confidence_gate_candidates(
+                    candidates,
+                    intent,
+                    step_type=step_type,
+                    source="initial",
+                )
         execution_policy = self._candidate_execution_policy(candidate_confidence, step_type=step_type)
         selector_generation_ms = self._elapsed_ms(selector_generation_started)
         last_error: Exception | None = None
@@ -4306,11 +4631,18 @@ class AgentExecutor:
         recovery_attempts = self._effective_selector_recovery_attempts(step_type, len(candidates))
         if execution_policy["recovery_attempts"] is not None:
             recovery_attempts = min(recovery_attempts, int(execution_policy["recovery_attempts"]))
+        # Semantic confidence gating: ambiguous/no_match perception results indicate
+        # the planner's semantic contract couldn't uniquely resolve an element.
+        # Cap retry cycles at 1 so we surface the failure quickly instead of
+        # exhausting the full fallback cascade on an unresolvable target.
+        if semantic_confidence in {"ambiguous", "no_match"}:
+            recovery_attempts = min(recovery_attempts, 1)
         LOGGER.debug(
             "Selector fallback: step_type=%s raw_selector=%r domain=%r "
-            "candidates=%d confidence=%s policy=%s",
+            "candidates=%d confidence=%s policy=%s semantic_confidence=%s",
             step_type, raw_selector, run_domain,
             len(candidates), candidate_confidence.level, execution_policy.get("mode"),
+            semantic_confidence,
         )
         trace_group = self._record_step_trace_group(
             {
@@ -4319,6 +4651,9 @@ class AgentExecutor:
                 "step_type": step_type,
                 "run_domain": run_domain,
                 "text_hint": text_hint,
+                "semantic_confidence": semantic_confidence,
+                "element_constrained": _element_constrained,
+                "element_candidates": list(element_candidates) if element_candidates else None,
                 "intent": self._serialize_step_intent(intent),
                 "candidate_timeout_seconds": candidate_timeout_s,
                 "recovery_attempts": recovery_attempts,
@@ -4366,7 +4701,9 @@ class AgentExecutor:
                 # it may just be slow to render after an async SPA operation.
                 # All other candidates fail fast to avoid wasting time.
                 if step_type in {"click", "type", "select"}:
-                    is_grounded = bool(grounded_selector and selector == grounded_selector)
+                    # Element-constrained selectors all address the same identified
+                    # element; give them the full grounded timeout.
+                    is_grounded = _element_constrained or bool(grounded_selector and selector == grounded_selector)
                     probe_timeout_ms = 3000 if is_grounded else 1500
                     probe_ok = await self._probe_element_present(selector, timeout_ms=probe_timeout_ms)
                     if not probe_ok:
@@ -4562,6 +4899,15 @@ class AgentExecutor:
         allow_live_candidates = execution_policy.get("allow_live_candidates", True)
         if self._should_skip_live_candidates(step_type, raw_selector, last_error, len(candidates)):
             allow_live_candidates = False
+        # Suppress live DOM re-rank when perception already determined ambiguity or
+        # no match: re-querying the DOM won't resolve the semantic disambiguation
+        # problem and would only waste time and risk acting on the wrong element.
+        if semantic_confidence in {"ambiguous", "no_match"}:
+            allow_live_candidates = False
+        # Element-constrained path: perception already identified the exact element;
+        # live DOM re-rank would only risk finding a different (wrong) element.
+        if _element_constrained:
+            allow_live_candidates = False
         if allow_live_candidates:
             LOGGER.debug(
                 "Selector fallback: all initial candidates exhausted, querying live DOM. "
@@ -4722,6 +5068,17 @@ class AgentExecutor:
         if last_error:
             active_step = self._active_step_state()
             allow_llm = execution_policy.get("allow_llm_recovery", True)
+            # Do not escalate to LLM selector recovery when semantic confidence is
+            # ambiguous or no_match: the LLM would receive the same ambiguous DOM
+            # signals that perception already couldn't resolve, and would likely
+            # return a wrong-element selector rather than a correct one.
+            if semantic_confidence in {"ambiguous", "no_match"}:
+                allow_llm = False
+            # Element-constrained path: the element was already positively identified
+            # by perception. LLM recovery operates on the broad DOM and would likely
+            # suggest selectors for a different element.
+            if _element_constrained:
+                allow_llm = False
             if allow_llm and active_step is not None and not self._active_step_has_llm_recovery_group():
                 LOGGER.warning(
                     "Selector fallback: all candidates exhausted (%d attempts), attempting LLM recovery. "
@@ -5814,154 +6171,14 @@ class AgentExecutor:
                 keys.insert(0, "password")
             if "username" in selector_lower:
                 keys.insert(0, "username")
-            if "formname" in selector_lower or "form_name" in selector_lower or "form name" in selector_lower:
-                keys.insert(0, "form_name")
-            if "workflowname" in selector_lower or "workflow_name" in selector_lower or "workflow name" in selector_lower:
-                keys.insert(0, "workflow_name")
-            if "workflow_description" in selector_lower or "description" in selector_lower:
-                keys.insert(0, "workflow_description")
-            if "status_name" in selector_lower or "status name" in selector_lower or "statusname" in selector_lower:
-                keys.insert(0, "status_name")
-            if "label" in selector_lower:
-                keys.insert(0, "form_label")
-            if "dropdown_option_label" in selector_lower:
-                keys.insert(0, "dropdown_option_label")
-            if "dropdown_option_value" in selector_lower:
-                keys.insert(0, "dropdown_option_value")
-            if any(token in selector_lower for token in ("twotabsearchtextbox", "field-keywords")):
-                keys.insert(0, "amazon_search_box")
-        amazon_result_position = self._amazon_result_position(selector_lower, text_hint) if step_type == "click" else None
-        youtube_result_position = self._youtube_result_position(selector_lower, text_hint) if step_type == "click" else None
         if step_type == "click":
             if any(token in selector_lower for token in ("login", "sign in", "signin", "log in")):
                 keys.insert(0, "login_button")
-            if any(token in selector_lower for token in ("language", "locale", "change language", "change locale", "lang")):
-                keys.insert(0, "language_switcher")
-            if "create_form_confirm" in selector_lower or "create form confirm" in selector_lower:
-                keys.insert(0, "create_form_confirm")
-            elif "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
-                keys.insert(0, "create_form")
-            if "create workflow" in selector_lower or "create_workflow" in selector_lower or "createworkflow" in selector_lower:
-                keys.insert(0, "create_workflow")
-            if "add status" in selector_lower or "add_status" in selector_lower or "addstatus" in selector_lower:
-                keys.insert(0, "add_status_button")
-            if "new status" in selector_lower or "new_status" in selector_lower or "newstatus" in selector_lower:
-                keys.insert(0, "new_status_tab")
-            if "from_status_dropdown" in selector_lower or "from status" in selector_lower:
-                keys.insert(0, "from_status_dropdown")
-            if "to_status_dropdown" in selector_lower or "to status" in selector_lower:
-                keys.insert(0, "to_status_dropdown")
-            if "transition_canvas_label" in selector_lower:
-                keys.insert(0, "transition_canvas_label")
-            if "workflow_list_item" in selector_lower or "qa_auto_workflow_" in selector_lower:
-                keys.insert(0, "workflow_list_item")
-            if "top_left_corner" in selector_lower or "top left corner" in selector_lower:
-                keys.insert(0, "top_left_corner")
-            if "workflows_module" in selector_lower or selector_lower.strip() == "workflows":
-                keys.insert(0, "workflows_module")
-            if "form_list_first_name" in selector_lower:
-                keys.insert(0, "form_list_first_name")
-            if "back button" in selector_lower or "selector.back_button" in selector_lower or selector_lower.strip() == "back":
-                keys.insert(0, "back_button")
-            if "save workflow" in selector_lower or "save_workflow" in selector_lower or "saveworkflow" in selector_lower:
-                keys.insert(0, "save_workflow")
-            if "save status" in selector_lower or "save_status" in selector_lower or "savestatus" in selector_lower:
-                keys.insert(0, "save_status")
-            if "status_category_todo" in selector_lower or "to do" == selector_lower.strip():
-                keys.insert(0, "status_category_todo")
-            if "status_category_dropdown" in selector_lower or "select category" in selector_lower or "status category" in selector_lower:
-                keys.insert(0, "status_category_dropdown")
-            if "save form" in selector_lower or "save_form" in selector_lower or "saveform" in selector_lower:
-                keys.insert(0, "save_form")
-        if step_type == "click" and text_hint and self._looks_like_transition_hint(text_hint):
-            candidates_from_hint = self._transition_label_signal_selectors(text_hint, test_data)
-        else:
-            candidates_from_hint = []
-            if any(token in selector_lower for token in ("required", "checkbox")):
-                keys.insert(0, "required_checkbox")
-            if "dropdown_option_type_trigger" in selector_lower:
-                keys.insert(0, "dropdown_option_type_trigger")
-            if "dropdown_option_enter_manual" in selector_lower:
-                keys.insert(0, "dropdown_option_enter_manual")
-            if "dropdown_option_add_button" in selector_lower:
-                keys.insert(0, "dropdown_option_add_button")
-            if any(token in selector_lower for token in ("nav-search-submit", "search-submit", "search button")):
-                keys.insert(0, "amazon_search_submit")
-            if amazon_result_position is not None:
-                if amazon_result_position == 2:
-                    keys.insert(0, "amazon_second_result")
-                else:
-                    candidates_from_hint.extend(self._amazon_result_candidates(amazon_result_position))
-            if youtube_result_position is not None:
-                candidates_from_hint.extend(self._youtube_result_candidates(youtube_result_position))
-            elif any(
-                token in selector_lower
-                for token in ("s-search-result", "h2 a", "product-image", "a-link-normal")
-            ):
-                keys.insert(0, "amazon_first_result")
-            if any(token in selector_lower for token in ("add-to-cart", "add to cart", "submit.add-to-cart")):
-                keys.insert(0, "amazon_add_to_cart")
-            if any(token in selector_lower for token in ("nav-cart", "cart")):
-                keys.insert(0, "amazon_cart")
-        if step_type == "drag":
-            if any(
-                token in selector_lower
-                for token in ("short answer", "short_answer", "shortanswer")
-            ):
-                keys.insert(0, "short_answer_source")
-            if any(token in selector_lower for token in ("email", "field-email")):
-                keys.insert(0, "email_field_source")
-            if any(token in selector_lower for token in ("dropdown", "linked dropdown", "field-dropdown")):
-                keys.insert(0, "dropdown_field_source")
-            if any(
-                token in selector_lower
-                for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")
-            ):
-                keys.insert(0, "form_canvas_target")
-        if step_type == "verify_text":
-            hint_lower = (text_hint or "").lower()
-            if any(token in hint_lower for token in ("create form", "create_form", "createform")):
-                keys.insert(0, "create_form")
-            if any(token in hint_lower for token in ("create workflow", "create_workflow", "createworkflow")):
-                keys.insert(0, "create_workflow")
-            if any(token in hint_lower for token in ("workflow has been created",)):
-                keys.insert(0, "workflow_confirmation")
-            if any(token in hint_lower for token in ("login", "sign in", "signin", "log in")):
-                keys.insert(0, "login_button")
-            if any(token in hint_lower for token in ("save", "save form", "save_form")):
-                keys.insert(0, "save_form")
-            if any(token in hint_lower for token in ("save workflow", "save_workflow")):
-                keys.insert(0, "save_workflow")
-            if any(token in hint_lower for token in ("save status", "save_status")):
-                keys.insert(0, "save_status")
-            if "create form" in selector_lower or "create_form" in selector_lower or "createform" in selector_lower:
-                keys.insert(0, "create_form")
-            if "create workflow" in selector_lower or "create_workflow" in selector_lower or "createworkflow" in selector_lower:
-                keys.insert(0, "create_workflow")
-            if "workflow_confirmation" in selector_lower or "workflow has been created" in selector_lower:
-                keys.insert(0, "workflow_confirmation")
-            if "form_list_first_row" in selector_lower:
-                keys.insert(0, "form_list_first_row")
-        if step_type == "wait":
-            if "dropdown_options_section" in selector_lower:
-                keys.insert(0, "dropdown_options_section")
-            if "create_workflow" in selector_lower or "create workflow" in selector_lower:
-                keys.insert(0, "create_workflow")
 
         ordered_keys = self._dedupe(keys)
         candidates: list[str] = []
-        strict_dropdown_keys = {
-            "dropdown_option_type_trigger",
-            "dropdown_option_enter_manual",
-            "dropdown_options_section",
-            "dropdown_option_label",
-            "dropdown_option_value",
-            "dropdown_option_add_button",
-        }
         for key in ordered_keys:
-            # Prefer remembered selectors that already succeeded on this domain,
-            # except for brittle dropdown modal actions where profile selectors are safer.
-            if key not in strict_dropdown_keys and step_type != "type":
+            if step_type != "type":
                 candidates.extend(self._memory_candidates(run_domain, step_type, key))
             profile_candidates = self._merge_profile_candidates(key, selector_profile, run_domain=run_domain)
             for candidate in profile_candidates:
@@ -5982,20 +6199,13 @@ class AgentExecutor:
                 deduped = self._dedupe([selector] + candidates)
         else:
             deduped = self._dedupe(candidates)
-        if candidates_from_hint:
-            deduped = self._dedupe(candidates_from_hint + deduped)
-        if step_type == "drag":
-            deduped = self._prioritize_drag_candidates(deduped, alias_key=alias_key)
+
         effective_filter_key = alias_key
         if not effective_filter_key and step_type == "type":
             if "email" in selector_lower:
                 effective_filter_key = "email"
             elif "password" in selector_lower:
                 effective_filter_key = "password"
-            elif "dropdown_option_label" in selector_lower:
-                effective_filter_key = "dropdown_option_label"
-            elif "dropdown_option_value" in selector_lower:
-                effective_filter_key = "dropdown_option_value"
         if effective_filter_key:
             deduped = self._filter_alias_candidates(effective_filter_key, deduped)
         if (
@@ -6008,12 +6218,6 @@ class AgentExecutor:
                 for candidate in deduped
                 if "clear search query" not in candidate.lower()
                 and "reset query" not in candidate.lower()
-            ]
-        if step_type == "click" and amazon_result_position is not None and amazon_result_position > 1:
-            deduped = [
-                candidate
-                for candidate in deduped
-                if "h2 a.a-link-normal" not in candidate.lower() and candidate.lower().strip() != "h2 a"
             ]
         return self._rank_selectors_by_intent(deduped, intent)
 
@@ -6044,85 +6248,6 @@ class AgentExecutor:
             text_hint,
         ) + intent_candidates)
 
-    @staticmethod
-    def _amazon_result_position(selector_lower: str, text_hint: str | None = None) -> int | None:
-        signal = " ".join(part for part in (selector_lower, (text_hint or "").lower()) if part).strip()
-        if not any(token in signal for token in ("amazon", "s-search-result", "product", "results")):
-            widget_match = re.search(r"search-results[_-](\d+)", signal)
-            if widget_match:
-                try:
-                    return max(int(widget_match.group(1)), 1)
-                except Exception:
-                    return None
-            return None
-        nth_of_type_match = re.search(r"nth-of-type\((\d+)\)", signal)
-        if nth_of_type_match:
-            return max(int(nth_of_type_match.group(1)), 1)
-        nth_child_match = re.search(r"nth-child\((\d+)\)", signal)
-        if nth_child_match:
-            return max(int(nth_child_match.group(1)), 1)
-        widget_match = re.search(r"search-results[_-](\d+)", signal)
-        if widget_match:
-            try:
-                return max(int(widget_match.group(1)), 1)
-            except Exception:
-                return None
-        for word, value in (
-            ("first", 1),
-            ("second", 2),
-            ("third", 3),
-            ("fourth", 4),
-            ("fifth", 5),
-        ):
-            if word in signal:
-                return value
-        return None
-
-    @staticmethod
-    def _amazon_result_candidates(position: int) -> list[str]:
-        index = max(position - 1, 0)
-        nth = max(position, 1)
-        return [
-            f"div[data-component-type='s-search-result'] h2 a >> nth={index}",
-            f"div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a >> nth={index}",
-            f"div[data-component-type='s-search-result']:nth-of-type({nth}) h2 a",
-            f"div[data-component-type='s-search-result']:nth-of-type({nth}) [data-cy='title-recipe-title'] a",
-        ]
-
-    @staticmethod
-    def _youtube_result_position(selector_lower: str, text_hint: str | None = None) -> int | None:
-        signal = " ".join(part for part in (selector_lower, (text_hint or "").lower()) if part).strip()
-        if not any(token in signal for token in ("youtube", "video-title", "ytd-video-renderer", "video result", "video")):
-            return None
-        nth_match = re.search(r">>\s*nth=(\d+)", signal)
-        if nth_match:
-            return int(nth_match.group(1)) + 1
-        nth_of_type_match = re.search(r"nth-of-type\((\d+)\)", signal)
-        if nth_of_type_match:
-            return max(int(nth_of_type_match.group(1)), 1)
-        if ":first-of-type" in signal:
-            return 1
-        for word, value in (
-            ("first", 1),
-            ("second", 2),
-            ("third", 3),
-            ("fourth", 4),
-            ("fifth", 5),
-        ):
-            if word in signal:
-                return value
-        return None
-
-    @staticmethod
-    def _youtube_result_candidates(position: int) -> list[str]:
-        index = max(position - 1, 0)
-        nth = max(position, 1)
-        return [
-            f"a#video-title >> nth={index}",
-            f"ytd-video-renderer a#video-title >> nth={index}",
-            f"ytd-video-renderer:nth-of-type({nth}) a#video-title",
-        ]
-
     def _initialize_runtime_test_data(self, test_data: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(test_data)
         stable_now = datetime.now()
@@ -6133,182 +6258,8 @@ class AgentExecutor:
         normalized.setdefault("NOW_YYYYMMDDHHMMSS", stable_now.strftime("%Y%m%d%H%M%S"))
         return normalized
 
-    @staticmethod
-    def _prioritize_drag_candidates(candidates: list[str], alias_key: str | None) -> list[str]:
-        key = (alias_key or "").strip().lower()
-
-        def score(selector: str) -> int:
-            s = selector.lower()
-            value = 100
-            if key == "short_answer_source":
-                if "[data-testid='field-short-answer']" in s:
-                    value -= 90
-                if "[data-testid*='short-answer']" in s:
-                    value -= 82
-                if "[data-rbd-draggable-id*='short']" in s:
-                    value -= 78
-                if "[draggable='true']" in s:
-                    value -= 75
-                if "[role='listitem']" in s:
-                    value -= 60
-                if "button:has-text('short answer')" in s or "[role='button']:has-text('short answer')" in s:
-                    value -= 35
-                if "text=short answer" in s:
-                    value -= 25
-            if key == "form_canvas_target":
-                if "[data-row-id].form-row[draggable='true']" in s:
-                    value -= 95
-                if "[data-row-id]" in s:
-                    value -= 90
-                if "[data-testid='form-builder-canvas']" in s:
-                    value -= 85
-                if ".form-canvas" in s or ".form-drop-area" in s or ".form-builder-canvas" in s:
-                    value -= 70
-                if "[data-testid='form-canvas']" in s or "[class*='drop'][class*='canvas']" in s:
-                    value -= 55
-                if "div.form-row[draggable='true']:has-text('drag and drop fields here')" in s:
-                    value -= 25
-                if "div.form-row.relative.flex.w-full[draggable='true']:has-text('drag and drop fields here')" in s:
-                    value -= 22
-                if "drag and drop fields here" in s:
-                    value += 15
-                if "[role='application']" in s:
-                    value += 25
-            if key == "email_field_source":
-                if "[draggable='true']" in s:
-                    value -= 90
-                if "[role='listitem']" in s:
-                    value -= 75
-                if "[data-rbd-draggable-id*='email']" in s:
-                    value -= 70
-                if "[data-testid='field-email']" in s:
-                    value -= 55
-                if "[data-testid*='field-email']" in s:
-                    value -= 50
-                if "button:has-text('email')" in s or "[role='button']:has-text('email')" in s:
-                    value -= 40
-                if "text=email" in s:
-                    value -= 20
-            return value
-
-        return sorted(candidates, key=score)
-
     def _filter_alias_candidates(self, alias_key: str, candidates: list[str]) -> list[str]:
         key = alias_key.strip().lower()
-        if key == "dropdown_option_enter_manual":
-            filtered = [
-                c for c in candidates
-                if "enter options manually" in c.lower() and "use a saved list" not in c.lower()
-            ]
-            return filtered or candidates
-
-        if key == "dropdown_option_label":
-            filtered = [
-                c for c in candidates
-                if ("placeholder='label'" in c.lower() or 'placeholder="label"' in c.lower() or "name='label'" in c.lower() or 'name="label"' in c.lower())
-                and "enter a label" not in c.lower()
-            ]
-            return filtered or candidates
-
-        if key == "dropdown_option_value":
-            filtered = [
-                c for c in candidates
-                if "placeholder='value'" in c.lower() or 'placeholder="value"' in c.lower() or "name='value'" in c.lower() or 'name="value"' in c.lower()
-            ]
-            return filtered or candidates
-
-        if key == "dropdown_option_type_trigger":
-            filtered = [
-                c for c in candidates
-                if "select an option" in c.lower() or "option type" in c.lower() or "[role='combobox']" in c.lower()
-            ]
-            return filtered or candidates
-
-        if key == "dropdown_option_add_button":
-            preferred_markers = (
-                "add-option",
-                "aria-label*='add option'",
-                "title*='add option'",
-                "svg[class*='plus']",
-                "input[placeholder='value']) button",
-                ":has-text('+')",
-                "text=+",
-            )
-            filtered = [c for c in candidates if any(m in c.lower() for m in preferred_markers)]
-            return filtered or candidates
-
-        if key == "status_category_todo":
-            filtered = [
-                c for c in candidates
-                if "to do" in c.lower() and "<option" not in c.lower() and "text=to do" not in c.lower()
-            ]
-            return filtered or candidates
-
-        if key == "form_label":
-            blocked_tokens = (
-                "#formname",
-                "input#formname",
-                "input[name='formname']",
-                "input[name='name']",
-                "textarea[name='name']",
-                "placeholder*='name'",
-                "placeholder=\"name\"",
-                "placeholder='name'",
-                "input[type='text']",
-            )
-            filtered = [
-                candidate
-                for candidate in candidates
-                if not any(token in candidate.lower() for token in blocked_tokens)
-            ]
-            return filtered or candidates
-
-        if key == "form_name":
-            preferred_tokens = (
-                "div[role='dialog'] input#name",
-                "div[role='dialog'] input[name='name']",
-                "div[role='dialog'] input[placeholder='enter a name']",
-                "div[role='dialog'] input[placeholder*='enter a name']",
-                "div[role='dialog'] input[data-slot='input'][name='name']",
-                "input#name",
-                "input[name='name']",
-                "placeholder='enter a name'",
-                "placeholder*='enter a name'",
-                "data-slot='input'",
-                "placeholder*='name'",
-            )
-            blocked_tokens = (
-                "search",
-                "email",
-                "password",
-                "username",
-                "login",
-                "signin",
-                "sign in",
-                "phone",
-                "tel",
-            )
-            filtered = [
-                candidate
-                for candidate in candidates
-                if any(token in candidate.lower() for token in preferred_tokens)
-                and not any(token in candidate.lower() for token in blocked_tokens)
-            ]
-            return filtered or candidates
-
-        if key == "workflow_name":
-            preferred_tokens = (
-                "input[name='workflowname']",
-                "input#workflowname",
-                "input#workflow-name",
-                "placeholder*='workflow name'",
-            )
-            filtered = [
-                candidate
-                for candidate in candidates
-                if any(token in candidate.lower() for token in preferred_tokens)
-            ]
-            return filtered or candidates
 
         if key == "email":
             # Prevent cross-field leakage from selector memory.
@@ -6576,6 +6527,58 @@ class AgentExecutor:
             return
         await asyncio.sleep(delay_ms / 1000)
 
+    async def _wait_for_page_ready(self, run_id: str, *, budget_s: float = 12.0) -> None:
+        """
+        Lightweight generic readiness gate after a navigate action.
+
+        Strategy (no page-specific logic, no fixed sleeps):
+        1. Wait for DOMContentLoaded — confirms the browser has parsed the HTML.
+           Returns immediately if already loaded (SPA client-side navigation).
+        2. Wait for at least one interactive element to be visible — confirms
+           the page has rendered enough for the next step to target something.
+           Uses a broad selector that matches any rendered DOM child.
+        3. If the page still looks blank after the budget, log a warning and
+           continue — the downstream health-check will catch it.
+
+        Both waits are best-effort: errors are suppressed so a slow page does
+        not cause a hard failure here.  Total wall-clock is capped at budget_s.
+        """
+        started = perf_counter()
+
+        # Step 1 — DOM parsed
+        dom_budget_s = min(budget_s * 0.5, 8.0)
+        try:
+            await asyncio.wait_for(
+                self._browser.wait_for(
+                    until="load_state",
+                    load_state="domcontentloaded",
+                    ms=int(dom_budget_s * 1000),
+                ),
+                timeout=dom_budget_s + 0.5,
+            )
+        except Exception:
+            pass
+
+        elapsed = perf_counter() - started
+        remaining_s = max(budget_s - elapsed, 1.0)
+
+        # Step 2 — at least one rendered child element visible
+        try:
+            await asyncio.wait_for(
+                self._browser.wait_for(
+                    until="selector_visible",
+                    ms=int(remaining_s * 1000),
+                    selector="body > *:not(script):not(style):not(link)",
+                    load_state=None,
+                ),
+                timeout=remaining_s + 0.5,
+            )
+        except Exception:
+            pass
+
+        elapsed = perf_counter() - started
+        LOGGER.debug("Run %s: page ready gate complete (%.2fs)", run_id, elapsed)
+
     async def _smart_stabilization_wait(self, requested_ms: int) -> str:
         """
         Replace a fixed-ms timeout wait with DOM-readiness checks.
@@ -6810,6 +6813,85 @@ class AgentExecutor:
 
         return self._dedupe(variants)
 
+    @staticmethod
+    def _amazon_result_position(selector_lower: str, text_hint: str | None = None) -> int | None:
+        signal = " ".join(part for part in (selector_lower, (text_hint or "").lower()) if part).strip()
+        if not any(token in signal for token in ("amazon", "s-search-result", "product", "results")):
+            widget_match = re.search(r"search-results[_-](\d+)", signal)
+            if widget_match:
+                try:
+                    return max(int(widget_match.group(1)), 1)
+                except Exception:
+                    return None
+            return None
+        nth_of_type_match = re.search(r"nth-of-type\((\d+)\)", signal)
+        if nth_of_type_match:
+            return max(int(nth_of_type_match.group(1)), 1)
+        nth_child_match = re.search(r"nth-child\((\d+)\)", signal)
+        if nth_child_match:
+            return max(int(nth_child_match.group(1)), 1)
+        widget_match = re.search(r"search-results[_-](\d+)", signal)
+        if widget_match:
+            try:
+                return max(int(widget_match.group(1)), 1)
+            except Exception:
+                return None
+        for word, value in (
+            ("first", 1),
+            ("second", 2),
+            ("third", 3),
+            ("fourth", 4),
+            ("fifth", 5),
+        ):
+            if word in signal:
+                return value
+        return None
+
+    @staticmethod
+    def _amazon_result_candidates(position: int) -> list[str]:
+        index = max(position - 1, 0)
+        nth = max(position, 1)
+        return [
+            f"div[data-component-type='s-search-result'] h2 a >> nth={index}",
+            f"div[data-component-type='s-search-result'] [data-cy='title-recipe-title'] a >> nth={index}",
+            f"div[data-component-type='s-search-result']:nth-of-type({nth}) h2 a",
+            f"div[data-component-type='s-search-result']:nth-of-type({nth}) [data-cy='title-recipe-title'] a",
+        ]
+
+    @staticmethod
+    def _youtube_result_position(selector_lower: str, text_hint: str | None = None) -> int | None:
+        signal = " ".join(part for part in (selector_lower, (text_hint or "").lower()) if part).strip()
+        if not any(token in signal for token in ("youtube", "video-title", "ytd-video-renderer", "video result", "video")):
+            return None
+        nth_match = re.search(r">>\s*nth=(\d+)", signal)
+        if nth_match:
+            return int(nth_match.group(1)) + 1
+        nth_of_type_match = re.search(r"nth-of-type\((\d+)\)", signal)
+        if nth_of_type_match:
+            return max(int(nth_of_type_match.group(1)), 1)
+        if ":first-of-type" in signal:
+            return 1
+        for word, value in (
+            ("first", 1),
+            ("second", 2),
+            ("third", 3),
+            ("fourth", 4),
+            ("fifth", 5),
+        ):
+            if word in signal:
+                return value
+        return None
+
+    @staticmethod
+    def _youtube_result_candidates(position: int) -> list[str]:
+        index = max(position - 1, 0)
+        nth = max(position, 1)
+        return [
+            f"a#video-title >> nth={index}",
+            f"ytd-video-renderer a#video-title >> nth={index}",
+            f"ytd-video-renderer:nth-of-type({nth}) a#video-title",
+        ]
+
     def _id_case_variants(self, selector: str) -> list[str]:
         id_match = re.search(r"#([A-Za-z][A-Za-z0-9_-]*)", selector)
         if not id_match:
@@ -6844,40 +6926,6 @@ class AgentExecutor:
         return value.replace("\\", "\\\\").replace('"', '\\"')
 
     @staticmethod
-    def _looks_like_transition_hint(value: str) -> bool:
-        lowered = value.lower()
-        return "transition" in lowered or "tranisition" in lowered
-
-    @staticmethod
-    def _transition_label_text_variants(value: str) -> list[str]:
-        normalized = value.strip()
-        if not normalized:
-            return []
-        variants = [normalized]
-        corrected = re.sub(r"(?i)tranisition", "Transition", normalized)
-        if corrected not in variants:
-            variants.append(corrected)
-        lower_corrected = re.sub(r"(?i)transition", "Tranisition", normalized)
-        if lower_corrected not in variants:
-            variants.append(lower_corrected)
-        return variants
-
-    def _transition_label_signal_selectors(self, text_hint: str, test_data: dict[str, Any]) -> list[str]:
-        hinted_text = self._apply_template(text_hint, test_data).strip()
-        candidates: list[str] = []
-        seen: set[str] = set()
-        for variant in self._transition_label_text_variants(hinted_text):
-            for selector in (
-                f"text={variant}",
-                f"svg text:has-text(\"{self._escape_playwright_text(variant)}\")",
-                f"[data-edge-label-renderer] :has-text(\"{self._escape_playwright_text(variant)}\")",
-            ):
-                if selector not in seen:
-                    seen.add(selector)
-                    candidates.append(selector)
-        return candidates
-
-    @staticmethod
     def _selector_alias_key(selector: str) -> str | None:
         text = selector.strip()
         alias_patterns = (
@@ -6901,7 +6949,6 @@ class AgentExecutor:
     ) -> list[str]:
         values: list[str] = []
         values.extend(selector_profile.get(key, []))
-        values.extend(DEFAULT_SELECTOR_PROFILE.get(key, []))
         deduped: list[str] = []
         seen: set[str] = set()
         for item in values:
@@ -6946,18 +6993,6 @@ class AgentExecutor:
             return "confirm_password"
         if "password" in selector_lower:
             return "password"
-        if "workflow_name" in selector_lower or "workflow name" in selector_lower or "workflowname" in selector_lower:
-            return "workflow_name"
-        if "workflow_description" in selector_lower or "workflow description" in selector_lower:
-            return "workflow_description"
-        if "form_name" in selector_lower or "form name" in selector_lower or "formname" in selector_lower:
-            return "form_name"
-        if "label" in selector_lower:
-            return "form_label"
-        if "phone" in selector_lower or "tel" in selector_lower:
-            return "phone"
-        if "name" in selector_lower:
-            return "name"
         return None
 
     def _resolve_builtin_template(self, key: str) -> str | None:
@@ -7180,45 +7215,6 @@ class AgentExecutor:
         if alias:
             keys.extend(self._selector_memory_lookup_keys(alias))
         keys.extend(self._semantic_selector_memory_keys(step_type, raw_selector))
-
-        selector_lower = raw_selector.lower()
-        if step_type in {"click", "verify_text"}:
-            if any(token in selector_lower for token in ("create form", "create_form", "createform")):
-                keys.append("create_form")
-            if any(token in selector_lower for token in ("save form", "save_form", "saveform")):
-                keys.append("save_form")
-            if any(token in selector_lower for token in ("back button", "selector.back_button")):
-                keys.append("back_button")
-            if any(token in selector_lower for token in ("required", "checkbox")):
-                keys.append("required_checkbox")
-            if any(token in selector_lower for token in ("login", "sign in", "signin", "log in")):
-                keys.append("login_button")
-            if any(token in selector_lower for token in ("nav-search-submit", "search-submit", "search button")):
-                keys.append("amazon_search_submit")
-            if any(
-                token in selector_lower
-                for token in ("s-search-result", "h2 a", "product-image", "a-link-normal")
-            ):
-                keys.append("amazon_first_result")
-            if any(token in selector_lower for token in ("add-to-cart", "add to cart", "submit.add-to-cart")):
-                keys.append("amazon_add_to_cart")
-            if any(token in selector_lower for token in ("nav-cart", "cart")):
-                keys.append("amazon_cart")
-        if step_type == "drag":
-            if any(
-                token in selector_lower
-                for token in ("short answer", "short_answer", "shortanswer")
-            ):
-                keys.append("short_answer_source")
-            if any(token in selector_lower for token in ("email", "field-email")):
-                keys.append("email_field_source")
-            if any(token in selector_lower for token in ("dropdown", "linked dropdown", "field-dropdown")):
-                keys.append("dropdown_field_source")
-            if any(
-                token in selector_lower
-                for token in ("canvas", "dropzone", "drop zone", "form-canvas", "form builder")
-            ):
-                keys.append("form_canvas_target")
 
         for key in self._dedupe(keys):
             store.remember_success(run_domain, step_type, key, resolved_selector)

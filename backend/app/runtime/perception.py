@@ -48,6 +48,7 @@ class IndexedElement:
     visible: bool
     enabled: bool
     selectors: tuple[str, ...]   # ordered most-stable → least-stable
+    semantic_role: str = ""      # normalised ARIA-style role (textbox, button, combobox, link, …)
 
     @property
     def best_selector(self) -> str | None:
@@ -173,6 +174,74 @@ def _build_selectors_for_element(
 
 
 # ---------------------------------------------------------------------------
+# Semantic role normalisation
+# ---------------------------------------------------------------------------
+
+# Input[type] values that map to the "textbox" semantic role.
+_TEXTBOX_INPUT_TYPES: frozenset[str] = frozenset({
+    "text", "email", "password", "search", "tel", "url",
+    "number", "date", "time", "week", "month", "color", "range", "",
+})
+
+# ARIA role → canonical semantic role used in the planner contract.
+# Roles not in this map are treated as unknown ("").
+_ARIA_TO_SEMANTIC: dict[str, str] = {
+    "textbox": "textbox",
+    "searchbox": "textbox",
+    "combobox": "combobox",
+    "listbox": "combobox",
+    "button": "button",
+    "link": "link",
+    "checkbox": "checkbox",
+    "radio": "radio",
+    "menuitem": "menuitem",
+    "menuitemcheckbox": "menuitem",
+    "menuitemradio": "menuitem",
+    "tab": "tab",
+    "switch": "checkbox",
+    "option": "option",
+}
+
+
+def _normalize_semantic_role(tag: str, el_type: str, aria_role: str) -> str:
+    """
+    Derive a canonical semantic role (matching the planner contract vocabulary)
+    from a live DOM element's tag, input type, and ARIA role.
+
+    Priority: explicit ARIA role > tag+type derivation.
+    Returns "" when the role cannot be determined.
+    """
+    # Explicit ARIA role takes priority — the page already declares the semantics.
+    normalized_aria = _ARIA_TO_SEMANTIC.get(aria_role.lower().strip(), "")
+    if normalized_aria:
+        return normalized_aria
+
+    tag_lower = tag.lower().strip()
+    type_lower = el_type.lower().strip()
+
+    if tag_lower == "input":
+        if type_lower in _TEXTBOX_INPUT_TYPES:
+            return "textbox"
+        if type_lower == "checkbox":
+            return "checkbox"
+        if type_lower == "radio":
+            return "radio"
+        if type_lower in {"submit", "button", "reset", "image"}:
+            return "button"
+        return "textbox"   # safe default for unrecognised input types
+    if tag_lower == "textarea":
+        return "textbox"
+    if tag_lower == "select":
+        return "combobox"
+    if tag_lower == "button":
+        return "button"
+    if tag_lower == "a":
+        return "link"
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Index construction
 # ---------------------------------------------------------------------------
 
@@ -200,9 +269,12 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
             continue  # invisible = not interactable right now
 
         selectors = _build_selectors_for_element(item, duplicate_id_counts)
+        _tag     = str(item.get("tag",  "")).strip().lower()
+        _el_type = str(item.get("type", "")).strip()
+        _role    = str(item.get("role", "")).strip()
         elements.append(IndexedElement(
-            tag=str(item.get("tag", "")).strip().lower(),
-            role=str(item.get("role", "")).strip(),
+            tag=_tag,
+            role=_role,
             text=str(item.get("text", "")).strip()[:120],
             aria=str(item.get("aria", "")).strip(),
             name=str(item.get("name", "")).strip(),
@@ -210,11 +282,12 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
             testid=str(item.get("testid", "")).strip(),
             placeholder=str(item.get("placeholder", "")).strip(),
             title=str(item.get("title", "")).strip(),
-            el_type=str(item.get("type", "")).strip(),
+            el_type=_el_type,
             label=str(item.get("label", "")).strip()[:80],
             visible=True,
             enabled=bool(item.get("enabled", True)),
             selectors=selectors,
+            semantic_role=_normalize_semantic_role(_tag, _el_type, _role),
         ))
 
     LOGGER.debug("Built element index: %d visible interactive elements at %s", len(elements), url)
@@ -232,6 +305,9 @@ _STOP_WORDS = frozenset({
     # Selector / step-description noise words
     "selector", "input", "button", "click", "type", "wait", "verify",
     "text", "select", "field", "form", "into", "element", "page",
+    # HTML attribute names — appear in CSS selectors but carry no element-
+    # identity signal; only the attribute VALUE matters for matching
+    "name", "id", "class", "href", "value", "action", "method", "src", "alt",
 })
 
 
@@ -325,17 +401,46 @@ def score_element(
     if tokens and el_text_lower == " ".join(tokens):
         score += 30
 
-    # Label phrase-match bonus for type/select steps: the associated <label>
-    # text is the strongest signal for identifying the correct input field.
-    # A full phrase match in the label (e.g. label="Confirm Password" when
-    # intent is "confirm password") scores higher than a partial token match.
+    # Label phrase-match + cardinality scoring for type/select steps.
+    # The associated <label> text is the strongest signal for identifying
+    # the correct input field.
+    #
+    # Cardinality principle (generic, no hardcoded field names):
+    #   - Label whose token set EXACTLY matches the intent tokens → strongest
+    #     signal; the field is named precisely what the intent describes.
+    #   - Label that is a SUPERSET of the intent (extra words) → weaker;
+    #     this is a more-specific sibling field (e.g. intent="password" but
+    #     label="Confirm Password" — label has an extra distinguishing word).
+    #   - Label that is a SUBSET of the intent (missing words) → penalised;
+    #     the field label does not fully cover what was asked for.
     if el.label and step_type in {"type", "select"}:
         label_lower = el.label.lower()
+        label_tokens = {t for t in label_lower.split() if len(t) >= 2}
+        intent_tokens = set(tokens)
         phrase = " ".join(tokens)
+
         if phrase and phrase in label_lower:
-            score += 20   # full phrase present in label
+            # Full intent phrase found verbatim in label — strongest match
+            score += 20
         elif any(t in label_lower for t in tokens):
             score += 8    # at least one token present in label
+
+        # Cardinality adjustment (only when label tokens are meaningful)
+        if label_tokens and intent_tokens:
+            matched = intent_tokens & label_tokens
+            extra_in_label = label_tokens - intent_tokens   # label more specific
+            missing_from_label = intent_tokens - label_tokens  # label too narrow
+
+            if matched == intent_tokens and not extra_in_label:
+                # Perfect token match: label names exactly what intent asks for
+                score += 12
+            elif extra_in_label and matched == intent_tokens:
+                # Label is a superset — this is a sibling field with extra
+                # qualifier words. Penalise proportionally to the extra words.
+                score -= min(len(extra_in_label) * 6, 18)
+            elif missing_from_label:
+                # Label is missing some intent words — partial overlap
+                score -= min(len(missing_from_label) * 4, 12)
 
     # Step type alignment bonuses / penalties
     if step_type == "click":
@@ -559,6 +664,317 @@ def find_best_match(
         confidence.upper(), step_type,
         top_score, gap, above_threshold - 1,
         selector, top_el.text[:60], intent_text[:60],
+    )
+
+    return PerceptionMatch(
+        element=top_el,
+        selector=selector,
+        score=top_score,
+        confidence=confidence,
+        alternative_count=above_threshold - 1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structured semantic target matching
+# ---------------------------------------------------------------------------
+
+def _extract_target_canonical(target: dict[str, Any]) -> dict[str, str | None]:
+    """
+    Resolve a target dict — from either the new semantic contract or legacy plans
+    — into the canonical field set used by the structured scorer.
+
+    New fields (semantic_name / expected_role / accessible_name / scope) take
+    priority; legacy fields (kind / role / label / text / context) are used as
+    fallbacks so that old plans continue to work.
+    """
+    def _s(v: Any) -> str | None:
+        if not isinstance(v, str):
+            return None
+        s = v.strip()
+        return s or None
+
+    return {
+        "semantic_name":  _s(target.get("semantic_name"))  or _s(target.get("kind")),
+        "expected_role":  _s(target.get("expected_role"))  or _s(target.get("role")),
+        "accessible_name": (
+            _s(target.get("accessible_name"))
+            or _s(target.get("label"))
+            or _s(target.get("text"))
+        ),
+        "placeholder": _s(target.get("placeholder")),
+        "scope":        _s(target.get("scope"))    or _s(target.get("context")),
+    }
+
+
+def score_element_for_target(
+    el: IndexedElement,
+    canonical: dict[str, str | None],
+    step_type: str,
+) -> int:
+    """
+    Score an element against a structured semantic target canonical dict.
+
+    Fields are compared directly (no tokenisation of CSS syntax).
+
+    accessible_name is the primary identity signal and contributes the most.
+    semantic_name is secondary (disambiguates sibling fields).
+    placeholder and scope are tertiary tiebreakers.
+    """
+    if not el.enabled:
+        return 0
+
+    accessible_name    = (canonical.get("accessible_name") or "").strip().lower()
+    semantic_name      = (canonical.get("semantic_name")   or "").strip().lower()
+    placeholder_target = (canonical.get("placeholder")     or "").strip().lower()
+    scope              = (canonical.get("scope")           or "").strip().lower()
+
+    el_text        = el.text.lower()
+    el_aria        = el.aria.lower()
+    el_label       = el.label.lower()
+    el_name        = el.name.lower()
+    el_placeholder = el.placeholder.lower()
+
+    # Combined text-identity haystack for partial/token matching
+    text_haystack = " ".join([el_text, el_aria, el_label, el_name]).strip()
+
+    score = 0
+
+    # ------------------------------------------------------------------
+    # accessible_name — primary identity signal
+    # Compared against every text-carrying attribute, in priority order.
+    # ------------------------------------------------------------------
+    if accessible_name:
+        if el_text == accessible_name:
+            score += 60       # exact visible text — strongest
+        elif el_aria == accessible_name:
+            score += 58       # exact ARIA label
+        elif el_label == accessible_name:
+            score += 58       # exact associated label
+        elif el_name == accessible_name:
+            score += 40       # exact name attribute (common for form fields)
+        elif accessible_name in text_haystack:
+            score += 25       # full phrase present somewhere in the element
+        else:
+            # Token-level overlap: score proportionally to fraction matched
+            acc_tokens = [w for w in accessible_name.split() if len(w) >= 3]
+            if acc_tokens:
+                matched = [w for w in acc_tokens if w in text_haystack]
+                if matched:
+                    score += max(int(12 * len(matched) / len(acc_tokens)), 8)
+
+    # ------------------------------------------------------------------
+    # semantic_name — secondary signal; distinguishes sibling fields
+    # (e.g. "password" vs "confirm password")
+    # ------------------------------------------------------------------
+    if semantic_name:
+        full_haystack = " ".join([el_text, el_aria, el_label, el_name, el_placeholder])
+        if el_label == semantic_name or el_text == semantic_name:
+            score += 35       # canonical name exactly matches visible label/text
+        elif semantic_name in full_haystack:
+            score += 18
+        else:
+            sem_tokens = [w for w in semantic_name.split() if len(w) >= 3]
+            if sem_tokens:
+                matched = [w for w in sem_tokens if w in full_haystack]
+                if matched:
+                    score += int(8 * len(matched) / len(sem_tokens))
+
+    # ------------------------------------------------------------------
+    # placeholder — useful when there is no label (bare input with placeholder)
+    # ------------------------------------------------------------------
+    if placeholder_target:
+        if el_placeholder == placeholder_target:
+            score += 30
+        elif placeholder_target in el_placeholder:
+            score += 15
+
+    # ------------------------------------------------------------------
+    # scope — weak tiebreaker; checks if scope words appear in the
+    # element's id / name / aria (structural containers often surface in those)
+    # ------------------------------------------------------------------
+    if scope and score > 0:
+        scope_words = [w for w in scope.split() if len(w) >= 3]
+        el_context = " ".join([el.el_id, el.name, el_aria]).lower()
+        if any(w in el_context for w in scope_words):
+            score += 6
+
+    # Stable-attribute bonuses — prefer elements the runtime can address reliably
+    if el.el_id:
+        score += 5
+    if el.testid:
+        score += 8
+    if el.aria:
+        score += 4
+
+    return max(score, 0)
+
+
+def derive_element_selectors(
+    element: IndexedElement,
+    step_type: str,
+) -> list[str]:
+    """
+    Derive an ordered list of real executable selectors from an already-identified
+    IndexedElement.
+
+    These selectors are grounded in the matched DOM element — not generated from
+    heuristics or profile patterns.  They are used as the complete candidate list
+    for constrained retry when perception produced a strong match (unique / high).
+
+    Priority order mirrors _selector_stability_rank:
+      1. #id
+      2. [data-testid]
+      3. [aria-label]
+      4. tag[name]
+      5. tag[placeholder]
+      6. role/text combos (button:has-text, a:has-text, [role]:has-text)
+      7. text= (Playwright text locator)
+      8. Remaining selectors from the element's pre-built tuple
+
+    Deduplicates and excludes empty strings.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(sel: str) -> None:
+        s = sel.strip()
+        if s and s not in seen:
+            seen.add(s)
+            candidates.append(s)
+
+    # --- Stable identity selectors built from element attributes ---------------
+    if element.el_id:
+        _add(f"#{element.el_id}")
+    if element.testid:
+        _add(f"[data-testid='{element.testid}']")
+    if element.aria:
+        _add(f"[aria-label='{element.aria}']")
+    if element.tag and element.name:
+        _add(f"{element.tag}[name='{element.name}']")
+    if element.tag and element.placeholder:
+        _add(f"{element.tag}[placeholder='{element.placeholder}']")
+
+    # --- Role + text selectors — semantic, survives CSS-class reshuffles -------
+    text = element.text.strip()
+    tag = element.tag.lower()
+    role = element.role.lower() if element.role else ""
+
+    if text:
+        if tag == "button":
+            _add(f"button:has-text('{text}')")
+        if tag == "a":
+            _add(f"a:has-text('{text}')")
+        if role in {"button", "link", "menuitem", "tab"}:
+            _add(f"[role='{role}']:has-text('{text}')")
+        if step_type in {"click", "type", "select"} and len(text) <= 60:
+            _add(f"text={text}")
+
+    # --- Pre-built selectors from build_element_index (sorted by stability) ---
+    for sel in element.selectors:
+        _add(sel)
+
+    return candidates
+
+
+def find_best_match_for_target(
+    target: dict[str, Any],
+    step_type: str,
+    element_index: ElementIndex,
+    min_score: int = _MIN_SCORE,
+) -> PerceptionMatch | None:
+    """
+    Find the live DOM element that best matches a structured semantic target contract.
+
+    Unlike find_best_match() (which tokenises a flat intent string), this function
+    matches directly against the contract fields:
+
+        accessible_name  →  primary identity
+        semantic_name    →  disambiguation (sibling fields)
+        expected_role    →  hard pre-filter (role mismatch → excluded)
+        placeholder      →  tiebreaker for unlabelled inputs
+        scope            →  weak container context tiebreaker
+
+    Returns a PerceptionMatch with the same confidence levels as find_best_match,
+    or None when no element meets the minimum score.
+    """
+    if not element_index.elements:
+        LOGGER.debug("Perception (target): element index is empty")
+        return None
+
+    canonical = _extract_target_canonical(target)
+    expected_role = (canonical.get("expected_role") or "").strip().lower()
+
+    # ------------------------------------------------------------------
+    # Hard pre-filter: semantic role must match.
+    # Falls through to full index if role filter empties the set — this
+    # protects against role normalisation gaps during the migration period.
+    # ------------------------------------------------------------------
+    if expected_role:
+        role_filtered = [
+            el for el in element_index.elements
+            if el.semantic_role == expected_role
+        ]
+        if role_filtered:
+            candidates = role_filtered
+        else:
+            LOGGER.warning(
+                "Perception (target): expected_role=%r matched 0 of %d elements "
+                "— falling through to full index (role normalisation gap?)",
+                expected_role, element_index.count,
+            )
+            candidates = element_index.elements
+    else:
+        candidates = element_index.elements
+
+    scored: list[tuple[int, IndexedElement]] = []
+    for el in candidates:
+        s = score_element_for_target(el, canonical, step_type)
+        if s >= min_score:
+            scored.append((s, el))
+
+    if not scored:
+        LOGGER.debug(
+            "Perception (target): 0 elements met min_score=%d  "
+            "step_type=%s  semantic_name=%r  accessible_name=%r  expected_role=%r  "
+            "(role_candidates=%d  total_elements=%d)",
+            min_score, step_type,
+            canonical.get("semantic_name"), canonical.get("accessible_name"), expected_role,
+            len(candidates), element_index.count,
+        )
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_score, top_el = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0
+    gap = top_score - second_score
+    above_threshold = len(scored)
+
+    selector = top_el.best_selector
+    if not selector:
+        LOGGER.debug(
+            "Perception (target): top element has no usable selector  "
+            "semantic_name=%r  accessible_name=%r",
+            canonical.get("semantic_name"), canonical.get("accessible_name"),
+        )
+        return None
+
+    if above_threshold == 1:
+        confidence = "unique"
+    elif gap >= _UNIQUE_GAP:
+        confidence = "high"
+    elif gap >= _HIGH_GAP:
+        confidence = "medium"
+    else:
+        confidence = "ambiguous"
+
+    LOGGER.info(
+        "Perception (target): %s match  step_type=%-6s  score=%d  gap=%d  alternatives=%d  "
+        "selector=%r  element_text=%r  semantic_name=%r  accessible_name=%r  role=%r",
+        confidence.upper(), step_type,
+        top_score, gap, above_threshold - 1,
+        selector, top_el.text[:60],
+        canonical.get("semantic_name"), canonical.get("accessible_name"), expected_role or top_el.semantic_role,
     )
 
     return PerceptionMatch(

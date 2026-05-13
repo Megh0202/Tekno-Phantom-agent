@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.runtime.executor import AgentExecutor, CandidateConfidence
+from app.runtime.executor import AgentExecutor, CandidateConfidence, CandidateValidationResult, StepIntent
 from app.runtime.perception import build_element_index, find_best_match
 from app.runtime.selector_memory import InMemorySelectorMemoryStore
 from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
@@ -25,6 +25,7 @@ def _executor(step_timeout_seconds: int = 15) -> AgentExecutor:
         execution_fast_path_selector_timeout_ms=2000,
     )
     executor._selector_memory = None
+    executor._selector_timeout_tasks = {}
     executor._step_trace_context = ContextVar("executor_step_trace_context_test", default=None)
     executor._step_state_context = ContextVar("executor_step_state_context_test", default=None)
     return executor
@@ -114,13 +115,17 @@ class _RunStore:
     def persist(self, run: RunState) -> None:
         self._run = run
 
+    def is_cancelled(self, run_id: str) -> bool:
+        return False
 
-def test_selector_candidates_use_default_email_profile() -> None:
+
+def test_selector_candidates_use_email_profile_from_selector_profile() -> None:
     executor = _executor()
+    email_profile = ["input[name='username']", "input[name='email']", "input[type='email']", "input[autocomplete='email']"]
     candidates = executor._selector_candidates(
         raw_selector="input[type='email']",
         step_type="type",
-        selector_profile={},
+        selector_profile={"email": email_profile},
         test_data={},
         run_domain=None,
         text_hint="qa@example.com",
@@ -131,13 +136,19 @@ def test_selector_candidates_use_default_email_profile() -> None:
     assert "input[type='email']" in candidates
 
 
-def test_selector_candidates_include_signup_alias_defaults() -> None:
+def test_selector_candidates_include_signup_aliases_from_selector_profile() -> None:
     executor = _executor()
+    profile = {
+        "first_name": ["input[name='firstName']", "input[name='first_name']", "input[name='name']"],
+        "surname": ["input[name='surname']", "input[name='lastName']", "input[name='last_name']"],
+        "phone": ["input[name='phone']", "input[type='tel']", "input[autocomplete='tel']"],
+        "confirm_password": ["input[name='confirm_password']", "input[name='confirmPassword']", "input[autocomplete='new-password']"],
+    }
 
     assert "input[name='name']" in executor._selector_candidates(
         raw_selector="{{selector.first_name}}",
         step_type="type",
-        selector_profile={},
+        selector_profile=profile,
         test_data={},
         run_domain=None,
         text_hint="Test01",
@@ -145,7 +156,7 @@ def test_selector_candidates_include_signup_alias_defaults() -> None:
     assert "input[name='surname']" in executor._selector_candidates(
         raw_selector="{{selector.surname}}",
         step_type="type",
-        selector_profile={},
+        selector_profile=profile,
         test_data={},
         run_domain=None,
         text_hint="Last01",
@@ -153,7 +164,7 @@ def test_selector_candidates_include_signup_alias_defaults() -> None:
     assert "input[type='tel']" in executor._selector_candidates(
         raw_selector="{{selector.phone}}",
         step_type="type",
-        selector_profile={},
+        selector_profile=profile,
         test_data={},
         run_domain=None,
         text_hint="91991919919",
@@ -161,7 +172,7 @@ def test_selector_candidates_include_signup_alias_defaults() -> None:
     assert "input[name='confirm_password']" in executor._selector_candidates(
         raw_selector="{{selector.confirm_password}}",
         step_type="type",
-        selector_profile={},
+        selector_profile=profile,
         test_data={},
         run_domain=None,
         text_hint="Abcd@1234",
@@ -194,12 +205,12 @@ def test_duplicate_ids_do_not_become_grounded_or_snapshot_primary_selectors() ->
     assert perception.selector == "input[name='surname']"
 
 
-def test_type_selector_candidates_prioritize_explicit_selector_before_email_aliases() -> None:
+def test_type_selector_candidates_prioritize_explicit_selector_before_profile_aliases() -> None:
     executor = _executor()
     candidates = executor._selector_candidates(
         raw_selector="input[name='email']",
         step_type="type",
-        selector_profile={},
+        selector_profile={"email": ["#username", "input[name='username']", "input[type='email']"]},
         test_data={},
         run_domain=None,
         text_hint="qa@example.com",
@@ -214,7 +225,7 @@ def test_password_candidates_do_not_infer_email_from_password_value() -> None:
     candidates = executor._selector_candidates(
         raw_selector="input[name='password']",
         step_type="type",
-        selector_profile={},
+        selector_profile={"email": ["input[name='username']", "input[placeholder*='Email']", "input[type='email']"]},
         test_data={},
         run_domain=None,
         text_hint="Madhu@123",
@@ -229,7 +240,7 @@ def test_type_candidates_do_not_infer_email_profile_from_email_like_value() -> N
     candidates = executor._selector_candidates(
         raw_selector="input[placeholder='First Name']",
         step_type="type",
-        selector_profile={},
+        selector_profile={"email": ["input[name='email']", "input[placeholder*='Email']", "input[type='email']"]},
         test_data={},
         run_domain="example.com",
         text_hint="test@example.com",
@@ -279,7 +290,7 @@ def test_click_memory_candidates_match_across_text_selector_forms() -> None:
     assert "button.text-\\[12px\\].font-ibm-plex.font-medium.text-black.underline.ml-1.hover\\:opacity-80:visible" in candidates
 
 
-def test_click_alias_candidates_prefer_remembered_selector_before_profile_defaults() -> None:
+def test_click_alias_candidates_prefer_remembered_selector_before_profile_aliases() -> None:
     executor = _executor()
     memory = InMemorySelectorMemoryStore()
     memory.remember_success(
@@ -293,7 +304,7 @@ def test_click_alias_candidates_prefer_remembered_selector_before_profile_defaul
     candidates = executor._selector_candidates(
         raw_selector="{{selector.login_button}}",
         step_type="click",
-        selector_profile={},
+        selector_profile={"login_button": ["button:has-text('Login')", "button:has-text('Sign In')", "button[type='submit']"]},
         test_data={},
         run_domain="app.stag.dr-adem.com",
     )
@@ -2366,6 +2377,105 @@ def test_selector_fallback_does_not_retry_non_transient_error() -> None:
     assert call_count == 1
 
 
+def test_intent_target_text_css_fallback_still_works_without_target_metadata() -> None:
+    """
+    When no text_hint is provided, the CSS token fallback still extracts useful
+    tokens from the selector.
+    """
+    executor = _executor()
+    intent = executor._build_step_intent(
+        "type",
+        "input[data-search='query']",
+        text_hint=None,
+    )
+    assert intent.target_text is not None
+    lowered = (intent.target_text or "").lower()
+    assert "search" in lowered or "query" in lowered
+
+
+def test_step_text_hint_returns_target_label_not_typed_value_for_type_step() -> None:
+    """
+    _step_text_hint must return target.label (element identity) for type steps,
+    not the top-level 'text' field (the value being typed).
+    This is what the dispatch call site now uses as text_hint for _run_with_selector_fallback.
+    """
+    step_input = {
+        "type": "type",
+        "selector": "{{selector.confirm_password}}",
+        "text": "PasswordVitaone1@",
+        "target": {"label": "Confirm Password"},
+    }
+    result = AgentExecutor._step_text_hint(step_input, "type")
+    assert result == "Confirm Password"
+
+
+def test_step_text_hint_returns_target_label_not_option_value_for_select_step() -> None:
+    """
+    _step_text_hint must return target.label for select steps,
+    not the 'value' being selected.
+    """
+    step_input = {
+        "type": "select",
+        "selector": "select[name='country']",
+        "value": "IN",
+        "target": {"label": "Country"},
+    }
+    result = AgentExecutor._step_text_hint(step_input, "select")
+    assert result == "Country"
+
+
+def test_step_text_hint_returns_none_for_type_step_without_target_metadata() -> None:
+    """
+    When no target metadata exists, _step_text_hint returns None for type steps
+    (typed value is skipped), so CSS token fallback runs in _intent_target_text.
+    """
+    step_input = {
+        "type": "type",
+        "selector": "input[name='password']",
+        "text": "PasswordVitaone1@",
+    }
+    result = AgentExecutor._step_text_hint(step_input, "type")
+    assert result is None
+
+
+def test_type_dispatch_intent_uses_identity_hint_not_typed_value() -> None:
+    """
+    End-to-end: when a type step has target.label = "Confirm Password" and
+    text = "PasswordVitaone1@", the intent built via _step_text_hint +
+    _build_step_intent must use "Confirm Password" as target_text.
+    This is the fixed dispatch path — typed value must never corrupt selector intent.
+    """
+    executor = _executor()
+    # Simulate what the fixed _dispatch_step now does:
+    raw_step = {
+        "type": "type",
+        "selector": "{{selector.confirm_password}}",
+        "text": "PasswordVitaone1@",
+        "target": {"label": "Confirm Password"},
+    }
+    identity_hint = AgentExecutor._step_text_hint(raw_step, "type")
+    intent = executor._build_step_intent("type", raw_step["selector"], identity_hint)
+    assert intent.target_text == "Confirm Password"
+
+
+def test_type_dispatch_intent_without_target_metadata_falls_back_to_css_tokens() -> None:
+    """
+    When no target metadata is provided, _step_text_hint returns None and
+    _intent_target_text falls through to CSS token / alias extraction.
+    Confirm the alias slug is used as the fallback.
+    """
+    executor = _executor()
+    raw_step = {
+        "type": "type",
+        "selector": "{{selector.confirm_password}}",
+        "text": "PasswordVitaone1@",
+    }
+    identity_hint = AgentExecutor._step_text_hint(raw_step, "type")
+    intent = executor._build_step_intent("type", raw_step["selector"], identity_hint)
+    # Without target metadata, alias slug expansion should produce the fallback
+    assert intent.target_text == "confirm password"
+
+
 def test_drag_fallback_retries_transient_timeout_and_recovers() -> None:
     executor = _executor(step_timeout_seconds=4)
 
@@ -2394,3 +2504,301 @@ def test_drag_fallback_retries_transient_timeout_and_recovers() -> None:
 
     assert result == "Dragged #source to #target"
     assert browser.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# _type_field_identity_surface and _check_field_identity_hint
+# Generic sibling-field identity tests — no app-specific words hardcoded.
+# ---------------------------------------------------------------------------
+
+def test_type_field_identity_surface_expands_camelcase_name() -> None:
+    surface = AgentExecutor._type_field_identity_surface("input[name='confirmPassword']")
+    assert "confirm" in surface
+    assert "password" in surface
+
+
+def test_type_field_identity_surface_expands_snake_case_name() -> None:
+    surface = AgentExecutor._type_field_identity_surface("input[name='confirm_password']")
+    assert "confirm" in surface
+    assert "password" in surface
+
+
+def test_type_field_identity_surface_reads_aria_label() -> None:
+    surface = AgentExecutor._type_field_identity_surface("[aria-label='Confirm Password']")
+    assert "confirm" in surface
+    assert "password" in surface
+
+
+def test_type_field_identity_surface_reads_placeholder() -> None:
+    surface = AgentExecutor._type_field_identity_surface("input[placeholder='Confirm your password']")
+    assert "confirm" in surface
+    assert "password" in surface
+
+
+def test_check_field_identity_hint_rejects_sibling_field() -> None:
+    """
+    Selector resolves to the base field but intent names the qualified sibling.
+    Generic: the qualifying word is missing from the selector surface.
+    """
+    err = AgentExecutor._check_field_identity_hint(
+        "input[name='password']",
+        "Confirm Password",
+    )
+    assert err is not None
+    assert "confirm" in err.lower()
+
+
+def test_check_field_identity_hint_passes_correct_sibling_field() -> None:
+    """
+    Selector resolves to the correct qualified sibling field.
+    """
+    err = AgentExecutor._check_field_identity_hint(
+        "input[name='confirmPassword']",
+        "Confirm Password",
+    )
+    assert err is None
+
+
+def test_check_field_identity_hint_skips_single_word_hint() -> None:
+    """
+    Single-word hints (e.g. 'Password') are not specific enough to enforce
+    sibling-field discrimination — skip the check.
+    """
+    err = AgentExecutor._check_field_identity_hint(
+        "input[name='password']",
+        "Password",
+    )
+    assert err is None
+
+
+def test_check_field_identity_hint_skips_opaque_selector() -> None:
+    """
+    ID-only or class-only selectors with no identity words in their surface
+    are treated as opaque — do not block on insufficient evidence.
+    """
+    err = AgentExecutor._check_field_identity_hint(
+        "#f2",
+        "Confirm Password",
+    )
+    assert err is None
+
+
+def test_validate_type_post_action_raises_on_identity_mismatch() -> None:
+    """
+    post_validate for a type step must raise when value matches but the
+    selector surface is the wrong sibling field.
+    """
+    executor = _executor()
+
+    class _Browser:
+        async def get_element_value(self, selector: str) -> str | None:
+            return "secret"   # value check passes
+
+    executor._browser = _Browser()
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        asyncio.run(
+            executor._validate_type_post_action(
+                resolved_selector="input[name='password']",
+                expected_text="secret",
+                clear_first=True,
+                identity_hint="Confirm Password",
+            )
+        )
+
+
+def test_validate_type_post_action_passes_on_correct_field() -> None:
+    executor = _executor()
+
+    class _Browser:
+        async def get_element_value(self, selector: str) -> str | None:
+            return "secret"
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._validate_type_post_action(
+            resolved_selector="input[name='confirmPassword']",
+            expected_text="secret",
+            clear_first=True,
+            identity_hint="Confirm Password",
+        )
+    )
+    assert "post_validation=passed" in result
+
+
+def test_validate_type_post_action_no_identity_hint_skips_identity_check() -> None:
+    """
+    When no identity hint is provided the identity check is skipped entirely —
+    existing behaviour for steps without target metadata.
+    """
+    executor = _executor()
+
+    class _Browser:
+        async def get_element_value(self, selector: str) -> str | None:
+            return "secret"
+
+    executor._browser = _Browser()
+
+    result = asyncio.run(
+        executor._validate_type_post_action(
+            resolved_selector="input[name='password']",
+            expected_text="secret",
+            clear_first=True,
+            identity_hint=None,
+        )
+    )
+    assert "post_validation=passed" in result
+
+
+# ---------------------------------------------------------------------------
+# _validate_candidate_against_intent tests
+# ---------------------------------------------------------------------------
+
+def _make_intent(target_text: str | None) -> StepIntent:
+    return StepIntent(
+        action="click",
+        element_type="button",
+        target_text=target_text,
+        ordinal=None,
+        scope_hint=None,
+    )
+
+
+def test_validate_candidate_skips_when_no_intent_target_text() -> None:
+    """No target_text → always skipped, no snapshot needed."""
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button[type='submit']",
+        step_type="click",
+        intent=_make_intent(None),
+        snapshot=None,
+        source="profile",
+    )
+    assert result.status == "skipped"
+    assert result.reason == "no_target_text"
+
+
+def test_validate_candidate_fails_strict_generic_when_unresolved() -> None:
+    """Strict mode + generic selector + not in snapshot → failed."""
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button[type='submit']",
+        step_type="click",
+        intent=_make_intent("Sign In"),
+        snapshot=[],  # empty snapshot — selector won't resolve
+        source="profile",
+        strictness="strict",
+    )
+    assert result.status == "failed"
+    assert "generic" in result.reason or "unresolved" in result.reason
+
+
+def test_validate_candidate_passes_when_button_text_matches_intent() -> None:
+    """Resolved button whose text matches target_text → passed."""
+    snapshot = [
+        {
+            "tag": "button",
+            "role": "button",
+            "text": "Sign In",
+            "label": "Sign In",
+            "aria": "",
+            "placeholder": "",
+            "name": "",
+            "title": "",
+            "href": "",
+            "enabled": True,
+            "selectors": ["button[type='submit']"],
+        }
+    ]
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button[type='submit']",
+        step_type="click",
+        intent=_make_intent("Sign In"),
+        snapshot=snapshot,
+        source="profile",
+    )
+    assert result.status == "passed"
+    assert result.resolved_count == 1
+
+
+def test_validate_candidate_fails_when_button_text_mismatches_intent() -> None:
+    """Resolved button whose text does not match target_text → failed."""
+    snapshot = [
+        {
+            "tag": "button",
+            "role": "button",
+            "text": "Cancel",
+            "label": "Cancel",
+            "aria": "",
+            "placeholder": "",
+            "name": "",
+            "title": "",
+            "href": "",
+            "enabled": True,
+            "selectors": ["button[type='submit']"],
+        }
+    ]
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button[type='submit']",
+        step_type="click",
+        intent=_make_intent("Sign In"),
+        snapshot=snapshot,
+        source="profile",
+    )
+    assert result.status == "failed"
+    assert result.resolved_count == 1
+
+
+def test_validate_candidate_fails_strict_partial_multiword_label() -> None:
+    """Strict + multi-word target where only one word matches → failed."""
+    snapshot = [
+        {
+            "tag": "button",
+            "role": "button",
+            "text": "Confirm",
+            "label": "Confirm",
+            "aria": "",
+            "placeholder": "",
+            "name": "",
+            "title": "",
+            "href": "",
+            "enabled": True,
+            "selectors": ["button#confirm-btn"],
+        }
+    ]
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button#confirm-btn",
+        step_type="click",
+        intent=_make_intent("Confirm Password"),
+        snapshot=snapshot,
+        source="profile",
+        strictness="strict",
+    )
+    assert result.status == "failed"
+
+
+def test_validate_candidate_passes_strict_full_multiword_label() -> None:
+    """Strict + multi-word target where all words match → passed."""
+    snapshot = [
+        {
+            "tag": "button",
+            "role": "button",
+            "text": "Confirm Password",
+            "label": "Confirm Password",
+            "aria": "",
+            "placeholder": "",
+            "name": "",
+            "title": "",
+            "href": "",
+            "enabled": True,
+            "selectors": ["button#confirm-btn"],
+        }
+    ]
+    result = AgentExecutor._validate_candidate_against_intent(
+        selector="button#confirm-btn",
+        step_type="click",
+        intent=_make_intent("Confirm Password"),
+        snapshot=snapshot,
+        source="profile",
+        strictness="strict",
+    )
+    assert result.status == "passed"

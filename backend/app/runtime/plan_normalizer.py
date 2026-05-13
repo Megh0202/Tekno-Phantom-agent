@@ -455,8 +455,12 @@ def _pick_selector(raw_step: dict[str, Any]) -> str | None:
             return None
         return cleaned_xpath if cleaned_xpath.startswith("xpath=") else f"xpath={cleaned_xpath}"
 
+    # Only use "target" as a text hint when it is a plain string — semantic plans
+    # use target as a dict (the v2 contract); converting a dict via str() would
+    # produce "{'semantic_name': ...}" which is not a valid Playwright selector.
+    _raw_target = raw_step.get("target")
     target = (
-        _as_str(raw_step.get("target"))
+        (_as_str(_raw_target) if isinstance(_raw_target, str) else None)
         or _as_str(raw_step.get("label"))
         or _as_str(raw_step.get("name"))
     )
@@ -467,6 +471,12 @@ def _normalize_semantic_target(raw_step: dict[str, Any]) -> dict[str, Any] | Non
     raw_target = raw_step.get("target")
     candidate: dict[str, Any] = {}
     if isinstance(raw_target, dict):
+        # New canonical fields (v2 contract)
+        for key in ("semantic_name", "expected_role", "accessible_name", "scope"):
+            value = _as_str(raw_target.get(key))
+            if value:
+                candidate[key] = value
+        # Legacy fields — preserved for backward compatibility
         for key in ("kind", "role", "text", "label", "placeholder", "context"):
             value = _as_str(raw_target.get(key))
             if value:
@@ -492,27 +502,40 @@ def _normalize_semantic_target(raw_step: dict[str, Any]) -> dict[str, Any] | Non
 
 
 def _selector_seed_from_target(target: dict[str, Any], *, step_type: str) -> str | None:
+    # New canonical fields take priority
+    accessible_name = _as_str(target.get("accessible_name"))
+    semantic_name = _as_str(target.get("semantic_name"))
+    expected_role = _as_str(target.get("expected_role"))
+
+    # Legacy field fallbacks
     text = _as_str(target.get("text"))
     label = _as_str(target.get("label"))
     placeholder = _as_str(target.get("placeholder"))
-    role = _as_str(target.get("role"))
+    role = _as_str(target.get("role")) or expected_role
     kind = _as_str(target.get("kind"))
+
+    # Best identity label: accessible_name > label > text > semantic_name
+    identity = accessible_name or label or text or semantic_name
 
     if placeholder and step_type in {"type", "select"}:
         return f"input[placeholder*='{placeholder}'], textarea[placeholder*='{placeholder}']"
-    if label and step_type in {"type", "select"}:
-        return f"label:has-text('{label}') input, label:has-text('{label}') textarea, [aria-label*='{label}']"
-    visible_text = text or label
-    if not visible_text:
+    identity_label = accessible_name or label
+    if identity_label and step_type in {"type", "select"}:
+        return (
+            f"label:has-text('{identity_label}') input, "
+            f"label:has-text('{identity_label}') textarea, "
+            f"[aria-label*='{identity_label}']"
+        )
+    if not identity:
         return None
     if step_type == "click":
-        if role:
-            return f"[role='{role}']:has-text('{visible_text}')"
-        if kind == "link":
-            return f"a:has-text('{visible_text}')"
-        return f"button:has-text('{visible_text}')"
+        if expected_role == "link" or kind == "link":
+            return f"a:has-text('{identity}')"
+        if role and role not in {"button"}:
+            return f"[role='{role}']:has-text('{identity}')"
+        return f"button:has-text('{identity}')"
     if step_type == "verify_text":
-        return f"text={visible_text}"
+        return f"text={identity}"
     return None
 
 
