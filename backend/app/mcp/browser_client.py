@@ -1696,10 +1696,11 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 "before_url": before_url,
                 "after_url": after_url,
             }
-        if before_text != after_text:
+        _text_diff_size = abs(len(after_text) - len(before_text))
+        if before_text != after_text and _text_diff_size >= 30:
             return {
                 "status": "passed",
-                "detail": "Page text changed after click",
+                "detail": f"Page text changed after click (diff size: {_text_diff_size} chars)",
                 "selector": selector,
                 "before_url": before_url,
                 "after_url": after_url,
@@ -3142,10 +3143,11 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
                 "before_url": before_url,
                 "after_url": after_url,
             }
-        if before_text != after_text:
+        _text_diff_size = abs(len(after_text) - len(before_text))
+        if before_text != after_text and _text_diff_size >= 30:
             return {
                 "status": "passed",
-                "detail": "Page text changed after click",
+                "detail": f"Page text changed after click (diff size: {_text_diff_size} chars)",
                 "selector": selector,
                 "before_url": before_url,
                 "after_url": after_url,

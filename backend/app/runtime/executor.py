@@ -1091,7 +1091,7 @@ class AgentExecutor:
         post_validate_ms = 0.0
         try:
             if step_type == "click":
-                before_snapshot = await self._safe_page_snapshot()
+                before_snapshot = await self._capture_click_pre_state(resolved_selector)
                 result = await asyncio.wait_for(
                     self._browser.click(resolved_selector),
                     timeout=self._fast_path_action_timeout_seconds(),
@@ -1448,6 +1448,36 @@ class AgentExecutor:
                     )
 
             # ------------------------------------------------------------------
+            # SEMANTIC INTERACTION READINESS GATE
+            # When the page is still structurally unstable (loading_state:
+            # visible_elements=0, blank URL, or no title), semantic actions
+            # must not fire against a transitional/partial DOM.  Stale DOM
+            # nodes from the previous page can still be live during SPA
+            # hydration, auth redirects, and shell transitions — causing
+            # perception and the selector pipeline to act on the wrong
+            # element (e.g. a "Sign in" button from a prior route).
+            #
+            # Gate: apply a brief best-effort readiness window BEFORE
+            # perception so that both the perception probe and the selector
+            # pipeline operate on a stable DOM.  Only fires for semantic
+            # interaction steps (click/type/select) and only when
+            # loading_state is explicitly flagged by the health check.
+            # Bounded by a short budget; suppresses all exceptions.
+            # ------------------------------------------------------------------
+            _health_issue_types = {i["type"] for i in page_health.get("issues", [])}
+            if step.type in {"click", "type", "select"} and "loading_state" in _health_issue_types:
+                LOGGER.info(
+                    "Run %s step %d (type=%s): loading_state detected before semantic action — "
+                    "applying readiness gate (budget=4s)",
+                    run.run_id, step.index + 1, step.type,
+                )
+                await self._wait_for_page_ready(run.run_id, budget_s=4.0)
+                # Re-capture snapshot so perception and the semantic gate see
+                # the post-wait DOM, not the blank/loading state snapshot.
+                before_snapshot = await self._safe_page_snapshot()
+                step_trace["page_state_before"] = self._summarize_page_state(before_snapshot)
+
+            # ------------------------------------------------------------------
             # PERCEIVE FIRST — reuse the already-fetched page snapshot (zero
             # extra network/browser cost) to identify the target element from
             # what is actually visible on the page right now.
@@ -1790,6 +1820,24 @@ class AgentExecutor:
                 and _has_selector_field
                 and _is_element_not_found
             ):
+                # Before requesting selector help, check whether the page has
+                # already reached a semantic success state (e.g. the login click
+                # fired and the browser navigated to the dashboard while selector
+                # candidates were still being attempted).  If a destination state
+                # is confirmed, complete the step without showing recovery UI.
+                _dest_state = await self._check_semantic_destination_state(
+                    before_snapshot, step.type
+                )
+                if _dest_state:
+                    LOGGER.info(
+                        "Run %s step %d/%d (type=%s): semantic destination state detected "
+                        "— suppressing selector recovery. detail=%s",
+                        run.run_id, step.index + 1, len(run.steps), step.type, _dest_state,
+                    )
+                    step.status = StepStatus.completed
+                    step.message = _dest_state
+                    step.error = None
+                    return  # finally block still runs to write trace/timestamps
                 LOGGER.warning(
                     "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
                     run.run_id, step.index + 1, len(run.steps), step.type,
@@ -3129,6 +3177,95 @@ class AgentExecutor:
         except Exception:
             return None
 
+    async def _check_semantic_destination_state(
+        self,
+        before_snapshot: dict[str, Any] | None,
+        step_type: str,
+    ) -> str | None:
+        """
+        After all selector candidates are exhausted, check whether the page has
+        already reached a semantic success state relative to the before-step
+        snapshot — indicating the interaction succeeded even though selectors
+        could not confirm it.
+
+        Three generic, app-agnostic signals (no hardcoded routes or app names):
+
+          1. URL/route changed — navigation occurred while selectors were
+             being attempted.
+          2. Visible credential input (password field) present before the step
+             but absent after — auth/login form was submitted successfully.
+          3. Substantial growth in visible interactive element count — a login
+             page (2-5 elements) transitioned to an application shell (10+),
+             detected generically via a ×2 multiplier + minimum absolute delta.
+
+        Returns a human-readable success message when a destination state is
+        detected, or None when no signal is present.
+        Only applies to click steps — type/select post-validation already
+        verifies field values directly.
+        """
+        if step_type != "click":
+            return None
+        if not isinstance(before_snapshot, dict):
+            return None
+        after = await self._safe_page_snapshot()
+        if not isinstance(after, dict):
+            return None
+
+        before_url = str(before_snapshot.get("url") or "")
+        after_url = str(after.get("url") or "")
+
+        # Signal 1: URL/route changed — navigation already happened.
+        if before_url and after_url and before_url != after_url:
+            return (
+                f"Step effect already applied: page navigated from "
+                f"'{before_url}' to '{after_url}'"
+            )
+
+        before_els: list[dict[str, Any]] = [
+            el for el in (before_snapshot.get("interactive_elements") or [])
+            if isinstance(el, dict)
+        ]
+        after_els: list[dict[str, Any]] = [
+            el for el in (after.get("interactive_elements") or [])
+            if isinstance(el, dict)
+        ]
+
+        def _has_visible_password_input(elements: list[dict[str, Any]]) -> bool:
+            return any(
+                el.get("visible", True) and (
+                    str(el.get("type", "")).lower() == "password"
+                    or "password" in str(el.get("placeholder", "")).lower()
+                    or "password" in str(el.get("aria", "")).lower()
+                    or "password" in str(el.get("label", "")).lower()
+                )
+                for el in elements
+            )
+
+        # Signal 2: Credential input disappeared — auth/login form submitted.
+        if _has_visible_password_input(before_els) and not _has_visible_password_input(after_els):
+            return (
+                "Step effect already applied: credential form is no longer present "
+                "(authentication likely succeeded)"
+            )
+
+        # Signal 3: Large application-shell transition.
+        # A login page typically has 2-5 visible elements; a dashboard shell 10+.
+        # Require both a ×2 relative multiplier and ≥10 absolute delta to avoid
+        # false positives from async content loading independently of the click.
+        before_visible = sum(1 for el in before_els if el.get("visible", True))
+        after_visible = sum(1 for el in after_els if el.get("visible", True))
+        if (
+            before_visible > 0
+            and after_visible >= before_visible * 2
+            and after_visible - before_visible >= 10
+        ):
+            return (
+                f"Step effect already applied: page interactive element count grew "
+                f"from {before_visible} to {after_visible} (application shell transition)"
+            )
+
+        return None
+
     @staticmethod
     def _snapshot_item_summary(item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -3620,9 +3757,11 @@ class AgentExecutor:
     async def _capture_click_pre_state(self, resolved_selector: str) -> dict[str, Any]:
         page_snapshot = await self._safe_page_snapshot()
         try:
+            # 200 ms cap keeps fast-path overhead minimal; the result is
+            # None-safe — missing element_context just skips identity checks.
             element_context = await asyncio.wait_for(
                 self._browser.get_element_context(resolved_selector),
-                timeout=1.0,
+                timeout=0.2,
             )
         except Exception:
             element_context = None
@@ -4361,6 +4500,7 @@ class AgentExecutor:
         snapshot_index: dict[str, dict[str, Any]],
         *,
         explicit_selector: bool,
+        grounded: bool = False,
     ) -> tuple[bool, str]:
         """
         Lightweight semantic check run after _probe_element_present passes but
@@ -4378,6 +4518,11 @@ class AgentExecutor:
         4. Label alignment: at least one meaningful word from intent.target_text
            must appear in the element's text/aria/placeholder/name surface.
            Skip this check when target_text is absent or very short.
+           When grounded=True (perception-matched element), the multi-word
+           ALL-words strict block is relaxed to ≥1 word — grounded selectors
+           derived from a single identified DOM node tolerate partial label
+           overlap (e.g. intent "Submit Form" → element "Submit").  Zero-word
+           overlap is still blocked regardless of grounding status.
         """
         # Skip semantic gate for explicit selectors UNLESS the intent carries
         # target identity metadata (target.label/text/placeholder).  With
@@ -4465,7 +4610,12 @@ class AgentExecutor:
                 # element's identity surface. A partial match means this is
                 # a similar-but-different field — block so the ranked
                 # fallback pipeline can surface the correct candidate.
-                if len(target_words) >= 2 and len(matched) < len(target_words):
+                # Exception: grounded selectors (perception-matched to a single
+                # identified DOM element) relax this to ≥1 word — partial
+                # overlap is acceptable when a single element was already
+                # identified by the perception layer (e.g. intent "Submit Form"
+                # legitimately grounds to a button labelled "Submit").
+                if not grounded and len(target_words) >= 2 and len(matched) < len(target_words):
                     return False, (
                         f"semantic_gate: partial label overlap — "
                         f"matched={sorted(matched)} "
@@ -4731,15 +4881,20 @@ class AgentExecutor:
                     # Pre-action semantic gate: confirm this element is actually
                     # the intended target before firing the browser action.
                     # Runs after probe_ok (element is visible) but before the
-                    # action.  Grounded selectors (perception-matched) skip the
-                    # gate — they were already validated at grounding time.
-                    if not is_grounded and step_type in {"click", "type", "select"}:
+                    # action.  Grounded selectors (perception-matched) use a
+                    # lighter-weight variant of the gate — structural checks
+                    # (disabled/hidden/role) are fully enforced; label alignment
+                    # requires ≥1 word overlap rather than all words (relaxed
+                    # multi-word strict block).  Zero-word overlap is blocked
+                    # regardless of grounding status.
+                    if step_type in {"click", "type", "select"}:
                         gate_ok, gate_reason = self._pre_action_semantic_gate(
                             selector,
                             step_type,
                             intent,
                             snapshot_selector_index,
                             explicit_selector=explicit_selector,
+                            grounded=is_grounded,
                         )
                         if not gate_ok:
                             compact_error = f"semantic_gate: {gate_reason}"

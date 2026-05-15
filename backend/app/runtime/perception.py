@@ -482,8 +482,15 @@ def score_element(
 # ---------------------------------------------------------------------------
 
 _MIN_SCORE = 18        # minimum score to be a candidate at all
-_HIGH_GAP = 15         # score gap between top-1 and top-2 for "high" confidence
-_UNIQUE_GAP = 22       # score gap for "unique" (only 1 element is above threshold)
+_HIGH_SCORE = 38       # minimum absolute score to award "high" or "unique" confidence
+                       # — prevents a single weak token match from producing
+                       # actionable confidence when competitors score 0.
+_HIGH_GAP = 20         # score gap between top-1 and top-2 for "high" confidence
+                       # — raised from 15 to require stronger separation between
+                       # semantically adjacent elements (e.g. "Save" vs "Save Changes")
+_UNIQUE_GAP = 30       # score gap for "unique" confidence (was 22)
+                       # — single-element candidacy alone is insufficient if the
+                       # absolute score is low (partial token match, noisy page)
 
 
 # ---------------------------------------------------------------------------
@@ -648,10 +655,14 @@ def find_best_match(
         LOGGER.debug("Perception: top element has no usable selector for intent=%r", intent_text[:60])
         return None
 
-    # Determine confidence
-    if above_threshold == 1:
+    # Determine confidence.
+    # Absolute score guard: regardless of gap or uniqueness, do not award
+    # "high" or "unique" when the top score is below _HIGH_SCORE.  A low
+    # absolute score means the match is based on weak/partial signals —
+    # not strong enough to suppress the fallback pipeline.
+    if above_threshold == 1 and top_score >= _HIGH_SCORE:
         confidence = "unique"
-    elif gap >= _UNIQUE_GAP:
+    elif gap >= _UNIQUE_GAP and top_score >= _HIGH_SCORE:
         confidence = "high"
     elif gap >= _HIGH_GAP:
         confidence = "medium"
@@ -959,9 +970,9 @@ def find_best_match_for_target(
         )
         return None
 
-    if above_threshold == 1:
+    if above_threshold == 1 and top_score >= _HIGH_SCORE:
         confidence = "unique"
-    elif gap >= _UNIQUE_GAP:
+    elif gap >= _UNIQUE_GAP and top_score >= _HIGH_SCORE:
         confidence = "high"
     elif gap >= _HIGH_GAP:
         confidence = "medium"
