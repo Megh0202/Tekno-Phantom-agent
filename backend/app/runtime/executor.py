@@ -24,6 +24,7 @@ from app.runtime.plan_normalizer import normalize_plan_steps
 from app.runtime.perception import (
     ElementIndex,
     PerceptionMatch,
+    _DIALOG_SCOPE_RE,
     build_element_index,
     derive_element_selectors,
     find_best_match,
@@ -1291,6 +1292,21 @@ class AgentExecutor:
             LOGGER.debug("Perception: no interactive elements at step %d", step.index + 1)
             return None
 
+        # Detect whether a visible modal/dialog is currently active.  When one
+        # is, pass the flag to perception so it can boost dialog-scoped element
+        # scores above background-page competitors that share similar text.
+        _modal_active = isinstance(snapshot, dict) and any(
+            isinstance(el, dict)
+            and el.get("visible", True)
+            and str(el.get("role", "")).lower() in {"dialog", "alertdialog"}
+            for el in (snapshot.get("interactive_elements") or [])
+        )
+        if _modal_active:
+            LOGGER.debug(
+                "Perception: active dialog detected at step %d — applying dialog-scope boost",
+                step.index + 1,
+            )
+
         # Prefer structured target matching when a semantic contract is present.
         # Falls back to tokenised intent matching for legacy steps with no target.
         if _has_semantic_contract:
@@ -1298,12 +1314,14 @@ class AgentExecutor:
                 target=raw_target,
                 step_type=step.type,
                 element_index=element_index,
+                active_dialog=_modal_active,
             )
 
         return find_best_match(
             intent_text=intent_text,
             step_type=step.type,
             element_index=element_index,
+            active_dialog=_modal_active,
         )
 
     @staticmethod
@@ -5355,6 +5373,7 @@ class AgentExecutor:
         # When a listbox/dropdown is open, its options (role='option') are the
         # only valid click targets — nav links and other page elements must not
         # win the scoring race just because they share the same visible text.
+        open_listbox_options: list[Any] = []
         if step_type == "click":
             open_listbox_options = [
                 item for item in elements
@@ -5369,6 +5388,42 @@ class AgentExecutor:
                     len(open_listbox_options),
                 )
                 elements = open_listbox_options
+
+        # When an active dialog/alertdialog is present AND at least one element
+        # has a dialog-scoped selector (Playwright often generates selectors
+        # prefixed with [role="dialog"]), restrict the candidate pool to those
+        # dialog-scoped elements.  Background-page elements with similar text
+        # (e.g. "Save Changes" competing with a modal "Save" button) are excluded
+        # so they cannot win the scoring race.
+        # Falls through to the full element list when:
+        #  - no visible dialog element exists in the snapshot, OR
+        #  - no elements have dialog-scope markers in their selectors
+        # (zero-regression for pages where Playwright does not generate
+        # dialog-scoped selectors).
+        if not open_listbox_options:
+            _has_active_dialog = any(
+                isinstance(el, dict)
+                and el.get("visible", True)
+                and str(el.get("role", "")).lower() in {"dialog", "alertdialog"}
+                for el in elements
+            )
+            if _has_active_dialog:
+                _dialog_scoped = [
+                    el for el in elements
+                    if isinstance(el, dict)
+                    and el.get("visible", True)
+                    and any(
+                        _DIALOG_SCOPE_RE.search(str(s))
+                        for s in (el.get("selectors") or [])
+                    )
+                ]
+                if _dialog_scoped:
+                    LOGGER.debug(
+                        "_page_snapshot_selector_candidates: active dialog detected — "
+                        "restricting to %d dialog-scoped elements (of %d total)",
+                        len(_dialog_scoped), len(elements),
+                    )
+                    elements = _dialog_scoped
 
         target_terms = self._selector_search_terms(raw_selector, text_hint, intent)
         if not target_terms:

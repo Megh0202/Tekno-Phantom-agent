@@ -1372,20 +1372,37 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     return null;
   };
   const detectLabel = (el) => {
-    // 1. Native label association via el.labels (input[id] + label[for])
+    // 1. aria-labelledby — W3C explicit label declaration; resolves one or more
+    //    element IDs to their text.  Covers button[role=checkbox aria-labelledby=…]
+    //    and other ARIA-enriched custom controls that native el.labels cannot reach.
+    try {
+      const labelledBy = (el.getAttribute("aria-labelledby") || "").trim();
+      if (labelledBy) {
+        const t = labelledBy.split(/\s+/)
+          .map(id => document.getElementById(id))
+          .filter(Boolean)
+          .map(node => (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .join(" ");
+        if (t) return t;
+      }
+    } catch (e) {}
+    // 2. Native label association via el.labels (input[id] + label[for])
     try {
       if (el.labels && el.labels.length > 0) {
         const t = Array.from(el.labels).map(l => (l.innerText || l.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
         if (t) return t;
       }
     } catch (e) {}
-    // 2. Nearby label in the closest form-field container (covers component-based UIs
-    //    like OrangeHRM where label and input share a wrapper div but have no for/id link)
+    // 3. Nearest form-field container with a label descendant.
+    //    Includes both generic ARIA containers (role=group/listitem/row) and
+    //    common CSS class patterns used by component frameworks.
     try {
       const container = el.closest([
+        "[role='group']", "[role='listitem']", "[role='row']",
+        "fieldset", "li", "td",
         ".oxd-input-group", ".oxd-form-row", ".form-group",
         "[class*='input-group']", "[class*='form-field']", "[class*='field-row']",
-        "fieldset", "li", "td",
       ].join(","));
       if (container) {
         const label = container.querySelector("label, .oxd-label, [class*='label']:not(input):not(button)");
@@ -1458,7 +1475,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     .filter(Boolean)
     .slice(0, 40);
 
-  const interactive = pick(Array.from(document.querySelectorAll("button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]")));
+  const interactive = pick(Array.from(document.querySelectorAll("button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [data-testid]")));
   const textExcerpt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
   return {
     url: window.location.href,
@@ -1539,6 +1556,8 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                         aria: (el.getAttribute("aria-label") || "").slice(0, 160),
                         href: (el.getAttribute("href") || "").slice(0, 200),
                         tag: (el.tagName || "").toLowerCase(),
+                        role: (el.getAttribute("role") || "").toLowerCase(),
+                        aria_checked: el.getAttribute("aria-checked"),
                         parent_select_value: (el.tagName.toLowerCase() === "option" && el.parentElement instanceof HTMLSelectElement)
                             ? (el.parentElement.value || null)
                             : null,
@@ -1818,6 +1837,47 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 "before_url": before_url,
                 "after_url": after_url,
             }
+        # Toggle interaction verification: check aria-checked mutation for
+        # checkbox/switch/radio controls implemented as button[role=checkbox]
+        # or similar ARIA-enriched elements.  These controls produce no URL,
+        # title, text, or visibility changes — their interaction success is
+        # expressed entirely through the aria-checked attribute transitioning
+        # between "true"/"false"/"mixed".
+        pre_aria_checked = str((target_context or {}).get("aria_checked") or "").strip()
+        pre_role = str((target_context or {}).get("role") or "").strip().lower()
+        _toggle_roles = {"checkbox", "switch", "radio", "menuitemcheckbox", "menuitemradio"}
+        if pre_role in _toggle_roles or pre_aria_checked in {"true", "false", "mixed"}:
+            try:
+                post_aria_checked = await locator.evaluate("el => el.getAttribute('aria-checked')")
+                post_aria_checked = str(post_aria_checked or "").strip()
+                if pre_aria_checked and post_aria_checked and pre_aria_checked != post_aria_checked:
+                    return {
+                        "status": "passed",
+                        "detail": (
+                            f"Toggle state changed: aria-checked {pre_aria_checked!r} → {post_aria_checked!r}"
+                        ),
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+                if post_aria_checked in {"true", "false", "mixed"}:
+                    # aria-checked is present — this is a toggle control.
+                    # State did not change: element may already be in the target
+                    # state (idempotent click) — report ambiguous so the caller
+                    # can decide rather than treating it as a hard failure.
+                    return {
+                        "status": "ambiguous",
+                        "detail": (
+                            f"Toggle control clicked but aria-checked did not change "
+                            f"(pre={pre_aria_checked!r} post={post_aria_checked!r}) — "
+                            "element may already be in the intended state."
+                        ),
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+            except Exception:
+                pass
         return {
             "status": "failed",
             "detail": "Click effect not observed: page URL/title/text stayed the same and the element remained visible/enabled.",
@@ -2869,7 +2929,39 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    } catch (error) {}"
             "    return null;"
             "  };"
-            "  const nodes = Array.from(document.querySelectorAll(\"button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [data-testid]\"));"
+            "  const detectLabel = (el) => {"
+            "    try {"
+            "      const labelledBy = (el.getAttribute('aria-labelledby') || '').trim();"
+            "      if (labelledBy) {"
+            "        const t = labelledBy.split(/\\\\s+/).map(id => document.getElementById(id)).filter(Boolean)"
+            "          .map(node => (node.innerText || node.textContent || '').replace(/\\\\s+/g, ' ').trim()).filter(Boolean).join(' ');"
+            "        if (t) return t;"
+            "      }"
+            "    } catch (e) {}"
+            "    try {"
+            "      if (el.labels && el.labels.length > 0) {"
+            "        const t = Array.from(el.labels).map(l => (l.innerText || l.textContent || '').replace(/\\\\s+/g, ' ').trim()).filter(Boolean).join(' ');"
+            "        if (t) return t;"
+            "      }"
+            "    } catch (e) {}"
+            "    try {"
+            "      const container = el.closest(["
+            "        \\\"[role='group']\\\", \\\"[role='listitem']\\\", \\\"[role='row']\\\","
+            "        'fieldset', 'li', 'td',"
+            "        '.oxd-input-group', '.oxd-form-row', '.form-group',"
+            "        \\\"[class*='input-group']\\\", \\\"[class*='form-field']\\\", \\\"[class*='field-row']\\\","
+            "      ].join(','));"
+            "      if (container) {"
+            "        const lbl = container.querySelector(\\\"label, .oxd-label, [class*='label']:not(input):not(button)\\\");"
+            "        if (lbl && lbl !== el) {"
+            "          const t = (lbl.innerText || lbl.textContent || '').replace(/\\\\s+/g, ' ').trim();"
+            "          if (t) return t;"
+            "        }"
+            "      }"
+            "    } catch (e) {}"
+            "    return '';"
+            "  };"
+            "  const nodes = Array.from(document.querySelectorAll(\"button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [data-testid]\"));"
             "  const interactive = nodes.map((el) => {"
             "    const tag = (el.tagName || '').toLowerCase();"
             "    const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 120);"
@@ -2881,6 +2973,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    const placeholder = el.getAttribute('placeholder') || '';"
             "    const href = el.getAttribute('href') || '';"
             "    const inputType = el.getAttribute('type') || '';"
+            "    const title = el.getAttribute('title') || '';"
+            "    const nearbyLabel = detectLabel(el);"
             "    const scope = detectScope(el);"
             "    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;"
             "    const style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(el) : null;"
@@ -2893,8 +2987,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    const titleLink = titleLinkSelector(el);"
             "    if (titleLink) selectors.push(titleLink);"
             "    if (tag === 'a' && href) selectors.push(`a[href*=\\\"${href.slice(0, 120).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
-            "    return { tag, type: inputType, text, aria, name, id, testid, role, placeholder, href: href.slice(0, 120), scope, visible, enabled, selectors };"
-            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder).slice(0, 40);"
+            "    return { tag, type: inputType, text, aria, name, id, testid, role, placeholder, title, label: nearbyLabel.slice(0, 80), href: href.slice(0, 120), scope, visible, enabled, selectors };"
+            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder || item.label).slice(0, 40);"
             "  return {"
             "    url: page.url(),"
             "    title: await page.title(),"
@@ -2989,6 +3083,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "        aria: (el.getAttribute('aria-label') || '').slice(0, 160),"
             "        href: (el.getAttribute('href') || '').slice(0, 200),"
             "        tag: (el.tagName || '').toLowerCase(),"
+            "        role: (el.getAttribute('role') || '').toLowerCase(),"
+            "        aria_checked: el.getAttribute('aria-checked'),"
             "        parent_select_value: (el.tagName.toLowerCase() === 'option' && el.parentElement instanceof HTMLSelectElement) ? (el.parentElement.value || null) : null,"
             "      };"
             "    });"
@@ -3232,6 +3328,47 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
                 "before_url": before_url,
                 "after_url": after_url,
             }
+        # Toggle interaction verification: check aria-checked mutation for
+        # checkbox/switch/radio controls.
+        pre_aria_checked = str((target_context or {}).get("aria_checked") or "").strip()
+        pre_role = str((target_context or {}).get("role") or "").strip().lower()
+        _toggle_roles = {"checkbox", "switch", "radio", "menuitemcheckbox", "menuitemradio"}
+        if pre_role in _toggle_roles or pre_aria_checked in {"true", "false", "mixed"}:
+            try:
+                toggle_code = (
+                    "async (page) => {"
+                    f"  const locator = page.locator({json.dumps(selector)}).first();"
+                    "  try {"
+                    "    const v = await locator.evaluate('el => el.getAttribute(\"aria-checked\")');"
+                    "    return JSON.stringify({ aria_checked: v ?? null });"
+                    "  } catch (e) { return '{\"aria_checked\": null}'; }"
+                    "}"
+                )
+                toggle_result = await self._run_code(toggle_code)
+                toggle_data = json.loads(toggle_result or "{}")
+                post_aria_checked = str(toggle_data.get("aria_checked") or "").strip()
+                if pre_aria_checked and post_aria_checked and pre_aria_checked != post_aria_checked:
+                    return {
+                        "status": "passed",
+                        "detail": f"Toggle state changed: aria-checked {pre_aria_checked!r} → {post_aria_checked!r}",
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+                if post_aria_checked in {"true", "false", "mixed"}:
+                    return {
+                        "status": "ambiguous",
+                        "detail": (
+                            f"Toggle control clicked but aria-checked did not change "
+                            f"(pre={pre_aria_checked!r} post={post_aria_checked!r}) — "
+                            "element may already be in the intended state."
+                        ),
+                        "selector": selector,
+                        "before_url": before_url,
+                        "after_url": after_url,
+                    }
+            except Exception:
+                pass
         return {
             "status": "failed",
             "detail": "Click effect not observed: page URL/title/text stayed the same and the element remained visible/enabled.",

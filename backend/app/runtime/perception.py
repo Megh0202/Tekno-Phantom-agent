@@ -49,6 +49,8 @@ class IndexedElement:
     enabled: bool
     selectors: tuple[str, ...]   # ordered most-stable → least-stable
     semantic_role: str = ""      # normalised ARIA-style role (textbox, button, combobox, link, …)
+    scope: str = ""              # page region this element lives in (dialog/form/main/nav/aside/…)
+                                 # populated from detectScope() in the browser snapshot
 
     @property
     def best_selector(self) -> str | None:
@@ -288,6 +290,7 @@ def build_element_index(snapshot: dict[str, Any]) -> ElementIndex:
             enabled=bool(item.get("enabled", True)),
             selectors=selectors,
             semantic_role=_normalize_semantic_role(_tag, _el_type, _role),
+            scope=str(item.get("scope", "")).strip().lower(),
         ))
 
     LOGGER.debug("Built element index: %d visible interactive elements at %s", len(elements), url)
@@ -324,6 +327,69 @@ def _tokenize(text: str) -> list[str]:
         t for t in text.split()
         if len(t) >= 2 and t not in _STOP_WORDS
     ]
+
+
+# ---------------------------------------------------------------------------
+# Region-priority scoring
+# ---------------------------------------------------------------------------
+#
+# Additive score deltas applied based on the page region (scope) where an
+# element lives.  The values are intentionally moderate — they tip the
+# balance between otherwise similar candidates but cannot override a strong
+# semantic text/label match.
+#
+# Positive = interaction regions (prefer for action steps)
+# Negative = navigation/layout chrome (de-prioritize for action steps)
+#
+# Key principle:
+#   Navigation intent ("open Checkbox page") → nav link still wins because
+#   text+tag+role bonuses (~70) dwarf the −20 penalty.
+#   Interaction intent ("toggle Primary checkbox") → control in main/form wins
+#   because interaction-owner boosts + label scoring >> nav link score.
+#
+# NEVER used as a hard filter — only shifts the relative scoring balance.
+_REGION_SCORE_DELTA: dict[str, int] = {
+    # Active interaction containers — boost
+    "dialog": 20,       # modal/dialog — highest priority (also has dialog-scope boost in selectors)
+    "form": 12,         # active form region
+    "search": 8,        # search region
+    "main": 8,          # primary content area
+    "article": 6,       # content article
+    "listbox": 6,       # open dropdown — already scoped by _dialog_scoped candidate restrict
+    # Layout chrome — de-prioritize
+    "nav": -20,         # navigation sidebar / top nav
+    "aside": -20,       # sidebar / secondary panel
+    "header": -8,       # page header chrome
+    "footer": -8,       # page footer chrome
+    # Neutral / unknown
+    "body": 0,
+    "": 0,
+}
+
+
+# ---------------------------------------------------------------------------
+# Interaction-category ownership constants
+# (defined here so score_element and score_element_for_target can reference them)
+# ---------------------------------------------------------------------------
+
+# ARIA roles that unambiguously identify the SEMANTIC INTERACTION OWNER for
+# toggle/selection actions.  These elements are the correct click target for
+# any checkbox-like intent — they receive a score boost that outweighs
+# text-only matches from surrounding containers/wrappers.
+#
+# Sized to exceed the gap between a container div with a perfect text match
+# (~78) and a checkbox button with a partial text/aria match (~62), pushing
+# the toggle-owner to clear first place even when its visible label text is
+# sparse relative to a surrounding wrapper.
+_TOGGLE_INTERACTION_OWNER_ROLES: frozenset[str] = frozenset({
+    "checkbox",
+    "switch",
+    "radio",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "treeitem",       # treeitem can carry aria-checked in tree/outline controls
+})
+_TOGGLE_OWNER_BOOST = 30   # added on top of generic click role bonus
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +467,15 @@ def score_element(
     if tokens and el_text_lower == " ".join(tokens):
         score += 30
 
-    # Label phrase-match + cardinality scoring for type/select steps.
-    # The associated <label> text is the strongest signal for identifying
-    # the correct input field.
+    # Label phrase-match + cardinality scoring.
+    # The associated <label> text (from aria-labelledby, <label for>, or a
+    # nearest-container heuristic) is the strongest identity signal for any
+    # labelled control — not just inputs.
+    #
+    # Applied to type/select (form fields) AND click (buttons, checkboxes,
+    # toggles, radios) so that a button[role=checkbox] whose aria-labelledby
+    # resolves to "Required" beats a nearby tab/container with "Required"
+    # in its visible text.
     #
     # Cardinality principle (generic, no hardcoded field names):
     #   - Label whose token set EXACTLY matches the intent tokens → strongest
@@ -413,7 +485,7 @@ def score_element(
     #     label="Confirm Password" — label has an extra distinguishing word).
     #   - Label that is a SUBSET of the intent (missing words) → penalised;
     #     the field label does not fully cover what was asked for.
-    if el.label and step_type in {"type", "select"}:
+    if el.label and step_type in {"type", "select", "click"}:
         label_lower = el.label.lower()
         label_tokens = {t for t in label_lower.split() if len(t) >= 2}
         intent_tokens = set(tokens)
@@ -448,6 +520,12 @@ def score_element(
             score += 20
         if el.role in {"button", "link", "menuitem", "tab", "checkbox", "radio", "option"}:
             score += 15
+        # Interaction-owner boost: toggle controls (checkbox/switch/radio) are
+        # the semantic owner of their toggle action.  They receive an additional
+        # boost so that a wrapper/container element sharing the same visible text
+        # does not outrank the actual actionable node.
+        if el.role in _TOGGLE_INTERACTION_OWNER_ROLES:
+            score += _TOGGLE_OWNER_BOOST
     elif step_type == "type":
         if el.tag in {"input", "textarea"}:
             score += 25
@@ -474,6 +552,11 @@ def score_element(
     if el.aria:
         score += 6
 
+    # Region-priority delta: boost elements in active interaction regions,
+    # de-prioritize navigation/layout chrome.  Applied last so it shifts
+    # relative ordering without overriding strong semantic text matches.
+    score += _REGION_SCORE_DELTA.get(el.scope, 0)
+
     return max(score, 0)
 
 
@@ -491,6 +574,22 @@ _HIGH_GAP = 20         # score gap between top-1 and top-2 for "high" confidence
 _UNIQUE_GAP = 30       # score gap for "unique" confidence (was 22)
                        # — single-element candidacy alone is insufficient if the
                        # absolute score is low (partial token match, noisy page)
+
+# Score boost applied to elements whose selectors reference the active modal
+# container when an active dialog/alertdialog is present on the page.  The
+# boost is sized to exceed _HIGH_GAP (20) when a dialog-scoped element
+# competes against a background-page element with a similar raw score —
+# pushing the gap past the threshold and promoting the correct element to
+# "high" or "unique" confidence.
+_DIALOG_SCOPE_BOOST = 25
+
+# Compiled pattern to detect dialog-scope markers in Playwright-generated
+# selectors.  Playwright routinely includes [role="dialog"] as a selector
+# prefix for elements that are structurally inside a dialog container.
+_DIALOG_SCOPE_RE = re.compile(
+    r'\[role=["\']?(?:dialog|alertdialog)["\']?\]|\[aria-modal',
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +707,7 @@ def find_best_match(
     step_type: str,
     element_index: ElementIndex,
     min_score: int = _MIN_SCORE,
+    active_dialog: bool = False,
 ) -> PerceptionMatch | None:
     """
     Find the live DOM element that best matches the step's intent.
@@ -620,6 +720,11 @@ def find_best_match(
 
     Returns None if no element meets the minimum score — the caller should
     fall back to the existing selector-candidate pipeline.
+
+    When active_dialog=True, elements whose Playwright-generated selectors
+    contain dialog-scope markers (e.g. [role="dialog"]) receive a score
+    boost — prioritising modal-scoped elements over background-page elements
+    that share similar visible text.
     """
     if not element_index.elements:
         LOGGER.debug("Perception: element index is empty for intent=%r", intent_text[:60])
@@ -633,6 +738,8 @@ def find_best_match(
     scored: list[tuple[int, IndexedElement]] = []
     for el in element_index.elements:
         s = score_element(el, tokens, step_type)
+        if active_dialog and any(_DIALOG_SCOPE_RE.search(sel) for sel in el.selectors):
+            s += _DIALOG_SCOPE_BOOST
         if s >= min_score:
             scored.append((s, el))
 
@@ -810,6 +917,35 @@ def score_element_for_target(
         if any(w in el_context for w in scope_words):
             score += 6
 
+    # ------------------------------------------------------------------
+    # Step-type alignment — mirrors score_element interaction-owner logic.
+    # Added here so that structured-contract paths (find_best_match_for_target)
+    # also benefit from interaction-category signals.
+    # ------------------------------------------------------------------
+    if step_type == "click":
+        if el.tag in {"button", "a"}:
+            score += 20
+        if el.role in {"button", "link", "menuitem", "tab", "checkbox", "radio", "option"}:
+            score += 15
+        if el.role in _TOGGLE_INTERACTION_OWNER_ROLES:
+            score += _TOGGLE_OWNER_BOOST
+    elif step_type == "type":
+        if el.tag in {"input", "textarea"}:
+            score += 25
+        if el.el_type in {"text", "email", "password", "search", "tel", "url", "number", ""}:
+            score += 15
+        if el.role in {"textbox", "searchbox", "combobox"}:
+            score += 15
+        if el.tag == "button":
+            score -= 20
+    elif step_type == "select":
+        if el.tag == "select":
+            score += 35
+        if el.role == "combobox":
+            score += 25
+        if el.tag == "button":
+            score -= 10
+
     # Stable-attribute bonuses — prefer elements the runtime can address reliably
     if el.el_id:
         score += 5
@@ -817,6 +953,9 @@ def score_element_for_target(
         score += 8
     if el.aria:
         score += 4
+
+    # Region-priority delta — same mechanism as score_element.
+    score += _REGION_SCORE_DELTA.get(el.scope, 0)
 
     return max(score, 0)
 
@@ -893,6 +1032,7 @@ def find_best_match_for_target(
     step_type: str,
     element_index: ElementIndex,
     min_score: int = _MIN_SCORE,
+    active_dialog: bool = False,
 ) -> PerceptionMatch | None:
     """
     Find the live DOM element that best matches a structured semantic target contract.
@@ -908,6 +1048,9 @@ def find_best_match_for_target(
 
     Returns a PerceptionMatch with the same confidence levels as find_best_match,
     or None when no element meets the minimum score.
+
+    When active_dialog=True, elements with dialog-scoped selectors receive a
+    score boost — same mechanism as find_best_match.
     """
     if not element_index.elements:
         LOGGER.debug("Perception (target): element index is empty")
@@ -941,6 +1084,8 @@ def find_best_match_for_target(
     scored: list[tuple[int, IndexedElement]] = []
     for el in candidates:
         s = score_element_for_target(el, canonical, step_type)
+        if active_dialog and any(_DIALOG_SCOPE_RE.search(sel) for sel in el.selectors):
+            s += _DIALOG_SCOPE_BOOST
         if s >= min_score:
             scored.append((s, el))
 
