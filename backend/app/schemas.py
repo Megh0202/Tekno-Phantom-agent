@@ -38,6 +38,7 @@ class StepStatus(str, Enum):
     failed = "failed"
     skipped = "skipped"
     cancelled = "cancelled"
+    human_recovered = "human_recovered"
 
 
 class SemanticTarget(BaseModel):
@@ -620,6 +621,40 @@ class ProjectListResponse(BaseModel):
     items: list[ProjectState]
 
 
+class InteractionEvent(BaseModel):
+    """A single human interaction captured during recovery mode."""
+    kind: Literal["click", "input", "change", "type", "toggle", "select", "navigate"]
+    # Element identity
+    tag: str | None = None
+    type: str | None = None        # input type attribute (text, checkbox, radio…)
+    role: str | None = None        # aria role
+    label: str | None = None       # aria-label
+    placeholder: str | None = None
+    name: str | None = None        # name attribute
+    text: str | None = None        # visible text (buttons/links only)
+    checked: bool | None = None    # checkbox/radio checked state
+    # Context
+    url: str | None = None
+    timestamp_ms: int = 0
+    # Stable fingerprint for replay matching
+    fingerprint: dict[str, Any] | None = None
+    # Legacy / type/select capture fields (kept for forward compatibility)
+    selector: str = ""
+    value: str | None = None
+
+
+class RecoveryContext(BaseModel):
+    """Structured context captured when a step enters waiting_for_input recovery mode."""
+    run_id: str
+    step_index: int
+    step_type: str
+    failed_selector: str | None = None
+    current_url: str | None = None
+    timestamp: datetime
+    execution_status: str
+    failure_snapshot_summary: dict[str, Any] | None = None
+
+
 class StepRuntimeState(BaseModel):
     step_id: str = Field(default_factory=lambda: str(uuid4()))
     index: int
@@ -638,6 +673,8 @@ class StepRuntimeState(BaseModel):
     user_input_prompt: str | None = None
     requested_selector_target: str | None = None
     provided_selector: str | None = None
+    recovery_context: RecoveryContext | None = None
+    pending_recovery_interactions: list[InteractionEvent] = Field(default_factory=list)
 
 
 class RunState(BaseModel):
@@ -663,6 +700,7 @@ class RunState(BaseModel):
     steps: list[StepRuntimeState]
     summary: str | None = None
     report_artifact: str | None = None
+    recovery_mode: bool = False
 
 
 class RunListResponse(BaseModel):

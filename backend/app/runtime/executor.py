@@ -33,7 +33,7 @@ from app.runtime.perception import (
 )
 from app.runtime.selector_memory import SelectorMemoryStore
 from app.runtime.store import RunStore
-from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
+from app.schemas import InteractionEvent, RecoveryContext, RunState, RunStatus, StepRuntimeState, StepStatus
 
 LOGGER = logging.getLogger("tekno.phantom.executor")
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")
@@ -322,6 +322,13 @@ class AgentExecutor:
         self._run_store.persist(run)
 
     _SELECTOR_INPUT_TIMEOUT_SECONDS: int = 120
+    # How often (in polling ticks, each ~1 s) to snapshot the page during
+    # recovery mode for passive state-change observation.  3 s is frequent
+    # enough to catch manual interactions without meaningful overhead.
+    _RECOVERY_OBSERVE_INTERVAL_SECS: int = 3
+    # Seconds of inactivity (no new browser interactions) after which the
+    # recovery session is considered stable and the confirmation prompt is shown.
+    _RECOVERY_STABILIZATION_SECS: int = 5
 
     def _schedule_selector_input_timeout(self, run_id: str) -> None:
         existing = self._selector_timeout_tasks.pop(run_id, None)
@@ -377,10 +384,13 @@ class AgentExecutor:
         if failed_index is not None:
             self._mark_remaining_steps_skipped(run, failed_index + 1)
 
+        run.recovery_mode = False
+        # Clean up the browser-side recovery recorder before resuming execution.
+        await self._stop_interaction_recording_safe(run_id)
         run.status = RunStatus.running
         self._run_store.persist(run)
         LOGGER.info(
-            "Run %s: selector timeout — step marked failed, remaining steps skipped",
+            "Run %s: selector timeout — step marked failed, remaining steps skipped, recovery mode cleared",
             run_id,
         )
 
@@ -417,7 +427,7 @@ class AgentExecutor:
     async def _execute_existing_steps(self, run: RunState) -> bool:
         has_step_failure = False
         for step in run.steps:
-            if step.status in {StepStatus.completed, StepStatus.skipped}:
+            if step.status in {StepStatus.completed, StepStatus.skipped, StepStatus.human_recovered}:
                 continue
             if step.status == StepStatus.waiting_for_input:
                 if self._should_continue_after_failure(run):
@@ -447,7 +457,7 @@ class AgentExecutor:
                     # Only count as failure if the step did not complete successfully.
                     # A background-task retry that clicked and navigated must not
                     # poison the final run status.
-                    if step.status != StepStatus.completed:
+                    if step.status not in {StepStatus.completed, StepStatus.human_recovered}:
                         has_step_failure = True
                     run.status = RunStatus.running
                     continue
@@ -519,8 +529,181 @@ class AgentExecutor:
                         self._schedule_selector_input_timeout(run.run_id)
                         user_provided_selector = False
                     if not user_provided_selector:
-                        for _ in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
+                        # Capture a baseline snapshot so the passive observer can
+                        # compare page state on each poll tick.  Failures here are
+                        # non-fatal — observation simply won't run that iteration.
+                        _obs_baseline = await self._safe_page_snapshot()
+                        _obs_logged: set[str] = set()  # deduplicate log messages
+                        _obs_changed: bool = False  # True once any page-state change detected
+                        _interaction_buffer: list[dict] = []  # cumulative human interactions
+                        _last_interaction_tick: int = -1    # tick of most recent new event
+                        _session_confirmed: bool = False    # guard: fire confirm exactly once
+                        for _tick in range(self._SELECTOR_INPUT_TIMEOUT_SECONDS + 5):
                             await asyncio.sleep(1)
+
+                            # ---- drain browser interaction buffer every tick (~1s) ----
+                            # Reading every second ensures interactions survive page
+                            # navigations (login redirects, form submits) that would
+                            # otherwise destroy window.__phantomInteractions before the
+                            # slower observation interval has a chance to poll.
+                            if _obs_baseline is not None and _tick > 0:
+                                _new_events = await self._read_interactions_safe(run.run_id)
+                                if _new_events:
+                                    _interaction_buffer.extend(_new_events)
+                                    _last_interaction_tick = _tick
+                                    LOGGER.debug(
+                                        "Run %s step %d: %d new interaction(s) captured"
+                                        " (total=%d)",
+                                        run.run_id, step.index + 1,
+                                        len(_new_events), len(_interaction_buffer),
+                                    )
+                                    # If the session is already confirmed but the human
+                                    # keeps interacting (e.g. types Employee Id after
+                                    # stabilization), update the stored interaction list
+                                    # so the confirmation prompt reflects ALL actions.
+                                    if _session_confirmed:
+                                        _state = self._run_store.get(run.run_id)
+                                        _s = next(
+                                            (st for st in (_state.steps if _state else [])
+                                             if st.step_id == step.step_id),
+                                            None,
+                                        )
+                                        if _s is not None and _s.pending_recovery_interactions is not None:
+                                            _updated = self._normalize_interactions(_interaction_buffer)
+                                            _s.pending_recovery_interactions = [
+                                                InteractionEvent(
+                                                    kind=ev.get("kind", "click"),
+                                                    tag=ev.get("tag"),
+                                                    type=ev.get("type"),
+                                                    role=ev.get("role"),
+                                                    label=ev.get("label"),
+                                                    placeholder=ev.get("placeholder"),
+                                                    name=ev.get("name"),
+                                                    text=ev.get("text"),
+                                                    checked=ev.get("checked"),
+                                                    url=ev.get("url"),
+                                                    timestamp_ms=int(ev.get("timestamp", 0)),
+                                                    fingerprint=ev.get("fingerprint"),
+                                                    selector=ev.get("selector", ""),
+                                                    value=ev.get("value"),
+                                                )
+                                                for ev in _updated
+                                            ]
+                                            _s.user_input_prompt = (
+                                                self._build_recovery_confirm_prompt(_updated)
+                                            )
+                                            self._run_store.persist(_state)
+
+                            # --------------------------------------------------
+                            # Passive page-state observation during recovery mode.
+                            # Every N seconds, snapshot the page and compare with
+                            # baseline to detect URL/modal/element-count changes.
+                            # --------------------------------------------------
+                            if (
+                                _obs_baseline is not None
+                                and _tick > 0
+                                and _tick % self._RECOVERY_OBSERVE_INTERVAL_SECS == 0
+                            ):
+                                _obs_current = await self._safe_page_snapshot()
+                                if _obs_current is not None:
+                                    _obs_changes = self._diff_recovery_snapshots(
+                                        _obs_baseline, _obs_current
+                                    )
+                                    for _obs_change in _obs_changes:
+                                        if _obs_change not in _obs_logged:
+                                            LOGGER.debug(
+                                                "Run %s step %d: recovery observation — %s",
+                                                run.run_id, step.index + 1, _obs_change,
+                                            )
+                                            _obs_logged.add(_obs_change)
+                                    if _obs_changes:
+                                        _obs_changed = True
+
+                            # ---- recovery session stabilization check (every tick) ----
+                            # The session is considered stable — and the confirmation
+                            # prompt is shown — only when ALL of:
+                            #   1. at least one interaction has been recorded
+                            #   2. no new interactions for _RECOVERY_STABILIZATION_SECS ticks
+                            #   3. we haven't already triggered the confirm prompt
+                            # NOTE: page state change (_obs_changed) is intentionally NOT
+                            # required here. The human is the authority — a single click,
+                            # a field focus, or any action that doesn't change the URL/DOM
+                            # is still a valid recovery attempt. The human will confirm.
+                            _inactivity = (
+                                _tick - _last_interaction_tick
+                                if _last_interaction_tick >= 0 else 0
+                            )
+                            if (
+                                not _session_confirmed
+                                and _interaction_buffer
+                                and _last_interaction_tick >= 0
+                                and _inactivity >= self._RECOVERY_STABILIZATION_SECS
+                            ):
+                                _state = self._run_store.get(run.run_id)
+                                _s = next(
+                                    (st for st in (_state.steps if _state else [])
+                                     if st.step_id == step.step_id),
+                                    None,
+                                )
+                                if (
+                                    _s is not None
+                                    and _s.status == StepStatus.waiting_for_input
+                                    and _s.user_input_kind in {"selector", None}
+                                ):
+                                    # Consolidate raw events: merge per-field input
+                                    # events into final values, let change supersede
+                                    # them, deduplicate clicks, drop noise.
+                                    _normalized = self._normalize_interactions(
+                                        _interaction_buffer
+                                    )
+                                    LOGGER.debug(
+                                        "Run %s step %d: session stable after %ds"
+                                        " inactivity — normalized %d raw event(s)"
+                                        " → %d interaction(s)",
+                                        run.run_id, step.index + 1, _inactivity,
+                                        len(_interaction_buffer), len(_normalized),
+                                    )
+                                    _s.pending_recovery_interactions = [
+                                        InteractionEvent(
+                                            kind=ev.get("kind", "click"),
+                                            tag=ev.get("tag"),
+                                            type=ev.get("type"),
+                                            role=ev.get("role"),
+                                            label=ev.get("label"),
+                                            placeholder=ev.get("placeholder"),
+                                            name=ev.get("name"),
+                                            text=ev.get("text"),
+                                            checked=ev.get("checked"),
+                                            url=ev.get("url"),
+                                            timestamp_ms=int(ev.get("timestamp", 0)),
+                                            fingerprint=ev.get("fingerprint"),
+                                            selector=ev.get("selector", ""),
+                                            value=ev.get("value"),
+                                        )
+                                        for ev in _normalized
+                                    ]
+                                    # Keep user_input_kind = "selector" so the selector
+                                    # recovery path stays open — user can still paste a
+                                    # selector OR click "Yes, I completed this step".
+                                    # Whichever they do first wins.
+                                    _s.user_input_prompt = (
+                                        self._build_recovery_confirm_prompt(_normalized)
+                                    )
+                                    self._run_store.persist(_state)
+                                    _session_confirmed = True
+                                    # Cancel the 40s timeout immediately — human has
+                                    # acted and their confirmation should not be raced
+                                    # by an auto-fail.  The loop continues waiting until
+                                    # the human calls POST /recovery-confirm.
+                                    self._cancel_selector_input_timeout(run.run_id)
+                                    LOGGER.info(
+                                        "Run %s step %d: recovery session complete —"
+                                        " %d interaction(s) recorded (%d raw events),"
+                                        " awaiting human confirmation (timeout cancelled)",
+                                        run.run_id, step.index + 1,
+                                        len(_normalized), len(_interaction_buffer),
+                                    )
+
                             fresh = self._run_store.get(run.run_id)
                             if fresh is None:
                                 break
@@ -547,9 +730,19 @@ class AgentExecutor:
                                 break
                         # Cancel external timeout task (may have already fired — that's fine).
                         self._cancel_selector_input_timeout(run.run_id)
+                        # Stop the browser-side recovery recorder now that the
+                        # pause window has closed (user provided selector or timed out).
+                        await self._stop_interaction_recording_safe(run.run_id)
                         # Safety net: if polling exhausted without any status change,
                         # mark step failed explicitly so it doesn't stay waiting_for_input.
-                        if not user_provided_selector and step.status == StepStatus.waiting_for_input:
+                        # Exception: recovery_confirm means the human acted and we are
+                        # awaiting their explicit confirmation — don't auto-fail on timeout.
+                        if (
+                            not user_provided_selector
+                            and step.status == StepStatus.waiting_for_input
+                            and step.user_input_kind != "recovery_confirm"
+                            and not step.pending_recovery_interactions
+                        ):
                             step.status = StepStatus.failed
                             step.error = "Selector input timed out — no selector was provided in time."
                             step.message = f"Step failed: no selector provided within {self._SELECTOR_INPUT_TIMEOUT_SECONDS}s."
@@ -582,12 +775,18 @@ class AgentExecutor:
                             has_step_failure = True
                             break
                     else:
+                        # human_recovered: human confirmed their recovery actions —
+                        # break out of the inner while loop so the outer for loop
+                        # advances to the next step (line 788 handles human_recovered).
+                        if step.status == StepStatus.human_recovered:
+                            run.status = RunStatus.running
+                            break
                         # Timeout — user did not provide a selector in time.
                         has_step_failure = True
                         break
                 # Only advance to the next step if the step actually passed.
                 # If the user gave up (timeout) or retry failed, stop the run.
-                if step.status == StepStatus.completed:
+                if step.status in {StepStatus.completed, StepStatus.human_recovered}:
                     continue
                 self._mark_remaining_steps_skipped(run, step.index + 1)
                 break
@@ -1869,6 +2068,33 @@ class AgentExecutor:
                 step.requested_selector_target = self._requested_selector_target(step)
                 step.user_input_prompt = self._build_selector_help_prompt(step)
                 step_trace["result"] = step.message
+                # Capture structured recovery context so the pause state is fully
+                # observable: which step failed, what selector was attempted, and
+                # what page the browser is on.  No behavior change — data only.
+                _failed_selector = step.input.get("selector") or step.input.get("source_selector") or None
+                _failed_selector = str(_failed_selector).strip() or None if _failed_selector else None
+                step.recovery_context = RecoveryContext(
+                    run_id=run.run_id,
+                    step_index=step.index,
+                    step_type=step.type,
+                    failed_selector=_failed_selector,
+                    current_url=(before_snapshot.get("url") if before_snapshot else None) or None,
+                    timestamp=utc_now(),
+                    execution_status=run.status.value,
+                    failure_snapshot_summary=self._summarize_page_state(before_snapshot),
+                )
+                run.recovery_mode = True
+                LOGGER.info(
+                    "Run %s: entered recovery mode — step=%d type=%s selector=%r url=%r",
+                    run.run_id,
+                    step.index + 1,
+                    step.type,
+                    _failed_selector,
+                    step.recovery_context.current_url,
+                )
+                # Inject the browser-side recovery recorder so it is ready to
+                # capture human interactions during the pause window.
+                await self._start_interaction_recording_safe(run.run_id)
                 # Capture screenshot + diagnosis so the UI shows "What went wrong",
                 # "Suggested fix", and "Try these selectors" even while paused.
                 # NOTE: apply_manual_selector_hint (sync) can run on the event loop
@@ -2353,8 +2579,10 @@ class AgentExecutor:
             raise ValueError("Run finished: the selector input window has expired.")
         if not self._can_accept_manual_selector_hint(step):
             raise ValueError("This step is not eligible for selector input recovery.")
-        # User provided a selector in time — cancel the auto-close countdown.
+        # User provided a selector in time — cancel the auto-close countdown and
+        # exit recovery mode now that a recovery action has been taken.
         self._cancel_selector_input_timeout(run.run_id)
+        run.recovery_mode = False
 
         requested_selector = self._requested_selector_target(step)
         if not requested_selector:
@@ -2409,6 +2637,82 @@ class AgentExecutor:
         run.status = RunStatus.running
         run.finished_at = None
         self._run_store.persist(run)
+        return run
+
+    def apply_human_recovery_confirmation(
+        self, run_id: str, step_id: str
+    ) -> RunState | None:
+        """Mark a recovery_confirm step as human_recovered and resume the run.
+
+        Called via POST /api/runs/{run_id}/steps/{step_id}/recovery-confirm.
+        Cancels the selector timeout, clears recovery mode, sets the step status
+        to human_recovered, resets downstream skipped steps to pending, and sets
+        the run back to running so the executor polling loop exits naturally on
+        its next tick.
+        """
+        run = self._run_store.get(run_id)
+        if not run:
+            return None
+
+        step = next((s for s in run.steps if s.step_id == step_id), None)
+        if not step:
+            return None
+
+        if run.status in {RunStatus.completed, RunStatus.cancelled}:
+            raise ValueError("This run has already finished and cannot be resumed.")
+
+        if step.status != StepStatus.waiting_for_input:
+            raise ValueError(
+                "This step is not awaiting recovery confirmation "
+                f"(status={step.status!r})."
+            )
+        if not step.pending_recovery_interactions:
+            raise ValueError(
+                "No recorded interactions found for this step. "
+                "Perform actions in the browser first, then confirm."
+            )
+
+        # Cancel the 120 s auto-close countdown.
+        self._cancel_selector_input_timeout(run.run_id)
+
+        # Exit recovery mode.
+        run.recovery_mode = False
+
+        # Fire-and-forget: stop the JS recorder in the live browser.
+        # Done as a background task because this method is synchronous.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._stop_interaction_recording_safe(run.run_id))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Mark the step as resolved by the human.
+        step.status = StepStatus.human_recovered
+        step.message = "Manually recovered by user"
+        step.error = None
+        step.user_input_kind = None
+        step.user_input_prompt = None
+        step.ended_at = utc_now()
+
+        # Reset any downstream steps that were skipped because of this failure
+        # so they will run after the human-recovered step.
+        for subsequent in run.steps[step.index + 1:]:
+            if subsequent.status == StepStatus.skipped:
+                subsequent.status = StepStatus.pending
+                subsequent.message = None
+                subsequent.error = None
+
+        # Setting run.status = running causes the polling loop to detect the
+        # change on its next tick and exit waiting_for_input cleanly.
+        run.status = RunStatus.running
+        run.finished_at = None
+        self._run_store.persist(run)
+        LOGGER.info(
+            "Run %s step %d: human recovery confirmed — step=human_recovered,"
+            " run resumed",
+            run_id, step.index + 1,
+        )
         return run
 
     @classmethod
@@ -3195,6 +3499,28 @@ class AgentExecutor:
         except Exception:
             return None
 
+    async def _start_interaction_recording_safe(self, run_id: str) -> None:
+        """Inject the browser-side recovery recorder.  Non-fatal on any error."""
+        try:
+            await self._browser.start_interaction_recording(run_id)
+        except Exception as exc:
+            LOGGER.debug("Run %s: recovery recorder start failed (non-fatal): %s", run_id, exc)
+
+    async def _stop_interaction_recording_safe(self, run_id: str) -> None:
+        """Disable and clear the browser-side recovery recorder.  Non-fatal on any error."""
+        try:
+            await self._browser.stop_interaction_recording(run_id)
+        except Exception as exc:
+            LOGGER.debug("Run %s: recovery recorder stop failed (non-fatal): %s", run_id, exc)
+
+    async def _read_interactions_safe(self, run_id: str) -> list[dict]:
+        """Read and clear the browser interaction buffer.  Returns [] on any error."""
+        try:
+            return await self._browser.get_recorded_interactions(run_id)
+        except Exception as exc:
+            LOGGER.debug("Run %s: get_recorded_interactions failed (non-fatal): %s", run_id, exc)
+            return []
+
     async def _check_semantic_destination_state(
         self,
         before_snapshot: dict[str, Any] | None,
@@ -3297,6 +3623,173 @@ class AgentExecutor:
             "visible": bool(item.get("visible", True)),
             "enabled": bool(item.get("enabled", True)),
         }
+
+    @staticmethod
+    def _diff_recovery_snapshots(
+        baseline: dict[str, Any],
+        current: dict[str, Any],
+    ) -> list[str]:
+        """
+        Compare two inspect_page() snapshots taken during recovery mode and
+        return human-readable descriptions of any meaningful UI state changes.
+
+        Uses only snapshot fields confirmed present in interactive_elements:
+        url, title, role, visible.  Does not make additional browser API calls.
+        """
+        changes: list[str] = []
+
+        # 1. URL change
+        before_url = str(baseline.get("url", "")).strip()
+        after_url = str(current.get("url", "")).strip()
+        if before_url and after_url and before_url != after_url:
+            changes.append(f"page URL changed ({before_url!r} → {after_url!r})")
+
+        # 2. Page title change
+        before_title = str(baseline.get("title", "")).strip()
+        after_title = str(current.get("title", "")).strip()
+        if before_title and after_title and before_title != after_title:
+            changes.append(f"page title changed ({before_title!r} → {after_title!r})")
+
+        def _get_elements(snap: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
+                el for el in (snap.get("interactive_elements") or [])
+                if isinstance(el, dict)
+            ]
+
+        before_els = _get_elements(baseline)
+        after_els = _get_elements(current)
+
+        # 3. Dialog / modal appeared or closed
+        def _has_dialog(els: list[dict[str, Any]]) -> bool:
+            return any(
+                el.get("role") in {"dialog", "alertdialog"}
+                and el.get("visible", True)
+                for el in els
+            )
+
+        before_dialog = _has_dialog(before_els)
+        after_dialog = _has_dialog(after_els)
+        if not before_dialog and after_dialog:
+            changes.append("modal/dialog appeared")
+        elif before_dialog and not after_dialog:
+            changes.append("modal/dialog closed")
+
+        # 4. Visible interactive element count shifted by ≥ 3
+        # (catches form submissions, tab changes, drawer open/close, etc.)
+        before_visible = sum(1 for el in before_els if el.get("visible", True))
+        after_visible = sum(1 for el in after_els if el.get("visible", True))
+        delta = after_visible - before_visible
+        if abs(delta) >= 3:
+            direction = "appeared" if delta > 0 else "disappeared"
+            changes.append(
+                f"{abs(delta)} interactive elements {direction} "
+                f"(visible count: {before_visible} → {after_visible})"
+            )
+
+        return changes
+
+    @staticmethod
+    @staticmethod
+    def _normalize_interactions(events: list[dict]) -> list[dict]:
+        """Convert raw DOM event stream into a clean, deduplicated interaction sequence.
+
+        Rules:
+        - ``input`` events: buffer per (tag, name, type) field key — always overwrite
+          with the latest value so only the final typed value is kept.
+        - ``change`` events: supersede any pending input for the same field and are
+          emitted immediately (they represent the committed, stable value).
+        - ``click`` events: flush all pending inputs first (focus moved away), then
+          emit the click; consecutive identical clicks within 500 ms are deduplicated.
+        - Noise: HTML/BODY/DOCUMENT tags, empty-value inputs, and events with no
+          useful identity are dropped.
+        """
+        result: list[dict] = []
+        # field_key → latest buffered input event (not yet emitted)
+        pending_input: dict[tuple[str, str, str], dict] = {}
+        last_click_sig: tuple | None = None  # (tag, name, text, ts_bucket)
+
+        def _field_key(ev: dict) -> tuple[str, str, str]:
+            return (
+                (ev.get("tag") or "").upper(),
+                ev.get("name") or "",
+                (ev.get("type") or "").lower(),
+            )
+
+        def _flush_pending(except_key: tuple | None = None) -> None:
+            """Emit all pending input events, optionally skipping one key."""
+            for k in list(pending_input):
+                if k != except_key:
+                    result.append(pending_input.pop(k))
+
+        for ev in events:
+            kind = ev.get("kind", "")
+            tag = (ev.get("tag") or "").upper()
+
+            # Drop structural noise
+            if tag in ("HTML", "BODY", "DOCUMENT"):
+                continue
+
+            if kind == "input":
+                # Drop if no useful identity at all
+                if not (ev.get("name") or ev.get("label") or ev.get("placeholder")):
+                    continue
+                # Drop empty-value non-checkable inputs
+                if ev.get("value") is None and not ev.get("checked"):
+                    continue
+                # Overwrite — we only want the latest value for this field
+                pending_input[_field_key(ev)] = ev
+
+            elif kind == "change":
+                key = _field_key(ev)
+                # Change supersedes pending input for the same field
+                pending_input.pop(key, None)
+                result.append(ev)
+
+            elif kind == "click":
+                # Flush inputs for fields other than the clicked one (focus left them)
+                _flush_pending()
+                # Deduplicate consecutive identical clicks within 500 ms
+                ts = int(ev.get("timestamp") or 0)
+                sig = (tag, ev.get("name") or "", (ev.get("text") or "").strip(), ts // 500)
+                if sig != last_click_sig:
+                    result.append(ev)
+                    last_click_sig = sig
+
+            else:
+                # navigate or other kinds — flush and pass through
+                _flush_pending()
+                result.append(ev)
+
+        # Flush remaining pending inputs at end of stream
+        _flush_pending()
+        return result
+
+    @staticmethod
+    def _build_recovery_confirm_prompt(interactions: list[dict]) -> str:
+        """Build a human-readable confirmation prompt for the detected interactions."""
+        def _describe(ev: dict) -> str:
+            kind = ev.get("kind", "action")
+            # Build a human-readable target description using the richest field available.
+            label = ev.get("label") or ev.get("placeholder") or ev.get("name")
+            text  = (ev.get("text") or "").strip()
+            tag   = ev.get("tag") or "?"
+            role  = ev.get("role") or ""
+            target = label or text or (f"{role} {tag}".strip() if role else tag)
+            if kind == "click":
+                return f"- clicked {target!r}"
+            if kind == "type":
+                return f"- typed into {target!r}"
+            if kind == "toggle":
+                state = "checked" if ev.get("checked") else "unchecked"
+                return f"- {state} {target!r}"
+            return f"- {kind} on {target!r}"
+
+        lines = [_describe(ev) for ev in interactions[:10]]
+        summary = "\n".join(lines) if lines else "(no detail available)"
+        return (
+            f"Detected {len(interactions)} interaction(s) in the browser:\n{summary}\n\n"
+            "Confirm these are the correct actions for this step to continue and save for future use."
+        )
 
     def _summarize_page_state(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(snapshot, dict):

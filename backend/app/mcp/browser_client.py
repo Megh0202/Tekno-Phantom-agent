@@ -52,6 +52,213 @@ except ImportError:  # pragma: no cover - optional dependency in non-MCP mode
     stdio_client = None
 
 LOGGER = logging.getLogger("tekno.phantom.browser")
+
+# ---------------------------------------------------------------------------
+# Recovery recorder lifecycle scripts
+# ---------------------------------------------------------------------------
+# Injected into every live page AND every child frame during recovery_mode.
+# Also re-injected automatically on every frame navigation so auth redirects
+# and SPA hard-navigations do not silently drop the listener.
+#
+# Guarded by window.__phantomRecording so re-injection after a navigation
+# (new document = guard is gone) works correctly.
+#
+# Cross-frame strategy:
+#   The top-level window owns window.__phantomInteractions.
+#   Child frames push into window.top.__phantomInteractions.
+#   If window.top is cross-origin, the frame initialises its own local buffer
+#   as a fallback so events are not silently lost.
+#
+# Diagnostics (all readable from DevTools console/variables):
+#   window.__phantomClickCount        — every click, trusted or not
+#   window.__phantomTrustedClickCount — trusted clicks only (real user gestures)
+#   window.__phantomClickHandler      — named handler for inspection
+_RECOVERY_RECORDER_SCRIPT: str = """\
+(function () {
+    if (window.__phantomRecording === true) { return; }
+    window.__phantomRecording = true;
+    window.__phantomClickCount = 0;
+
+    if (window === window.top) {
+        window.__phantomInteractions = [];
+    }
+
+    // Null-safe string helper: coerce to string, trim, truncate.
+    function _s(val, max) {
+        try { return ((val || "") + "").trim().slice(0, max); }
+        catch (_) { return ""; }
+    }
+
+    function _phantomOnClick(e) {
+        window.__phantomClickCount++;
+        if (!e.isTrusted) { return; }
+        try {
+            var el   = e.target;
+            // Skip structural root elements — they are never meaningful replay targets.
+            var _tag = (el.tagName || "").toUpperCase();
+            if (_tag === "HTML" || _tag === "BODY" || _tag === "DOCUMENT") { return; }
+
+            // Fix 1 — Icon/SVG clicks: when the direct target is a presentational
+            // element (SVG, PATH, I, USE, G) with no identity, walk up to the
+            // nearest interactive ancestor so we capture its label/text instead.
+            var _ICON_TAGS = { "SVG": 1, "PATH": 1, "I": 1, "USE": 1, "G": 1 };
+            if (_ICON_TAGS[_tag]) {
+                var _up = el.parentElement;
+                var _depth = 0;
+                while (_up && _depth < 6) {
+                    var _upTag  = (_up.tagName || "").toUpperCase();
+                    var _upRole = _s(_up.getAttribute ? _up.getAttribute("role") : "", 32);
+                    if (_upTag === "BUTTON" || _upTag === "A"
+                            || _upRole === "button" || _upRole === "link") {
+                        el = _up;
+                        break;
+                    }
+                    _up = _up.parentElement;
+                    _depth++;
+                }
+            }
+
+            var tag   = _s(el.tagName, 16).toUpperCase();
+            var itype = _s(el.type, 32).toLowerCase();
+            var role  = _s(el.getAttribute ? el.getAttribute("role") : "", 64)
+                        || _s(el.role, 64);
+            var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
+            var ph    = _s(el.placeholder, 128);
+            var name  = _s(el.name, 64);
+
+            // Fix 2 — Dropdown/menu option clicks: capture visible text for
+            // selectable items (LI, OPTION, role=option/menuitem/tab/treeitem)
+            // in addition to the existing BUTTON/A/LABEL set.
+            var _TEXT_ROLES = {
+                "option": 1, "menuitem": 1, "menuitemcheckbox": 1,
+                "menuitemradio": 1, "tab": 1, "treeitem": 1
+            };
+            var text = (tag === "BUTTON" || tag === "A" || tag === "LABEL"
+                        || tag === "LI"  || tag === "OPTION"
+                        || !!_TEXT_ROLES[role])
+                ? _s((el.textContent || "").replace(/\\s+/g, " "), 80)
+                : "";
+
+            var isCheckable = (tag === "INPUT"
+                && (itype === "checkbox" || itype === "radio"));
+
+            _push({
+                kind:        "click",
+                tag:         tag,
+                type:        itype  || undefined,
+                role:        role   || undefined,
+                label:       label  || undefined,
+                placeholder: ph     || undefined,
+                name:        name   || undefined,
+                text:        text   || undefined,
+                checked:     isCheckable ? !!el.checked : undefined,
+                url:         _s(window.location.href, 512),
+                timestamp:   Date.now(),
+                fingerprint: {
+                    tag:         tag,
+                    role:        role   || undefined,
+                    label:       label  || undefined,
+                    placeholder: ph     || undefined
+                }
+            });
+        } catch (err) {
+            console.debug("[phantom] capture error:", err.message || String(err));
+        }
+    }
+
+    // ---- shared buffer push ----
+    function _push(entry) {
+        var buf = null;
+        try { buf = window.top.__phantomInteractions; } catch (_cx) {}
+        if (!buf) {
+            if (!window.__phantomInteractions) { window.__phantomInteractions = []; }
+            buf = window.__phantomInteractions;
+        }
+        buf.push(entry);
+        console.debug("[phantom] captured", JSON.stringify(entry));
+    }
+
+    // ---- shared value-event builder ----
+    function _valueEntry(el, kind) {
+        var tag   = _s(el.tagName, 16).toUpperCase();
+        var itype = _s(el.type, 32).toLowerCase();
+        var isCheckable = (itype === "checkbox" || itype === "radio");
+        var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
+        var ph    = _s(el.placeholder, 128);
+        // Resolve visible label text via <label for=id> or wrapping <label>.
+        if (!label && el.id) {
+            try {
+                var lbl = document.querySelector("label[for='" + el.id + "']");
+                if (lbl) { label = _s((lbl.textContent || "").replace(/\\s+/g, " "), 80); }
+            } catch (_) {}
+        }
+        if (!label) {
+            try {
+                var closest = el.closest ? el.closest("label") : null;
+                if (closest) { label = _s((closest.textContent || "").replace(/\\s+/g, " "), 80); }
+            } catch (_) {}
+        }
+        return {
+            kind:        kind,
+            tag:         tag,
+            type:        itype  || undefined,
+            name:        _s(el.name, 64) || undefined,
+            role:        _s(el.getAttribute ? el.getAttribute("role") : "", 64) || undefined,
+            label:       label  || undefined,
+            placeholder: ph     || undefined,
+            value:       isCheckable    ? undefined
+                         : itype === "password" ? "[REDACTED]"
+                         : _s(el.value, 256) || undefined,
+            checked:     isCheckable ? !!el.checked : undefined,
+            url:         _s(window.location.href, 512),
+            timestamp:   Date.now()
+        };
+    }
+
+    // ---- input (debounced 500ms per element) ----
+    function _phantomOnInput(e) {
+        if (!e.isTrusted) { return; }
+        var el = e.target;
+        var tag = (el.tagName || "").toUpperCase();
+        if (tag === "HTML" || tag === "BODY") { return; }
+        if (el.__phantomTimer) { clearTimeout(el.__phantomTimer); }
+        el.__phantomTimer = setTimeout(function () {
+            el.__phantomTimer = null;
+            try { _push(_valueEntry(el, "input")); }
+            catch (err) { console.debug("[phantom] input error:", String(err)); }
+        }, 500);
+    }
+
+    // ---- change (fires once on commit: blur, checkbox toggle, select pick) ----
+    function _phantomOnChange(e) {
+        if (!e.isTrusted) { return; }
+        var el = e.target;
+        var tag = (el.tagName || "").toUpperCase();
+        if (tag === "HTML" || tag === "BODY") { return; }
+        // Cancel any pending debounced input — change supersedes it.
+        if (el.__phantomTimer) { clearTimeout(el.__phantomTimer); el.__phantomTimer = null; }
+        try { _push(_valueEntry(el, "change")); }
+        catch (err) { console.debug("[phantom] change error:", String(err)); }
+    }
+
+    window.__phantomClickHandler = _phantomOnClick;
+    document.addEventListener("click",  _phantomOnClick,  true);
+    document.addEventListener("input",  _phantomOnInput,  true);
+    document.addEventListener("change", _phantomOnChange, true);
+    console.debug("[phantom] recorder active url=" + window.location.href);
+})();
+"""
+
+# Injected when recovery_mode exits (success, timeout, or cancellation).
+_RECOVERY_RECORDER_TEARDOWN_SCRIPT: str = """\
+(function () {
+    window.__phantomRecording = false;
+    window.__phantomClickCount = 0;
+    window.__phantomClickHandler = null;
+    if (window === window.top) { window.__phantomInteractions = []; }
+})();
+"""
+
 _MOCK_SCREENSHOT_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5xY4kAAAAASUVORK5CYII="
 )
@@ -288,6 +495,16 @@ class BrowserMCPClient:
     def get_live_page(self) -> Any | None:
         return None
 
+    async def start_interaction_recording(self, run_id: str) -> None:
+        """No-op on the mock client."""
+
+    async def get_recorded_interactions(self, run_id: str) -> list[dict]:
+        """No-op on the mock client — always returns empty."""
+        return []
+
+    async def stop_interaction_recording(self, run_id: str) -> None:
+        """No-op on the mock client."""
+
 
 @dataclass
 class _PlaywrightRunContext:
@@ -310,6 +527,13 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         self._runs: dict[str, _PlaywrightRunContext] = {}
         self._lock = asyncio.Lock()
         self._current_run_id: ContextVar[str | None] = ContextVar("browser_run_id", default=None)
+        # Per-run list of (page, handler) pairs registered for framenavigated events.
+        # Stored so stop_interaction_recording can remove them cleanly.
+        self._frame_nav_handlers: dict[str, list[tuple[Any, Any]]] = {}
+        # Per-run list of (page, handler) pairs registered for console events.
+        # Forwards [phantom-min] browser console.log lines to Python LOGGER so
+        # verification is visible in server logs without needing DevTools/VNC.
+        self._console_handlers: dict[str, list[tuple[Any, Any]]] = {}
 
     async def start_run(self, run: RunState) -> None:
         run_id = run.run_id
@@ -1997,6 +2221,225 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             raise RuntimeError(f"No browser session exists for run_id={run_id}")
         return context
 
+    def _live_pages_for_run(self, run_id: str) -> list[Any]:
+        """Return every non-closed Playwright Page for this run's browser context.
+
+        The stored context.page is kept in sync with new-tab clicks (see the
+        click() implementation), but the browser context can hold additional
+        pages opened via popups or by the user.  Injecting into all of them
+        ensures the recorder is present on whichever tab is currently visible.
+        Falls back to [context.page] when context.pages is unavailable.
+        """
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            return []
+        try:
+            all_pages = list(run_context.context.pages)
+        except Exception:
+            all_pages = [run_context.page]
+        live = [p for p in all_pages if not p.is_closed()]
+        return live if live else [run_context.page]
+
+    @staticmethod
+    async def _inject_into_frames(page: Any, script: str, run_id: str, label: str) -> None:
+        """Evaluate *script* in the main frame and every non-detached child frame.
+
+        page.evaluate() only reaches the main frame.  Apps that render inside
+        iframes (e.g. embedded widgets, shadow-DOM portals) would otherwise
+        never fire on the parent document listener.  We inject into all frames
+        so the recorder is active wherever the user clicks.
+        """
+        # Main frame — page.evaluate() targets this directly.
+        await page.evaluate(script)
+        # Child frames — iterate page.frames (index 0 is the main frame).
+        try:
+            for frame in page.frames[1:]:
+                if frame.is_detached():
+                    continue
+                try:
+                    await frame.evaluate(script)
+                    LOGGER.debug(
+                        "Run %s: %s child frame url=%r", run_id, label, frame.url,
+                    )
+                except Exception as frame_exc:
+                    LOGGER.debug(
+                        "Run %s: %s child frame failed url=%r: %s",
+                        run_id, label, frame.url, frame_exc,
+                    )
+        except Exception:
+            pass  # page.frames unavailable — main frame injection already done
+
+    async def start_interaction_recording(self, run_id: str) -> None:
+        """Inject the recovery recorder into every live page and frame for this run.
+
+        Covers all non-closed pages in the browser context AND all child frames
+        within each page, so the recorder is active wherever the user clicks.
+
+        Also registers a framenavigated handler on each page so the recorder is
+        automatically re-injected after auth redirects and SPA hard navigations
+        (which replace the document, wiping any previously attached listeners).
+
+        Injection is idempotent — the script guard prevents duplicate setup on
+        frames that did NOT navigate.
+        """
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            LOGGER.debug("Run %s: recovery recorder — no browser context found, skipping", run_id)
+            return
+
+        # Clean up any stale handlers from a previous recording session.
+        self._remove_frame_nav_handlers(run_id)
+        self._remove_console_handlers(run_id)
+        self._frame_nav_handlers[run_id] = []
+        self._console_handlers[run_id] = []
+
+        pages = self._live_pages_for_run(run_id)
+        LOGGER.debug(
+            "Run %s: recovery recorder — injecting into %d live page(s)",
+            run_id, len(pages),
+        )
+        for page in pages:
+            try:
+                page_url = page.url
+                frame_count = len(page.frames)
+                LOGGER.debug(
+                    "Run %s: recovery recorder — targeting page url=%r closed=%s frames=%d",
+                    run_id, page_url, page.is_closed(), frame_count,
+                )
+                await self._inject_into_frames(
+                    page, _RECOVERY_RECORDER_SCRIPT, run_id, "recorder injected into"
+                )
+                # Verify globals are visible on the main frame.
+                verify = await page.evaluate(
+                    "({ recording: window.__phantomRecording,"
+                    "   interactionsReady: !!window.__phantomInteractions })"
+                )
+                LOGGER.info(
+                    "Run %s: recovery recorder injected — url=%r frames=%d"
+                    " recording=%s interactionsReady=%s",
+                    run_id, page_url, frame_count,
+                    verify.get("recording"),
+                    verify.get("interactionsReady"),
+                )
+
+                # Register a framenavigated listener so the recorder is re-injected
+                # whenever any frame in this page navigates to a new document.
+                # This handles: auth redirects, login page → dashboard transitions,
+                # and any hard navigation that replaces the document object.
+                def _make_nav_handler(p: Any, r_id: str) -> Any:
+                    async def _on_frame_navigated(frame: Any) -> None:
+                        if p.is_closed():
+                            return
+                        try:
+                            await frame.evaluate(_RECOVERY_RECORDER_SCRIPT)
+                            LOGGER.debug(
+                                "Run %s: recovery recorder re-injected after navigation"
+                                " frame url=%r",
+                                r_id, frame.url,
+                            )
+                        except Exception as nav_exc:
+                            LOGGER.debug(
+                                "Run %s: recorder re-injection on nav failed"
+                                " frame url=%r: %s",
+                                r_id, getattr(frame, "url", "?"), nav_exc,
+                            )
+                    return _on_frame_navigated
+
+                handler = _make_nav_handler(page, run_id)
+                page.on("framenavigated", handler)
+                self._frame_nav_handlers[run_id].append((page, handler))
+                LOGGER.debug(
+                    "Run %s: framenavigated re-injection handler registered for page url=%r",
+                    run_id, page_url,
+                )
+
+                # Forward browser console.log("[phantom-min] ...") lines to Python
+                # LOGGER so the verification output is visible in server logs without
+                # needing to open DevTools or a VNC session.
+                def _make_console_handler(r_id: str) -> Any:
+                    def _on_console(msg: Any) -> None:
+                        text = msg.text if hasattr(msg, "text") else str(msg)
+                        if "[phantom" in text or "PHANTOM" in text:
+                            LOGGER.info("Run %s [browser] %s", r_id, text)
+                    return _on_console
+
+                console_handler = _make_console_handler(run_id)
+                page.on("console", console_handler)
+                self._console_handlers[run_id].append((page, console_handler))
+            except Exception as exc:
+                LOGGER.debug(
+                    "Run %s: recovery recorder injection failed on page url=%r (non-fatal): %s",
+                    run_id, getattr(page, "url", "unknown"), exc,
+                )
+
+    async def get_recorded_interactions(self, run_id: str) -> list[dict]:
+        """Read and clear the interaction buffer from the top-level window.
+
+        Uses splice(0) so the buffer is read atomically and cleared in one call,
+        preventing duplicate delivery of events across poll ticks.
+        """
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            return []
+        page = run_context.page
+        if page is None or page.is_closed():
+            return []
+        try:
+            result = await page.evaluate("(window.__phantomInteractions || []).splice(0)")
+            if isinstance(result, list):
+                return result
+        except Exception as exc:
+            LOGGER.debug(
+                "Run %s: get_recorded_interactions failed (non-fatal): %s", run_id, exc
+            )
+        return []
+
+    async def stop_interaction_recording(self, run_id: str) -> None:
+        """Disable and clear the recovery recorder on every live page and frame.
+
+        Also removes the framenavigated and console handlers registered by
+        start_interaction_recording so they do not fire after the pause ends.
+        """
+        # Remove event handlers first so they don't fire during teardown.
+        self._remove_frame_nav_handlers(run_id)
+        self._remove_console_handlers(run_id)
+
+        pages = self._live_pages_for_run(run_id)
+        for page in pages:
+            if page.is_closed():
+                continue
+            try:
+                await self._inject_into_frames(
+                    page, _RECOVERY_RECORDER_TEARDOWN_SCRIPT, run_id, "recorder cleaned up in"
+                )
+                LOGGER.debug(
+                    "Run %s: recovery recorder cleaned up on page url=%r",
+                    run_id, page.url,
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "Run %s: recovery recorder cleanup failed on page url=%r (non-fatal): %s",
+                    run_id, getattr(page, "url", "unknown"), exc,
+                )
+
+    def _remove_frame_nav_handlers(self, run_id: str) -> None:
+        """Remove all framenavigated re-injection handlers registered for this run."""
+        handlers = self._frame_nav_handlers.pop(run_id, [])
+        for page, handler in handlers:
+            try:
+                page.remove_listener("framenavigated", handler)
+            except Exception:
+                pass  # page may already be closed — safe to ignore
+
+    def _remove_console_handlers(self, run_id: str) -> None:
+        """Remove all console forwarding handlers registered for this run."""
+        handlers = self._console_handlers.pop(run_id, [])
+        for page, handler in handlers:
+            try:
+                page.remove_listener("console", handler)
+            except Exception:
+                pass  # page may already be closed — safe to ignore
+
     @staticmethod
     def _image_delta_ratio(baseline_bytes: bytes, current_bytes: bytes) -> float:
         return image_delta_ratio(baseline_bytes, current_bytes)
@@ -3506,6 +3949,61 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
         if not match:
             return text.strip()
         return match.group(1).strip()
+
+    async def start_interaction_recording(self, run_id: str) -> None:
+        """Inject the recovery recorder into the MCP-managed page for this run.
+
+        Uses browser_run_code via the run's MCP session directly, bypassing
+        the ContextVar so it is safe to call from any async context.
+        """
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            return
+        try:
+            await self._call_tool(run_context, "browser_run_code", {"code": _RECOVERY_RECORDER_SCRIPT})
+            LOGGER.debug("Run %s: recovery recorder injected into page (MCP)", run_id)
+        except Exception as exc:
+            LOGGER.debug("Run %s: recovery recorder injection failed (MCP, non-fatal): %s", run_id, exc)
+
+    async def get_recorded_interactions(self, run_id: str) -> list[dict]:
+        """Read and clear the interaction buffer via MCP browser_run_code.
+
+        Returns parsed list of interaction dicts, or [] on any error.
+        """
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            return []
+        try:
+            result = await self._call_tool(
+                run_context,
+                "browser_run_code",
+                {"code": "JSON.stringify((window.__phantomInteractions || []).splice(0))"},
+            )
+            # _call_tool returns a string; result may be the JSON array string
+            raw = result if isinstance(result, str) else ""
+            # Strip any MCP result wrapper (e.g. "### Result\n[...]")
+            import json as _json
+            bracket = raw.find("[")
+            if bracket != -1:
+                parsed = _json.loads(raw[bracket:])
+                if isinstance(parsed, list):
+                    return parsed
+        except Exception as exc:
+            LOGGER.debug(
+                "Run %s: get_recorded_interactions failed (MCP, non-fatal): %s", run_id, exc
+            )
+        return []
+
+    async def stop_interaction_recording(self, run_id: str) -> None:
+        """Disable and clear the recovery recorder from the MCP-managed page."""
+        run_context = self._runs.get(run_id)
+        if run_context is None:
+            return
+        try:
+            await self._call_tool(run_context, "browser_run_code", {"code": _RECOVERY_RECORDER_TEARDOWN_SCRIPT})
+            LOGGER.debug("Run %s: recovery recorder cleaned up (MCP)", run_id)
+        except Exception as exc:
+            LOGGER.debug("Run %s: recovery recorder cleanup failed (MCP, non-fatal): %s", run_id, exc)
 
 
 def build_browser_client(

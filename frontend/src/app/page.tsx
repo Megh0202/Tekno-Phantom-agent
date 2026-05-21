@@ -36,6 +36,7 @@ type RuntimeStep = {
   failure_selector_suggestions?: string[] | null;
   user_input_kind?: string | null;
   user_input_prompt?: string | null;
+  pending_recovery_interactions?: unknown[] | null;
 };
 
 type RunState = {
@@ -332,6 +333,7 @@ export default function Home() {
   const [currentRunSourceTestCaseId, setCurrentRunSourceTestCaseId] = useState<string | null>(null);
   const [selectorFixInputs, setSelectorFixInputs] = useState<Record<string, string>>({});
   const [selectorFixBusyByStepId, setSelectorFixBusyByStepId] = useState<Record<string, boolean>>({});
+  const [recoveryConfirmBusyByStepId, setRecoveryConfirmBusyByStepId] = useState<Record<string, boolean>>({});
   const [selectorInputCountdown, setSelectorInputCountdown] = useState<number | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [requestInfo, setRequestInfo] = useState<string | null>(null);
@@ -1546,6 +1548,35 @@ export default function Home() {
     }
   }
 
+  async function confirmHumanRecovery(step: RuntimeStep): Promise<void> {
+    if (!currentRun) {
+      setRequestError("No active run context found.");
+      return;
+    }
+    setRequestError(null);
+    setRequestInfo(null);
+    setRecoveryConfirmBusyByStepId((previous) => ({ ...previous, [step.step_id]: true }));
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/runs/${currentRun.run_id}/steps/${step.step_id}/recovery-confirm`,
+        {
+          method: "POST",
+          headers: buildApiHeaders({ adminToken: ADMIN_API_TOKEN }),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const run = (await response.json()) as RunState;
+      setCurrentRun(run);
+      setRequestInfo(`Step #${step.index + 1} marked as completed. Run continuing.`);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Failed to confirm recovery");
+    } finally {
+      setRecoveryConfirmBusyByStepId((previous) => ({ ...previous, [step.step_id]: false }));
+    }
+  }
+
   function toggleFolderExpanded(folderId: string): void {
     setExpandedFolderIds((previous) => ({
       ...previous,
@@ -2396,6 +2427,31 @@ export default function Home() {
                             </div>
                           </div>
                         ) : null}
+                      </div>
+                    ) : null}
+                    {step.status === "waiting_for_input" && step.pending_recovery_interactions && step.pending_recovery_interactions.length > 0 ? (
+                      <div className={styles.selectorFixBox}>
+                        <p className={styles.selectorFixTitle}>
+                          Human Recovery
+                          {selectorInputCountdown !== null && selectorInputCountdown > 0 && (
+                            <span style={{ marginLeft: 8, fontSize: "0.8em", color: selectorInputCountdown <= 10 ? "#ff4444" : "#f5a623", fontWeight: "normal" }}>
+                              — closes in {selectorInputCountdown}s
+                            </span>
+                          )}
+                        </p>
+                        <p className={styles.selectorFixHint}>
+                          {step.user_input_prompt ?? "The agent detected your browser actions. Did you complete this step?"}
+                        </p>
+                        <div className={styles.selectorFixRow}>
+                          <button
+                            type="button"
+                            className={styles.secondaryButton}
+                            onClick={() => void confirmHumanRecovery(step)}
+                            disabled={Boolean(recoveryConfirmBusyByStepId[step.step_id])}
+                          >
+                            {recoveryConfirmBusyByStepId[step.step_id] ? "Confirming..." : "Yes, I completed this step"}
+                          </button>
+                        </div>
                       </div>
                     ) : null}
                     {(step.status === "failed" || step.status === "waiting_for_input") && editableSelectorField(step) ? (

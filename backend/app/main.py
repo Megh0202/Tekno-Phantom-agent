@@ -1459,6 +1459,32 @@ def build_app() -> FastAPI:
         background_tasks.add_task(_execute_and_persist_selector, run.run_id, step_id)
         return run_store.get(run.run_id) or run
 
+    @app.post(
+        "/api/runs/{run_id}/steps/{step_id}/recovery-confirm",
+        response_model=RunState,
+    )
+    async def confirm_step_recovery(
+        run_id: str,
+        step_id: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> RunState:
+        """Confirm that the human's browser actions resolved the failed step.
+
+        Only valid when the step is in waiting_for_input with
+        user_input_kind == "recovery_confirm".  Sets the step to
+        human_recovered and resumes the run.
+        """
+        existing = run_store.get(run_id)
+        if existing is None or not _can_access_owned_resource(actor, existing.user_id):
+            raise HTTPException(status_code=404, detail="Run or step not found")
+        try:
+            run = executor.apply_human_recovery_confirmation(run_id, step_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run or step not found")
+        return run_store.get(run.run_id) or run
+
     @app.post("/api/plan", response_model=PlanGenerateResponse)
     async def generate_plan(
         request: PlanGenerateRequest,
