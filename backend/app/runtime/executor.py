@@ -2680,10 +2680,19 @@ class AgentExecutor:
 
         # Fire-and-forget: stop the JS recorder in the live browser.
         # Done as a background task because this method is synchronous.
+        # Guard: only stop if recovery_mode is still False at execution time —
+        # a subsequent step may have already re-entered recovery and re-injected
+        # the recorder before this task runs.  Stopping it then would silently
+        # wipe the new session's recorder.
+        _run_id_for_stop = run.run_id
+        async def _guarded_stop() -> None:
+            _current = self._run_store.get(_run_id_for_stop)
+            if _current is None or not _current.recovery_mode:
+                await self._stop_interaction_recording_safe(_run_id_for_stop)
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                loop.create_task(self._stop_interaction_recording_safe(run.run_id))
+                loop.create_task(_guarded_stop())
         except Exception:  # noqa: BLE001
             pass
 

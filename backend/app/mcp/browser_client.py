@@ -83,40 +83,68 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
         window.__phantomInteractions = [];
     }
 
+    // Timestamp of the last real human click (isTrusted=true).
+    // Used in _phantomOnChange to accept framework-generated follow-up
+    // change events that originate from a real human gesture.
+    var _lastTrustedClickMs = 0;
+
     // Null-safe string helper: coerce to string, trim, truncate.
     function _s(val, max) {
         try { return ((val || "") + "").trim().slice(0, max); }
         catch (_) { return ""; }
     }
 
+    // ---- generic interactive target resolver ----
+    // Starting from a raw DOM element (e.g. e.target, which is always the
+    // deepest/innermost leaf), walk up to the nearest element that carries
+    // genuine interactive semantics.  This handles cases like:
+    //   <button><svg><path>...</path></svg></button>  → resolves to BUTTON
+    //   <div role="option"><span>Text</span></div>    → resolves to the DIV[option]
+    //   <li role="menuitem">...</li>                  → already meaningful, returned as-is
+    // Max traversal depth is 6 to avoid climbing into unrelated page structure.
+    function _resolveTarget(el) {
+        var _NATIVE = { "INPUT":1, "BUTTON":1, "SELECT":1, "TEXTAREA":1, "A":1 };
+        var _ROLES  = {
+            "button":1, "link":1, "checkbox":1, "radio":1,
+            "option":1, "menuitem":1, "menuitemcheckbox":1, "menuitemradio":1,
+            "tab":1, "switch":1, "combobox":1, "textbox":1
+            // "listbox" intentionally excluded — it is a container role (holds all
+            // options).  Walking up to it captures the whole list, not the clicked
+            // option.  The clicked option <div> stays as the resolved target so the
+            // text fallback can read its short individual label instead.
+        };
+        function _meaningful(node) {
+            if (!node || !node.tagName) { return false; }
+            if (_NATIVE[node.tagName.toUpperCase()]) { return true; }
+            var r = _s(node.getAttribute ? node.getAttribute("role") : "", 64);
+            return !!_ROLES[r];
+        }
+        if (_meaningful(el)) { return el; }
+        var _up = el.parentElement;
+        var _d  = 0;
+        while (_up && _d < 6) {
+            if (_meaningful(_up)) { return _up; }
+            _up = _up.parentElement;
+            _d++;
+        }
+        return el;  // no meaningful ancestor — use the original
+    }
+
     function _phantomOnClick(e) {
         window.__phantomClickCount++;
         if (!e.isTrusted) { return; }
+        // Record the timestamp of this real human click so _phantomOnChange
+        // can accept framework follow-up events within the trust window.
+        _lastTrustedClickMs = Date.now();
         try {
-            var el   = e.target;
-            // Skip structural root elements — they are never meaningful replay targets.
-            var _tag = (el.tagName || "").toUpperCase();
-            if (_tag === "HTML" || _tag === "BODY" || _tag === "DOCUMENT") { return; }
+            // Skip structural root elements before any resolution.
+            var _rawTag = (e.target.tagName || "").toUpperCase();
+            if (_rawTag === "HTML" || _rawTag === "BODY" || _rawTag === "DOCUMENT") { return; }
 
-            // Fix 1 — Icon/SVG clicks: when the direct target is a presentational
-            // element (SVG, PATH, I, USE, G) with no identity, walk up to the
-            // nearest interactive ancestor so we capture its label/text instead.
-            var _ICON_TAGS = { "SVG": 1, "PATH": 1, "I": 1, "USE": 1, "G": 1 };
-            if (_ICON_TAGS[_tag]) {
-                var _up = el.parentElement;
-                var _depth = 0;
-                while (_up && _depth < 6) {
-                    var _upTag  = (_up.tagName || "").toUpperCase();
-                    var _upRole = _s(_up.getAttribute ? _up.getAttribute("role") : "", 32);
-                    if (_upTag === "BUTTON" || _upTag === "A"
-                            || _upRole === "button" || _upRole === "link") {
-                        el = _up;
-                        break;
-                    }
-                    _up = _up.parentElement;
-                    _depth++;
-                }
-            }
+            // Resolve the nearest meaningful interactive ancestor so that clicks on
+            // nested presentational elements (SVG icons, SPAN wrappers, etc.) are
+            // attributed to the correct interactive element.
+            var el = _resolveTarget(e.target);
 
             var tag   = _s(el.tagName, 16).toUpperCase();
             var itype = _s(el.type, 32).toLowerCase();
@@ -126,18 +154,28 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
             var ph    = _s(el.placeholder, 128);
             var name  = _s(el.name, 64);
 
-            // Fix 2 — Dropdown/menu option clicks: capture visible text for
-            // selectable items (LI, OPTION, role=option/menuitem/tab/treeitem)
-            // in addition to the existing BUTTON/A/LABEL set.
+            // Capture visible text for elements whose text content is their
+            // primary identity: buttons, links, labels, list items, native
+            // options, and ARIA selectable roles (option, menuitem, tab, etc.).
             var _TEXT_ROLES = {
-                "option": 1, "menuitem": 1, "menuitemcheckbox": 1,
-                "menuitemradio": 1, "tab": 1, "treeitem": 1
+                "option":1, "menuitem":1, "menuitemcheckbox":1,
+                "menuitemradio":1, "tab":1, "treeitem":1
             };
             var text = (tag === "BUTTON" || tag === "A" || tag === "LABEL"
                         || tag === "LI"  || tag === "OPTION"
                         || !!_TEXT_ROLES[role])
                 ? _s((el.textContent || "").replace(/\\s+/g, " "), 80)
                 : "";
+
+            // Generic visible-text fallback: if no identity was captured above,
+            // try the element's own textContent.  Only use it when the FULL
+            // text is short enough to be a label rather than a content block
+            // (e.g. a dropdown option "Enter options manually" passes, but a
+            // container div holding all options at once does not).
+            if (!text && !label && !name) {
+                var _rawFull = ((el.textContent || "").replace(/\\s+/g, " ")).trim();
+                if (_rawFull && _rawFull.length <= 60) { text = _rawFull; }
+            }
 
             var isCheckable = (tag === "INPUT"
                 && (itype === "checkbox" || itype === "radio"));
@@ -231,7 +269,14 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
 
     // ---- change (fires once on commit: blur, checkbox toggle, select pick) ----
     function _phantomOnChange(e) {
-        if (!e.isTrusted) { return; }
+        // Accept if:
+        //   1. isTrusted=true  — direct human gesture on a native element, OR
+        //   2. fired within 300ms of the last trusted click — framework-generated
+        //      follow-up event (Vue/React synthetic change after human selection).
+        // This preserves the human-only protection while allowing legitimate
+        // framework events that originate from real human interaction.
+        var _withinTrustWindow = (Date.now() - _lastTrustedClickMs) <= 300;
+        if (!e.isTrusted && !_withinTrustWindow) { return; }
         var el = e.target;
         var tag = (el.tagName || "").toUpperCase();
         if (tag === "HTML" || tag === "BODY") { return; }
@@ -241,10 +286,113 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
         catch (err) { console.debug("[phantom] change error:", String(err)); }
     }
 
+    // ---- mousedown — early-capture fallback for blur-close dropdowns ----
+    // Vue/React dropdowns remove option elements from the DOM between mousedown
+    // and click (blur on the trigger fires first, framework tears down the list).
+    // click therefore never fires on the option.  mousedown fires before blur
+    // and captures the element while it still exists.
+    //
+    // Constraints:
+    //   1. Only capture elements that look like interactive options/menu items —
+    //      not generic containers, resize handles, or text-selection surfaces.
+    //   2. Store a signature of what mousedown captured.  If click later arrives
+    //      for the same element within 300ms, click is preferred and mousedown
+    //      is discarded (by flagging it as superseded).
+    //   3. If click never arrives (blur-close race), the mousedown entry stands.
+    //   4. isTrusted guard still applies — agent actions are always blocked.
+    var _lastMousedownEntry  = null;  // {sig, timestamp, entry} — pending dedup
+    var _MOUSEDOWN_ROLES = {
+        "option":1, "menuitem":1, "menuitemcheckbox":1,
+        "menuitemradio":1, "tab":1, "treeitem":1
+    };
+
+    function _phantomOnMousedown(e) {
+        if (!e.isTrusted) { return; }
+        try {
+            var _rawTag = (e.target.tagName || "").toUpperCase();
+            if (_rawTag === "HTML" || _rawTag === "BODY" || _rawTag === "DOCUMENT") { return; }
+
+            var el   = _resolveTarget(e.target);
+            var tag  = _s(el.tagName, 16).toUpperCase();
+            var role = _s(el.getAttribute ? el.getAttribute("role") : "", 64)
+                       || _s(el.role, 64);
+
+            // Only capture elements that are plausible dropdown/menu options.
+            // Skip native interactive elements (INPUT, BUTTON, SELECT, TEXTAREA, A)
+            // — click fires reliably on those so mousedown is not needed.
+            var _nativeTag = { "INPUT":1, "BUTTON":1, "SELECT":1, "TEXTAREA":1, "A":1 };
+            if (_nativeTag[tag]) { return; }
+
+            // Must have a meaningful role OR short visible text to qualify.
+            var _hasRole = !!_MOUSEDOWN_ROLES[role];
+            var _rawText = ((el.textContent || "").replace(/\\s+/g, " ")).trim();
+            var _hasText = (_rawText && _rawText.length <= 60);
+            if (!_hasRole && !_hasText) { return; }
+
+            var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
+            var name  = _s(el.name, 64);
+            var text  = _hasRole
+                ? _s(_rawText, 80)
+                : (!label && !name ? _rawText : "");
+
+            var _entry = {
+                kind:        "click",
+                tag:         tag,
+                role:        role  || undefined,
+                label:       label || undefined,
+                name:        name  || undefined,
+                text:        text  || undefined,
+                url:         _s(window.location.href, 512),
+                timestamp:   Date.now(),
+                fingerprint: { tag: tag, role: role || undefined, label: label || undefined }
+            };
+
+            // Build a dedup signature: tag + role + text + 300ms bucket.
+            var _sig = tag + "|" + (role || "") + "|" + (text || label || name || "")
+                       + "|" + Math.floor(Date.now() / 300);
+
+            // Hold the entry — push only if click doesn't supersede within 300ms.
+            _lastMousedownEntry = { sig: _sig, ts: Date.now(), entry: _entry };
+            setTimeout(function () {
+                if (_lastMousedownEntry && _lastMousedownEntry.sig === _sig) {
+                    _push(_lastMousedownEntry.entry);
+                    _lastMousedownEntry = null;
+                }
+            }, 300);
+        } catch (err) {
+            console.debug("[phantom] mousedown error:", err.message || String(err));
+        }
+    }
+
+    // Wrap _phantomOnClick to suppress the click if mousedown already captured it.
+    var _phantomOnClickOrig = _phantomOnClick;
+    _phantomOnClick = function (e) {
+        if (_lastMousedownEntry) {
+            var el   = _resolveTarget(e.target);
+            var tag  = _s(el.tagName, 16).toUpperCase();
+            var role = _s(el.getAttribute ? el.getAttribute("role") : "", 64);
+            var _rawText = ((el.textContent || "").replace(/\\s+/g, " ")).trim();
+            var text  = _rawText.length <= 60 ? _rawText : "";
+            var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
+            var name  = _s(el.name, 64);
+            var _sig  = tag + "|" + (role || "") + "|" + (text || label || name || "")
+                        + "|" + Math.floor(Date.now() / 300);
+            if (_sig === _lastMousedownEntry.sig) {
+                // click arrived for the same element — prefer click, discard mousedown.
+                _lastMousedownEntry = null;
+                _lastTrustedClickMs = Date.now();
+                _phantomOnClickOrig(e);
+                return;
+            }
+        }
+        _phantomOnClickOrig(e);
+    };
+
     window.__phantomClickHandler = _phantomOnClick;
-    document.addEventListener("click",  _phantomOnClick,  true);
-    document.addEventListener("input",  _phantomOnInput,  true);
-    document.addEventListener("change", _phantomOnChange, true);
+    document.addEventListener("mousedown", _phantomOnMousedown, true);
+    document.addEventListener("click",     _phantomOnClick,     true);
+    document.addEventListener("input",     _phantomOnInput,     true);
+    document.addEventListener("change",    _phantomOnChange,    true);
     console.debug("[phantom] recorder active url=" + window.location.href);
 })();
 """
