@@ -31,9 +31,23 @@ from app.runtime.perception import (
     find_best_match_for_target,
     find_by_signatures,
 )
+from app.runtime.hitl_manager import HitlManager
+from app.runtime.hitl_replayer import HitlReplayer
+from app.runtime.recovery_recipe_store import RecoveryRecipeStore
 from app.runtime.selector_memory import SelectorMemoryStore
 from app.runtime.store import RunStore
-from app.schemas import InteractionEvent, RecoveryContext, RunState, RunStatus, StepRuntimeState, StepStatus
+from app.schemas import (
+    FailureContext,
+    InteractionEvent,
+    RecoveryAction,
+    RecoveryContext,
+    RecoveryRecipe,
+    RunState,
+    RunStatus,
+    StepRuntimeState,
+    StepStatus,
+    SuccessSignals,
+)
 
 LOGGER = logging.getLogger("tekno.phantom.executor")
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")
@@ -106,6 +120,7 @@ class AgentExecutor:
         browser_client: BrowserMCPClient,
         file_client: FileSystemClient,
         selector_memory_store: SelectorMemoryStore | None = None,
+        recipe_store: RecoveryRecipeStore | None = None,
     ) -> None:
         self._settings = settings
         self._brain = brain_client
@@ -113,6 +128,9 @@ class AgentExecutor:
         self._browser = browser_client
         self._files = file_client
         self._selector_memory = selector_memory_store
+        self._recipe_store = recipe_store
+        self._replayer = HitlReplayer()
+        self._hitl = HitlManager(browser=browser_client)
         self._run_context: dict[str, dict[str, Any]] = {}
         self._viewer_shutdown_tasks: dict[str, asyncio.Task[None]] = {}
         self._selector_timeout_tasks: dict[str, asyncio.Task[None]] = {}
@@ -386,7 +404,7 @@ class AgentExecutor:
 
         run.recovery_mode = False
         # Clean up the browser-side recovery recorder before resuming execution.
-        await self._stop_interaction_recording_safe(run_id)
+        await self._hitl.stop_recording(run_id)
         run.status = RunStatus.running
         self._run_store.persist(run)
         LOGGER.info(
@@ -547,7 +565,7 @@ class AgentExecutor:
                             # otherwise destroy window.__phantomInteractions before the
                             # slower observation interval has a chance to poll.
                             if _obs_baseline is not None and _tick > 0:
-                                _new_events = await self._read_interactions_safe(run.run_id)
+                                _new_events = await self._hitl.read_interactions(run.run_id)
                                 if _new_events:
                                     _interaction_buffer.extend(_new_events)
                                     _last_interaction_tick = _tick
@@ -569,7 +587,7 @@ class AgentExecutor:
                                             None,
                                         )
                                         if _s is not None and _s.pending_recovery_interactions is not None:
-                                            _updated = self._normalize_interactions(_interaction_buffer)
+                                            _updated = self._hitl.normalize(_interaction_buffer)
                                             _s.pending_recovery_interactions = [
                                                 InteractionEvent(
                                                     kind=ev.get("kind", "click"),
@@ -577,6 +595,7 @@ class AgentExecutor:
                                                     type=ev.get("type"),
                                                     role=ev.get("role"),
                                                     label=ev.get("label"),
+                                                    label_src=ev.get("labelSrc"),
                                                     placeholder=ev.get("placeholder"),
                                                     name=ev.get("name"),
                                                     text=ev.get("text"),
@@ -586,11 +605,14 @@ class AgentExecutor:
                                                     fingerprint=ev.get("fingerprint"),
                                                     selector=ev.get("selector", ""),
                                                     value=ev.get("value"),
+                                                    selector_chain=ev.get("selector_chain") or [],
+                                                    option_text=ev.get("option_text"),
+                                                    clear_first=ev.get("clear_first"),
                                                 )
                                                 for ev in _updated
                                             ]
                                             _s.user_input_prompt = (
-                                                self._build_recovery_confirm_prompt(_updated)
+                                                self._hitl.build_confirm_prompt(_updated)
                                             )
                                             self._run_store.persist(_state)
 
@@ -653,7 +675,7 @@ class AgentExecutor:
                                     # Consolidate raw events: merge per-field input
                                     # events into final values, let change supersede
                                     # them, deduplicate clicks, drop noise.
-                                    _normalized = self._normalize_interactions(
+                                    _normalized = self._hitl.normalize(
                                         _interaction_buffer
                                     )
                                     LOGGER.debug(
@@ -670,6 +692,7 @@ class AgentExecutor:
                                             type=ev.get("type"),
                                             role=ev.get("role"),
                                             label=ev.get("label"),
+                                            label_src=ev.get("labelSrc"),
                                             placeholder=ev.get("placeholder"),
                                             name=ev.get("name"),
                                             text=ev.get("text"),
@@ -679,6 +702,9 @@ class AgentExecutor:
                                             fingerprint=ev.get("fingerprint"),
                                             selector=ev.get("selector", ""),
                                             value=ev.get("value"),
+                                            selector_chain=ev.get("selector_chain") or [],
+                                            option_text=ev.get("option_text"),
+                                            clear_first=ev.get("clear_first"),
                                         )
                                         for ev in _normalized
                                     ]
@@ -687,7 +713,7 @@ class AgentExecutor:
                                     # selector OR click "Yes, I completed this step".
                                     # Whichever they do first wins.
                                     _s.user_input_prompt = (
-                                        self._build_recovery_confirm_prompt(_normalized)
+                                        self._hitl.build_confirm_prompt(_normalized)
                                     )
                                     self._run_store.persist(_state)
                                     _session_confirmed = True
@@ -732,7 +758,7 @@ class AgentExecutor:
                         self._cancel_selector_input_timeout(run.run_id)
                         # Stop the browser-side recovery recorder now that the
                         # pause window has closed (user provided selector or timed out).
-                        await self._stop_interaction_recording_safe(run.run_id)
+                        await self._hitl.stop_recording(run.run_id)
                         # Safety net: if polling exhausted without any status change,
                         # mark step failed explicitly so it doesn't stay waiting_for_input.
                         # Exception: recovery_confirm means the human acted and we are
@@ -2055,6 +2081,13 @@ class AgentExecutor:
                     step.message = _dest_state
                     step.error = None
                     return  # finally block still runs to write trace/timestamps
+                # Try auto-recovery from a stored recipe before requesting human input.
+                _replayed = await self._try_recipe_replay(run, step, before_snapshot)
+                if _replayed:
+                    step.status = StepStatus.completed
+                    step.message = "Auto-recovered using saved human recovery recipe"
+                    step.error = None
+                    return  # finally block still runs to write trace/timestamps
                 LOGGER.warning(
                     "Run %s step %d/%d (type=%s): selector help requested. selector=%r root_cause=%s",
                     run.run_id, step.index + 1, len(run.steps), step.type,
@@ -2094,7 +2127,7 @@ class AgentExecutor:
                 )
                 # Inject the browser-side recovery recorder so it is ready to
                 # capture human interactions during the pause window.
-                await self._start_interaction_recording_safe(run.run_id)
+                await self._hitl.start_recording(run.run_id)
                 # Capture screenshot + diagnosis so the UI shows "What went wrong",
                 # "Suggested fix", and "Try these selectors" even while paused.
                 # NOTE: apply_manual_selector_hint (sync) can run on the event loop
@@ -2642,14 +2675,7 @@ class AgentExecutor:
     def apply_human_recovery_confirmation(
         self, run_id: str, step_id: str
     ) -> RunState | None:
-        """Mark a recovery_confirm step as human_recovered and resume the run.
-
-        Called via POST /api/runs/{run_id}/steps/{step_id}/recovery-confirm.
-        Cancels the selector timeout, clears recovery mode, sets the step status
-        to human_recovered, resets downstream skipped steps to pending, and sets
-        the run back to running so the executor polling loop exits naturally on
-        its next tick.
-        """
+        """Mark a recovery_confirm step as human_recovered and resume the run."""
         run = self._run_store.get(run_id)
         if not run:
             return None
@@ -2660,35 +2686,42 @@ class AgentExecutor:
 
         if run.status in {RunStatus.completed, RunStatus.cancelled}:
             raise ValueError("This run has already finished and cannot be resumed.")
-
         if step.status != StepStatus.waiting_for_input:
             raise ValueError(
-                "This step is not awaiting recovery confirmation "
-                f"(status={step.status!r})."
+                f"Step is not awaiting recovery confirmation (status={step.status!r})."
             )
         if not step.pending_recovery_interactions:
             raise ValueError(
-                "No recorded interactions found for this step. "
-                "Perform actions in the browser first, then confirm."
+                "No recorded interactions found. Perform actions in the browser first."
             )
 
-        # Cancel the 120 s auto-close countdown.
         self._cancel_selector_input_timeout(run.run_id)
-
-        # Exit recovery mode.
         run.recovery_mode = False
 
-        # Fire-and-forget: stop the JS recorder in the live browser.
-        # Done as a background task because this method is synchronous.
-        # Guard: only stop if recovery_mode is still False at execution time —
-        # a subsequent step may have already re-entered recovery and re-injected
-        # the recorder before this task runs.  Stopping it then would silently
-        # wipe the new session's recorder.
-        _run_id_for_stop = run.run_id
+        # Snapshot step fields before they are cleared — shared by the selector_memory
+        # bridge below and the background recipe-save task.
+        _step_type = step.type
+        _step_input = dict(step.input or {})
+        _interactions = list(step.pending_recovery_interactions)
+        _domain = self._extract_domain(
+            (step.recovery_context.current_url if step.recovery_context else None)
+            or run.start_url or ""
+        )
+        _failure_ctx = self._build_failure_context_from_summary(
+            step.recovery_context.failure_snapshot_summary if step.recovery_context else None
+        )
+
+        # Background task: stop the JS recorder and persist the recovery recipe.
+        # Guard skips the stop if a subsequent step has already re-entered recovery.
+        _run_id_ref = run.run_id
         async def _guarded_stop() -> None:
-            _current = self._run_store.get(_run_id_for_stop)
+            _current = self._run_store.get(_run_id_ref)
             if _current is None or not _current.recovery_mode:
-                await self._stop_interaction_recording_safe(_run_id_for_stop)
+                await self._hitl.stop_recording(_run_id_ref)
+                _after_snap = await self._safe_page_snapshot()
+                self._save_recovery_recipe(
+                    _step_type, _step_input, _interactions, _domain, _failure_ctx, _after_snap,
+                )
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -2696,7 +2729,6 @@ class AgentExecutor:
         except Exception:  # noqa: BLE001
             pass
 
-        # Mark the step as resolved by the human.
         step.status = StepStatus.human_recovered
         step.message = "Manually recovered by user"
         step.error = None
@@ -2704,22 +2736,17 @@ class AgentExecutor:
         step.user_input_prompt = None
         step.ended_at = utc_now()
 
-        # Reset any downstream steps that were skipped because of this failure
-        # so they will run after the human-recovered step.
         for subsequent in run.steps[step.index + 1:]:
             if subsequent.status == StepStatus.skipped:
                 subsequent.status = StepStatus.pending
                 subsequent.message = None
                 subsequent.error = None
 
-        # Setting run.status = running causes the polling loop to detect the
-        # change on its next tick and exit waiting_for_input cleanly.
         run.status = RunStatus.running
         run.finished_at = None
         self._run_store.persist(run)
         LOGGER.info(
-            "Run %s step %d: human recovery confirmed — step=human_recovered,"
-            " run resumed",
+            "Run %s step %d: human recovery confirmed — step=human_recovered, run resumed",
             run_id, step.index + 1,
         )
         return run
@@ -3508,28 +3535,6 @@ class AgentExecutor:
         except Exception:
             return None
 
-    async def _start_interaction_recording_safe(self, run_id: str) -> None:
-        """Inject the browser-side recovery recorder.  Non-fatal on any error."""
-        try:
-            await self._browser.start_interaction_recording(run_id)
-        except Exception as exc:
-            LOGGER.debug("Run %s: recovery recorder start failed (non-fatal): %s", run_id, exc)
-
-    async def _stop_interaction_recording_safe(self, run_id: str) -> None:
-        """Disable and clear the browser-side recovery recorder.  Non-fatal on any error."""
-        try:
-            await self._browser.stop_interaction_recording(run_id)
-        except Exception as exc:
-            LOGGER.debug("Run %s: recovery recorder stop failed (non-fatal): %s", run_id, exc)
-
-    async def _read_interactions_safe(self, run_id: str) -> list[dict]:
-        """Read and clear the browser interaction buffer.  Returns [] on any error."""
-        try:
-            return await self._browser.get_recorded_interactions(run_id)
-        except Exception as exc:
-            LOGGER.debug("Run %s: get_recorded_interactions failed (non-fatal): %s", run_id, exc)
-            return []
-
     async def _check_semantic_destination_state(
         self,
         before_snapshot: dict[str, Any] | None,
@@ -3697,108 +3702,289 @@ class AgentExecutor:
 
         return changes
 
-    @staticmethod
-    @staticmethod
-    def _normalize_interactions(events: list[dict]) -> list[dict]:
-        """Convert raw DOM event stream into a clean, deduplicated interaction sequence.
+    # ------------------------------------------------------------------ #
+    # Recovery recipe helpers                                              #
+    # ------------------------------------------------------------------ #
 
-        Rules:
-        - ``input`` events: buffer per (tag, name, type) field key — always overwrite
-          with the latest value so only the final typed value is kept.
-        - ``change`` events: supersede any pending input for the same field and are
-          emitted immediately (they represent the committed, stable value).
-        - ``click`` events: flush all pending inputs first (focus moved away), then
-          emit the click; consecutive identical clicks within 500 ms are deduplicated.
-        - Noise: HTML/BODY/DOCUMENT tags, empty-value inputs, and events with no
-          useful identity are dropped.
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extract normalized domain (netloc) from a URL for recipe lookup."""
+        return urlparse(url).netloc.lower() or "unknown"
+
+    @staticmethod
+    def _extract_element_key(step_type: str, step_input: dict[str, Any]) -> str:
+        """Derive a stable element fingerprint from step input for recipe lookup.
+
+        Priority: data-testid → accessible name/label → name attribute →
+        step_type:normalized-selector → step_type.
         """
-        result: list[dict] = []
-        # field_key → latest buffered input event (not yet emitted)
-        pending_input: dict[tuple[str, str, str], dict] = {}
-        last_click_sig: tuple | None = None  # (tag, name, text, ts_bucket)
-
-        def _field_key(ev: dict) -> tuple[str, str, str]:
-            return (
-                (ev.get("tag") or "").upper(),
-                ev.get("name") or "",
-                (ev.get("type") or "").lower(),
+        for field in ("testid", "data_testid", "data-testid"):
+            v = step_input.get(field)
+            if isinstance(v, str) and v.strip():
+                return f"testid:{v.strip()}"
+        for field in ("accessible_name", "semantic_name", "aria_label",
+                      "aria-label", "label", "text_hint"):
+            v = step_input.get(field)
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()[:80]
+        target = step_input.get("target")
+        if isinstance(target, dict):
+            for field in ("accessible_name", "semantic_name", "aria_label", "label"):
+                v = target.get(field)
+                if isinstance(v, str) and v.strip():
+                    return v.strip().lower()[:80]
+        for field in ("name",):
+            v = step_input.get(field)
+            if isinstance(v, str) and v.strip():
+                return f"name:{v.strip()}"
+        selector = (
+            step_input.get("selector")
+            or step_input.get("source_selector")
+            or ""
+        )
+        if selector:
+            attr_match = re.search(
+                r'\[(?:placeholder|aria-label|name)\*?=[\'"]([^\'"]+)[\'"]',
+                str(selector), re.IGNORECASE,
             )
+            if attr_match:
+                return attr_match.group(1).strip().lower()[:80]
+            text_match = re.search(r"has-text\(['\"]([^'\"]+)['\"]", str(selector))
+            if text_match:
+                return text_match.group(1).strip().lower()[:80]
+            normalized = re.sub(r"\[.*?\]|\s+", "", str(selector)).strip()[:60]
+            if normalized:
+                return f"{step_type}:{normalized}"
+        return step_type
 
-        def _flush_pending(except_key: tuple | None = None) -> None:
-            """Emit all pending input events, optionally skipping one key."""
-            for k in list(pending_input):
-                if k != except_key:
-                    result.append(pending_input.pop(k))
+    @staticmethod
+    def _build_failure_context(snapshot: dict[str, Any] | None) -> FailureContext:
+        """Build FailureContext from a raw _safe_page_snapshot() dict."""
+        if not isinstance(snapshot, dict):
+            return FailureContext()
+        els = [el for el in (snapshot.get("interactive_elements") or [])
+               if isinstance(el, dict)]
+        has_dialog = any(
+            el.get("role") in {"dialog", "alertdialog"} and el.get("visible", True)
+            for el in els
+        )
+        visible_count = sum(1 for el in els if el.get("visible", True))
+        return FailureContext(
+            url_path=urlparse(str(snapshot.get("url", ""))).path,
+            page_title=str(snapshot.get("title", ""))[:160],
+            has_dialog=has_dialog,
+            interactive_count=visible_count,
+        )
 
-        for ev in events:
-            kind = ev.get("kind", "")
-            tag = (ev.get("tag") or "").upper()
+    @staticmethod
+    def _build_failure_context_from_summary(
+        summary: dict[str, Any] | None,
+    ) -> FailureContext:
+        """Build FailureContext from a _summarize_page_state() dict."""
+        if not isinstance(summary, dict):
+            return FailureContext()
+        sample = summary.get("interactive_sample") or []
+        has_dialog = any(
+            isinstance(item, dict)
+            and item.get("role") in {"dialog", "alertdialog"}
+            and item.get("visible", True)
+            for item in sample
+        )
+        return FailureContext(
+            url_path=urlparse(str(summary.get("url", ""))).path,
+            page_title=str(summary.get("title", ""))[:160],
+            has_dialog=has_dialog,
+            interactive_count=int(summary.get("visible_interactive_count") or 0),
+        )
 
-            # Drop structural noise
-            if tag in ("HTML", "BODY", "DOCUMENT"):
+    @staticmethod
+    def _derive_success_signals(
+        failure_ctx: FailureContext,
+        after_snapshot: dict[str, Any] | None,
+    ) -> SuccessSignals:
+        """Derive SuccessSignals by comparing failure state with post-recovery page state."""
+        if not isinstance(after_snapshot, dict):
+            return SuccessSignals()
+        after_els = [el for el in (after_snapshot.get("interactive_elements") or [])
+                     if isinstance(el, dict)]
+        after_has_dialog = any(
+            el.get("role") in {"dialog", "alertdialog"} and el.get("visible", True)
+            for el in after_els
+        )
+        after_url_path = urlparse(str(after_snapshot.get("url", ""))).path
+        url_changed = after_url_path != failure_ctx.url_path
+        return SuccessSignals(
+            url_path_changed=url_changed,
+            url_path_after=after_url_path if url_changed else None,
+            dialog_dismissed=failure_ctx.has_dialog and not after_has_dialog,
+            dialog_appeared=not failure_ctx.has_dialog and after_has_dialog,
+        )
+
+    @staticmethod
+    def _promote_interactions_to_actions(
+        interactions: list[InteractionEvent],
+    ) -> list[RecoveryAction]:
+        """Promote captured InteractionEvents to semantic RecoveryActions for recipe storage."""
+        result: list[RecoveryAction] = []
+        for ev in interactions:
+            kind = ev.kind
+            tag = (ev.tag or "").upper()
+            role = (ev.role or "").lower()
+
+            # Skip noise: copyright / footer text captured by the JS recorder.
+            _display = (ev.label or ev.text or "")
+            if "©" in _display or "all rights reserved" in _display.lower():
                 continue
 
-            if kind == "input":
-                # Drop if no useful identity at all
-                if not (ev.get("name") or ev.get("label") or ev.get("placeholder")):
-                    continue
-                # Drop empty-value non-checkable inputs
-                if ev.get("value") is None and not ev.get("checked"):
-                    continue
-                # Overwrite — we only want the latest value for this field
-                pending_input[_field_key(ev)] = ev
-
-            elif kind == "change":
-                key = _field_key(ev)
-                # Change supersedes pending input for the same field
-                pending_input.pop(key, None)
-                result.append(ev)
-
+            if kind == "navigate":
+                action_type = "navigate_to"
+                value = ev.url or ev.value
+            elif kind in {"input", "type"}:
+                action_type = "fill_field"
+                value = ev.value
+            elif kind in {"change", "select"}:
+                action_type = "select_option" if tag == "SELECT" else "fill_field"
+                value = ev.value
+            elif kind == "toggle":
+                action_type = "click_control"
+                value = None
             elif kind == "click":
-                # Flush inputs for fields other than the clicked one (focus left them)
-                _flush_pending()
-                # Deduplicate consecutive identical clicks within 500 ms
-                ts = int(ev.get("timestamp") or 0)
-                sig = (tag, ev.get("name") or "", (ev.get("text") or "").strip(), ts // 500)
-                if sig != last_click_sig:
-                    result.append(ev)
-                    last_click_sig = sig
-
+                action_type = (
+                    "dismiss_dialog" if role in {"dialog", "alertdialog"}
+                    else "click_control"
+                )
+                value = None
             else:
-                # navigate or other kinds — flush and pass through
-                _flush_pending()
-                result.append(ev)
+                action_type = "click_control"
+                value = None
 
-        # Flush remaining pending inputs at end of stream
-        _flush_pending()
+            result.append(RecoveryAction(
+                action_type=action_type,
+                label=ev.label,
+                label_src=ev.label_src,
+                role=ev.role,
+                text=ev.text,
+                placeholder=ev.placeholder,
+                option_text=ev.option_text,
+                tag=ev.tag,
+                name=ev.name,
+                selector_chain=ev.selector_chain or [],
+                value=value,
+                checked=ev.checked,
+                clear_first=ev.clear_first,
+            ))
         return result
 
-    @staticmethod
-    def _build_recovery_confirm_prompt(interactions: list[dict]) -> str:
-        """Build a human-readable confirmation prompt for the detected interactions."""
-        def _describe(ev: dict) -> str:
-            kind = ev.get("kind", "action")
-            # Build a human-readable target description using the richest field available.
-            label = ev.get("label") or ev.get("placeholder") or ev.get("name")
-            text  = (ev.get("text") or "").strip()
-            tag   = ev.get("tag") or "?"
-            role  = ev.get("role") or ""
-            target = label or text or (f"{role} {tag}".strip() if role else tag)
-            if kind == "click":
-                return f"- clicked {target!r}"
-            if kind == "type":
-                return f"- typed into {target!r}"
-            if kind == "toggle":
-                state = "checked" if ev.get("checked") else "unchecked"
-                return f"- {state} {target!r}"
-            return f"- {kind} on {target!r}"
+    def _save_recovery_recipe(
+        self,
+        step_type: str,
+        step_input: dict[str, Any],
+        interactions: list[InteractionEvent],
+        domain: str,
+        failure_ctx: FailureContext,
+        after_snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Build and persist a RecoveryRecipe from the confirmed HITL session. Non-fatal."""
+        if self._recipe_store is None or not interactions:
+            return
+        try:
+            element_key = self._extract_element_key(step_type, step_input)
+            actions = self._promote_interactions_to_actions(interactions)
+            if not actions:
+                return
+            success_signals = self._derive_success_signals(failure_ctx, after_snapshot)
+            recipe = RecoveryRecipe(
+                domain=domain,
+                step_type=step_type,
+                element_key=element_key,
+                failure_context=failure_ctx,
+                success_signals=success_signals,
+                actions=actions,
+            )
+            self._recipe_store.save_recipe(recipe)
+            LOGGER.info(
+                "Recovery recipe saved domain=%r step_type=%r element_key=%r actions=%d",
+                domain, step_type, element_key, len(actions),
+            )
+        except Exception:
+            LOGGER.exception("Failed to save recovery recipe (non-fatal)")
 
-        lines = [_describe(ev) for ev in interactions[:10]]
-        summary = "\n".join(lines) if lines else "(no detail available)"
-        return (
-            f"Detected {len(interactions)} interaction(s) in the browser:\n{summary}\n\n"
-            "Confirm these are the correct actions for this step to continue and save for future use."
+    async def _try_recipe_replay(
+        self,
+        run: RunState,
+        step: StepRuntimeState,
+        before_snapshot: dict[str, Any] | None,
+    ) -> bool:
+        """Attempt auto-recovery from a stored recipe before entering HITL pause.
+
+        Returns True when outcome is "succeeded" or "uncertain" with at least one
+        action executed.  Returns False for "failed" or zero actions executed.
+        """
+        if self._recipe_store is None:
+            return False
+        domain = self._extract_domain(
+            (before_snapshot.get("url") if isinstance(before_snapshot, dict) else None)
+            or run.start_url or ""
         )
+        element_key = self._extract_element_key(step.type, step.input or {})
+        recipe = self._recipe_store.find_recipe(domain, step.type, element_key)
+        if recipe is None:
+            return False
+        page = self._browser.get_live_page()
+        if page is None:
+            LOGGER.debug("Run %s: no live page for recipe replay", run.run_id)
+            return False
+        LOGGER.info(
+            "Run %s step %d: attempting recipe replay domain=%r step_type=%r"
+            " element_key=%r actions=%d",
+            run.run_id, step.index + 1, domain, step.type,
+            element_key, len(recipe.actions),
+        )
+        # Patch fill_field / select_option values with the current step's values.
+        # The recipe remembers HOW to locate the element; the value to use always
+        # comes from the current run's step input (resolving any test-data templates).
+        _step_input = step.input or {}
+        _current_value = self._apply_template(
+            str(_step_input.get("value") or _step_input.get("text") or ""),
+            run.test_data or {},
+        )
+        _current_option = self._apply_template(
+            str(_step_input.get("option_text") or _step_input.get("value") or ""),
+            run.test_data or {},
+        )
+        if _current_value or _current_option:
+            patched: list = []
+            for _a in recipe.actions:
+                if _a.action_type == "fill_field" and _current_value:
+                    patched.append(_a.model_copy(update={"value": _current_value}))
+                elif _a.action_type == "select_option" and (_current_option or _current_value):
+                    _upd: dict = {}
+                    if _current_option:
+                        _upd["option_text"] = _current_option
+                    if _current_value:
+                        _upd["value"] = _current_value
+                    patched.append(_a.model_copy(update=_upd))
+                else:
+                    patched.append(_a)
+            recipe = recipe.model_copy(update={"actions": patched})
+        try:
+            result = await self._replayer.try_replay(page, recipe)
+        except Exception:
+            LOGGER.exception("Run %s: recipe replay raised unexpectedly", run.run_id)
+            self._recipe_store.mark_failure(domain, step.type, element_key)
+            return False
+        LOGGER.info(
+            "Run %s step %d: recipe replay outcome=%r executed=%d/%d"
+            " signals=%r reason=%r",
+            run.run_id, step.index + 1, result.outcome,
+            result.actions_executed, result.actions_total,
+            result.matched_signals, result.reason,
+        )
+        if result.outcome in {"succeeded", "uncertain"} and result.actions_executed == result.actions_total:
+            self._recipe_store.mark_success(domain, step.type, element_key)
+            return True
+        self._recipe_store.mark_failure(domain, step.type, element_key)
+        return False
 
     def _summarize_page_state(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(snapshot, dict):

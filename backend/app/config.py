@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     selector_memory_enabled: bool = True
     selector_memory_backend: Literal["sqlite", "in_memory", "disabled"] = "sqlite"
     selector_memory_db_path: Path = Path("data/selector_memory.sqlite3")
+    recovery_recipe_enabled: bool = True
+    recovery_recipe_backend: Literal["sqlite", "in_memory"] = "sqlite"
+    recovery_recipe_db_path: Path = Path("data/recovery_recipes.sqlite3")
     selector_memory_max_candidates: int = 5
     selector_help_mode: Literal["fail", "pause"] = "pause"
     selector_recovery_enabled: bool = True
@@ -124,6 +127,7 @@ class Settings(BaseSettings):
         self.drag_debug_log_path = _resolve_project_path(self.drag_debug_log_path)
         self.run_store_db_path = _resolve_project_path(self.run_store_db_path)
         self.selector_memory_db_path = _resolve_project_path(self.selector_memory_db_path)
+        self.recovery_recipe_db_path = _resolve_project_path(self.recovery_recipe_db_path)
         self.artifact_root = _resolve_project_path(self.artifact_root)
         self.viewer_static_root = _resolve_project_path(self.viewer_static_root)
 

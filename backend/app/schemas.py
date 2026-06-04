@@ -628,7 +628,13 @@ class InteractionEvent(BaseModel):
     tag: str | None = None
     type: str | None = None        # input type attribute (text, checkbox, radio…)
     role: str | None = None        # aria role
-    label: str | None = None       # aria-label
+    # Resolved accessible label text — may come from aria-label, aria-labelledby,
+    # <label for=>, wrapping <label>, or any preceding/following sibling element
+    # identified as a visual label.  Use with page.get_by_label() at replay time.
+    label: str | None = None
+    # Which mechanism produced `label` — "aria-label" | "aria-labelledby" | "title" |
+    # "label-for" | "label-wrap" | "label-sibling" | "label-sibling-next"
+    label_src: str | None = None
     placeholder: str | None = None
     name: str | None = None        # name attribute
     text: str | None = None        # visible text (buttons/links only)
@@ -641,6 +647,10 @@ class InteractionEvent(BaseModel):
     # Legacy / type/select capture fields (kept for forward compatibility)
     selector: str = ""
     value: str | None = None
+    # Replay anchors
+    selector_chain: list[str] = Field(default_factory=list)
+    option_text: str | None = None   # SELECT: visible label alongside value
+    clear_first: bool | None = None  # INPUT/TEXTAREA: clear before typing
 
 
 class RecoveryContext(BaseModel):
@@ -653,6 +663,154 @@ class RecoveryContext(BaseModel):
     timestamp: datetime
     execution_status: str
     failure_snapshot_summary: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# HITL Recovery Persistence Layer
+# ---------------------------------------------------------------------------
+# These four models represent the recovery recipe — the stored knowledge of
+# how a human fixed a failing step and how to replay that fix automatically.
+#
+# Design contract:
+#   - RecoveryAction  = semantic recovery intent (NOT raw browser events)
+#   - FailureContext  = observable page state at failure time (for matching)
+#   - SuccessSignals  = state-transition signals observed after human recovery
+#   - RecoveryRecipe  = the complete stored unit (lookup key + actions + signals)
+#
+# Separation from InteractionEvent:
+#   InteractionEvent  → live capture during HITL pause (raw, in-flight)
+#   RecoveryAction    → persisted after normalization (semantic, replay-ready)
+# ---------------------------------------------------------------------------
+
+
+class FailureContext(BaseModel):
+    """Observable page state at the moment a step fails and human recovery begins.
+
+    Used for two purposes:
+      1. Recipe matching — does this recipe apply to the current failure situation?
+      2. SuccessSignals derivation — compare before/after to detect state transitions.
+
+    Fields are intentionally minimal and stable. No DOM snapshots, no screenshots.
+    url_path strips query params and fragments so per-session noise is excluded.
+    """
+
+    url_path: str = ""
+    page_title: str = ""
+    has_dialog: bool = False
+    visible_error_text: str | None = None
+    interactive_count: int = 0
+
+
+class SuccessSignals(BaseModel):
+    """Lightweight state-transition signals observed after successful human recovery.
+
+    Derived by comparing the page state immediately after human confirmation
+    against the FailureContext captured at failure time.
+
+    Rules:
+      - Only populate fields that were ACTUALLY OBSERVED to change.
+      - Never infer. Never assume. If a signal was not checked, leave it None/False.
+      - Validation at replay time checks: did the same transitions happen?
+        NOT: is the DOM identical?
+    """
+
+    url_path_changed: bool = False
+    url_path_after: str | None = None
+    dialog_dismissed: bool = False
+    dialog_appeared: bool = False
+    error_count_before: int | None = None
+    error_count_after: int | None = None
+    target_field_has_value: bool = False
+
+
+class RecoveryAction(BaseModel):
+    """A single semantic recovery action within a recipe.
+
+    Represents INTENT — what the human was trying to accomplish — not a raw
+    browser event transcript.  Replay uses the semantic fields as primary
+    drivers (via Playwright built-in APIs) and selector_chain only as
+    execution fallback anchors.
+
+    Replay priority for locating the target element:
+      1. get_by_test_id()      if selector_chain[0] contains data-testid
+      2. get_by_label(label)   if label is present  — handles all label patterns
+      3. get_by_role(role, name=label or text)  if role is present
+      4. get_by_placeholder(placeholder)        if placeholder is present
+      5. get_by_text(text, exact=False)         if text is present (buttons/links)
+      6. selector_chain entries in order        — CSS fallback anchors
+      If all fail: log and skip this action, continue with next.
+
+    label_src is an active dispatch signal — it tells the replayer which
+    Playwright API to attempt first, derived from how the label was originally
+    resolved during capture.
+    """
+
+    # --- Intent ---
+    action_type: Literal[
+        "fill_field",
+        "select_option",
+        "click_control",
+        "dismiss_dialog",
+        "navigate_to",
+    ]
+
+    # --- Semantic identity: primary replay drivers ---
+    # Drives Playwright built-in API selection. More stable than DOM selectors
+    # across React/Vue rerenders, version upgrades, and layout changes.
+    label: str | None = None
+    label_src: str | None = None       # dispatch key: "aria-label" | "label-for" |
+                                       # "label-wrap" | "label-sibling" |
+                                       # "label-sibling-next" | "aria-labelledby" | "title"
+    role: str | None = None
+    text: str | None = None            # button/link visible text
+    placeholder: str | None = None
+    option_text: str | None = None     # SELECT: visible option label — primary over value
+
+    # --- Structural anchors: execution fallbacks ---
+    # Ordered by confidence (most stable first). Treated as hints, not truth.
+    # Avoid positional selectors, raw classnames, nth-child — these belong nowhere.
+    tag: str | None = None
+    name: str | None = None
+    selector_chain: list[str] = Field(default_factory=list)
+
+    # --- Value to apply ---
+    value: str | None = None
+    checked: bool | None = None
+    clear_first: bool | None = None
+
+
+class RecoveryRecipe(BaseModel):
+    """A stored recovery recipe — reusable semantic recovery knowledge.
+
+    Keyed by (domain, step_type, element_key).  Looked up when a step fails
+    before asking the human for help.  If a matching recipe exists, HitlReplayer
+    attempts to reproduce the recovery automatically.
+
+    element_key is a deterministic stable fingerprint of the FAILING element
+    (not the elements touched during recovery).  Derived in priority order:
+      data-testid value → aria-label value → resolved label text →
+      name attribute → role:text combination → normalized selector.
+    """
+
+    # --- Lookup key (composite primary key in the store) ---
+    domain: str
+    step_type: str
+    element_key: str
+
+    # --- Failure context: what situation this recipe applies to ---
+    failure_context: FailureContext
+
+    # --- Success signals: what state transitions define a successful recovery ---
+    success_signals: SuccessSignals
+
+    # --- Ordered semantic actions to replay ---
+    actions: list[RecoveryAction]
+
+    # --- Metadata ---
+    created_at: datetime = Field(default_factory=utc_now)
+    last_used_at: datetime | None = None
+    times_used: int = 0
+    times_succeeded: int = 0
 
 
 class StepRuntimeState(BaseModel):

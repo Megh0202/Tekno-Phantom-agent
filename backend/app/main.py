@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +28,7 @@ from app.routes import auth_router
 from app.runtime.executor import AgentExecutor
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
+from app.runtime.recovery_recipe_store import build_recovery_recipe_store
 from app.runtime.selector_memory import build_selector_memory_store
 from app.runtime.suite_executor import SuiteExecutor
 from app.runtime.suite_store import build_suite_store
@@ -38,6 +39,7 @@ from app.runtime.viewer_session import ViewerSessionManager
 from app.schemas import (
     CancelSuiteRunResponse,
     CancelRunResponse,
+    FailureContext,
     FolderCreateRequest,
     FolderListResponse,
     FolderState,
@@ -45,6 +47,8 @@ from app.schemas import (
     PlanGenerateResponse,
     PromptToStepsRequest,
     PromptToStepsResponse,
+    RecoveryAction,
+    RecoveryRecipe,
     RunCreateRequest,
     RunListResponse,
     RunResumeRequest,
@@ -56,6 +60,7 @@ from app.schemas import (
     StepImportResponse,
     StepSelectorHelpRequest,
     StepStatus,
+    SuccessSignals,
     SelectorRecoveryRequest,
     TestCaseCreateRequest,
     TestCaseListResponse,
@@ -978,6 +983,11 @@ def build_app() -> FastAPI:
     suite_store = build_suite_store(settings)
     test_case_store = build_test_case_store(settings)
     selector_memory = build_selector_memory_store(settings)
+    recipe_store = build_recovery_recipe_store(
+        enabled=settings.recovery_recipe_enabled,
+        backend=settings.recovery_recipe_backend,
+        db_path=settings.recovery_recipe_db_path,
+    )
     brain_client = HttpBrainClient(settings)
     viewer_sessions = ViewerSessionManager(settings) if _viewer_supported(settings) else None
     browser_client = build_browser_client(settings, viewer_sessions=viewer_sessions)
@@ -989,6 +999,7 @@ def build_app() -> FastAPI:
         browser_client,
         file_client,
         selector_memory_store=selector_memory,
+        recipe_store=recipe_store,
     )
     suite_executor = SuiteExecutor(
         settings,
@@ -1436,6 +1447,91 @@ def build_app() -> FastAPI:
                                 refreshed.source_test_case_id,
                                 profile_key,
                             )
+
+        # Save to recipe store so _try_recipe_replay handles this automatically on
+        # the next run.  Works for any run (not just test cases).  Skips step types
+        # where there is no meaningful action to replay.
+        if (
+            succeeded_step is not None
+            and succeeded_step.status == StepStatus.completed
+            and succeeded_step.provided_selector
+            and recipe_store is not None
+            and succeeded_step.type not in {"wait", "verify_text"}
+        ):
+            _stype = succeeded_step.type
+            _sinput = dict(succeeded_step.input or {})
+            _provided = succeeded_step.provided_selector
+
+            # Derive element_key from the ORIGINAL failing selector — that is what
+            # _try_recipe_replay will use to look up this recipe on the next run.
+            _key_input = dict(_sinput)
+            _orig_sel = _sinput.get("_selector_help_original")
+            if _orig_sel:
+                _key_input["selector"] = _orig_sel
+            _elem_key = AgentExecutor._extract_element_key(_stype, _key_input)
+            _domain = AgentExecutor._extract_domain(refreshed.start_url or "")
+
+            # Build failure context from the recovery_context captured at pause time.
+            _rc = succeeded_step.recovery_context
+            if _rc and _rc.failure_snapshot_summary:
+                _fail_ctx = AgentExecutor._build_failure_context_from_summary(
+                    _rc.failure_snapshot_summary
+                )
+            elif _rc and _rc.current_url:
+                _fail_ctx = FailureContext(url_path=urlparse(_rc.current_url).path)
+            else:
+                _fail_ctx = FailureContext()
+
+            _label = _sinput.get("accessible_name") or _sinput.get("label")
+            _name = _sinput.get("name")
+            _action: RecoveryAction | None = None
+
+            if _stype == "type":
+                _action = RecoveryAction(
+                    action_type="fill_field",
+                    label=_label,
+                    placeholder=_sinput.get("placeholder"),
+                    name=_name,
+                    selector_chain=[_provided],
+                    value=_sinput.get("value") or _sinput.get("text") or "",
+                    clear_first=True,
+                )
+            elif _stype in {"click", "handle_popup"}:
+                _action = RecoveryAction(
+                    action_type="click_control",
+                    label=_label,
+                    text=_sinput.get("text") or _sinput.get("text_hint"),
+                    role=_sinput.get("role"),
+                    name=_name,
+                    selector_chain=[_provided],
+                )
+            elif _stype == "select":
+                _action = RecoveryAction(
+                    action_type="select_option",
+                    label=_label,
+                    name=_name,
+                    selector_chain=[_provided],
+                    option_text=_sinput.get("option_text") or _sinput.get("text"),
+                    value=_sinput.get("value"),
+                )
+
+            if _action is not None:
+                try:
+                    recipe_store.save_recipe(RecoveryRecipe(
+                        domain=_domain,
+                        step_type=_stype,
+                        element_key=_elem_key,
+                        failure_context=_fail_ctx,
+                        success_signals=SuccessSignals(),
+                        actions=[_action],
+                    ))
+                    LOGGER.info(
+                        "Selector recovery: recipe saved domain=%r step_type=%r"
+                        " element_key=%r selector=%r",
+                        _domain, _stype, _elem_key, _provided,
+                    )
+                except Exception:
+                    LOGGER.exception("Selector recovery: failed to save recipe (non-fatal)")
 
     @app.post("/api/runs/{run_id}/steps/{step_id}/selector", response_model=RunState)
     async def submit_step_selector(

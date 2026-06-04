@@ -77,7 +77,22 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
 (function () {
     if (window.__phantomRecording === true) { return; }
     window.__phantomRecording = true;
+    // Hard gate: _push() only stores events while this is true.
+    // start_interaction_recording enables it; stop disables it.
+    // isTrusted alone cannot filter out Playwright CDP clicks (they are
+    // trusted by the browser), so this flag is the authoritative guard.
+    window.__phantomCapturing = true;
     window.__phantomClickCount = 0;
+
+    // Remove stale listeners from any prior recording session on this document.
+    // On SPA pages (no full navigation between recovery sessions), the document
+    // object persists and old addEventListener bindings stay active.
+    // The only way to remove them is via the stored function references.
+    // removeEventListener with a null ref is a no-op — safe to call regardless.
+    if (window.__phantomClickHandler)    { document.removeEventListener("click",     window.__phantomClickHandler,    true); }
+    if (window.__phantomMousedownHandler){ document.removeEventListener("mousedown",  window.__phantomMousedownHandler, true); }
+    if (window.__phantomInputHandler)    { document.removeEventListener("input",      window.__phantomInputHandler,     true); }
+    if (window.__phantomChangeHandler)   { document.removeEventListener("change",     window.__phantomChangeHandler,    true); }
 
     if (window === window.top) {
         window.__phantomInteractions = [];
@@ -130,6 +145,385 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
         return el;  // no meaningful ancestor — use the original
     }
 
+    // ---- shared identity resolver ----
+    // Centralises all meaningful-identity extraction for a DOM element.
+    // Priority order matches ARIA authoring-practices: explicit labelling
+    // attributes first, then programmatic associations, then visible text,
+    // then nearby semantic context as a last resort.
+    // Returns a plain object; all fields are trimmed strings or undefined.
+    function _resolveIdentity(el) {
+        var tag  = _s(el.tagName, 16).toUpperCase();
+        var role = _s(el.getAttribute ? el.getAttribute("role") : "", 64)
+                   || _s(el.role, 64);
+
+        // Track WHERE the label came from so selector generation can be exact.
+        // "aria-label" | "aria-labelledby" | "title" | "label-for" |
+        // "label-wrap" | "label-sibling" | ""
+        var _labelSrc   = "";
+        var _labelDepth = 0;   // DOM levels walked to find sibling label
+        var _labelElTag = "";  // actual tag name of the sibling label element
+
+        // 1. aria-label (explicit override — highest priority)
+        var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
+        if (label) { _labelSrc = "aria-label"; }
+
+        // 2. aria-labelledby → resolve one or more referenced element texts
+        if (!label) {
+            try {
+                var _lby = _s(el.getAttribute ? el.getAttribute("aria-labelledby") : "", 256);
+                if (_lby) {
+                    var _lbyParts = _lby.split(/\s+/).map(function(id) {
+                        var n = document.getElementById(id);
+                        return n ? _s((n.textContent || "").replace(/\s+/g, " "), 80) : "";
+                    }).filter(Boolean);
+                    if (_lbyParts.length) {
+                        label = _lbyParts.join(" ").slice(0, 128);
+                        _labelSrc = "aria-labelledby";
+                    }
+                }
+            } catch (_) {}
+        }
+
+        // 3. title attribute (tooltip / accessible name fallback)
+        if (!label) {
+            label = _s(el.getAttribute ? el.getAttribute("title") : "", 128);
+            if (label) { _labelSrc = "title"; }
+        }
+
+        // 4. <label for=id> — explicit HTML label association
+        if (!label && el.id) {
+            try {
+                var _lbl = document.querySelector("label[for='" + el.id + "']");
+                if (_lbl) {
+                    label = _s((_lbl.textContent || "").replace(/\s+/g, " "), 80);
+                    if (label) { _labelSrc = "label-for"; }
+                }
+            } catch (_) {}
+        }
+
+        // 5. Wrapping <label> — implicit HTML label association
+        if (!label) {
+            try {
+                var _lc = el.closest ? el.closest("label") : null;
+                if (_lc) {
+                    label = _s((_lc.textContent || "").replace(/\s+/g, " "), 80);
+                    if (label) { _labelSrc = "label-wrap"; }
+                }
+            } catch (_) {}
+        }
+
+        // Shared helpers for sibling label walks (steps 5b + 5c).
+        // Defined here once so both walks can use them without duplication.
+        //
+        // _isLabelEl: returns true for any element that acts as a visual label:
+        //   a) semantic label elements (<label>, <legend>), OR
+        //   b) explicit ARIA role="label", OR
+        //   c) any element with no interactive descendants and compact text
+        //      (covers <p>, <span>, <div> used as visual labels in React/Vue apps).
+        //
+        // _cleanLabelText: strips required/optional markers generically so
+        //   "First Name *" → "First Name", "Email (required)" → "Email".
+        var _isLabelEl = function(node) {
+            var nt = (node.tagName || "").toUpperCase();
+            if (nt === "LABEL" || nt === "LEGEND") { return true; }
+            if ((node.getAttribute ? node.getAttribute("role") : "") === "label") { return true; }
+            if (node.querySelector) {
+                if (node.querySelector("input,button,select,textarea,a[href]")) { return false; }
+            }
+            var _t = ((node.textContent || "").replace(/\s+/g, " ")).trim();
+            return _t.length > 0 && _t.length <= 80;
+        };
+        var _cleanLabelText = function(t) {
+            return t
+                .replace(/\s+/g, " ")
+                .replace(/\s*\([^)]*\)\s*$/, "")        // trailing (anything)
+                .replace(/[^a-zA-Z0-9À-ɏ\s]+\s*$/, "")  // trailing non-word chars
+                .trim();
+        };
+
+        // 5b. Preceding sibling label walk — up to 5 parent levels.
+        // Handles the common pattern: <label>Name</label><input> or
+        // <label>Name</label><div><input></div> (depth 1).
+        // The walk tracks depth so selectors are generated at the exact level found.
+        if (!label) {
+            try {
+                var _walkEl = el;
+                for (var _wi = 0; _wi < 5 && _walkEl && !label; _wi++) {
+                    var _prevSib = _walkEl.previousElementSibling;
+                    if (_prevSib && _isLabelEl(_prevSib)) {
+                        var _cleaned = _cleanLabelText(_prevSib.textContent || "");
+                        if (_cleaned && _cleaned.length <= 80) {
+                            label       = _cleaned.slice(0, 128);
+                            _labelSrc   = "label-sibling";
+                            _labelDepth = _wi;
+                            _labelElTag = (_prevSib.tagName || "label").toLowerCase();
+                        }
+                    }
+                    _walkEl = _walkEl.parentElement;
+                }
+            } catch (_) {}
+        }
+
+        // 5c. Following sibling label walk — up to 5 parent levels.
+        // Handles Vuetify / Quasar / Angular Material floating labels where the
+        // <label> element is rendered AFTER the <input> in DOM order and has no
+        // for= association.  Example: <div><input/><label>Email</label></div>.
+        // CSS has no backward-sibling combinator so no CSS selector is generated
+        // for this source; Playwright's get_by_label() handles it at replay time.
+        if (!label) {
+            try {
+                var _walkEl2 = el;
+                for (var _wi2 = 0; _wi2 < 5 && _walkEl2 && !label; _wi2++) {
+                    var _nextSib = _walkEl2.nextElementSibling;
+                    if (_nextSib && _isLabelEl(_nextSib)) {
+                        var _cleaned2 = _cleanLabelText(_nextSib.textContent || "");
+                        if (_cleaned2 && _cleaned2.length <= 80) {
+                            label       = _cleaned2.slice(0, 128);
+                            _labelSrc   = "label-sibling-next";
+                            _labelDepth = _wi2;
+                            _labelElTag = (_nextSib.tagName || "label").toLowerCase();
+                        }
+                    }
+                    _walkEl2 = _walkEl2.parentElement;
+                }
+            } catch (_) {}
+        }
+
+        var ph   = _s(el.placeholder, 128);   // 6. placeholder
+        var name = _s(el.name, 64);            // 7. name attribute
+
+        // 8. Role-based visible text — elements whose primary identity IS their text
+        var _TEXT_ROLES = {
+            "option":1, "menuitem":1, "menuitemcheckbox":1,
+            "menuitemradio":1, "tab":1, "treeitem":1
+        };
+        var text = (tag === "BUTTON" || tag === "A" || tag === "LABEL"
+                    || tag === "LI"  || tag === "OPTION"
+                    || !!_TEXT_ROLES[role])
+            ? _s((el.textContent || "").replace(/\s+/g, " "), 80)
+            : "";
+
+        // 9. Short visible textContent fallback — any element with a compact label
+        if (!text && !label && !name) {
+            var _raw = ((el.textContent || "").replace(/\s+/g, " ")).trim();
+            if (_raw && _raw.length <= 60) { text = _raw; }
+        }
+
+        // 10. Nearby semantic container text — last resort for anonymous icons/DIVs
+        if (!text && !label && !name) {
+            try {
+                var _ctrs = ["[role='group']", "fieldset", "li", "td", "th"];
+                for (var _ci = 0; _ci < _ctrs.length; _ci++) {
+                    var _ctr = el.closest ? el.closest(_ctrs[_ci]) : null;
+                    if (_ctr) {
+                        var _ct = (_ctr.textContent || "").replace(/\s+/g, " ").trim();
+                        if (_ct && _ct.length <= 60) { text = _ct; break; }
+                    }
+                }
+            } catch (_) {}
+        }
+
+        var _isSiblingLabel = (_labelSrc === "label-sibling" || _labelSrc === "label-sibling-next");
+        return {
+            tag:         tag,
+            role:        role       || undefined,
+            label:       label      || undefined,
+            labelSrc:    _labelSrc  || undefined,  // where label came from
+            labelDepth:  _isSiblingLabel ? _labelDepth : undefined,
+            labelElTag:  _isSiblingLabel ? (_labelElTag || undefined) : undefined,
+            text:        text       || undefined,
+            name:        name       || undefined,
+            placeholder: ph         || undefined
+        };
+    }
+
+    // ---- selector helpers ----
+    function _attr(tag, attr, val) {
+        return tag.toLowerCase() + "[" + attr + "=" + JSON.stringify(val) + "]";
+    }
+    function _hasText(tag, txt) {
+        return tag.toLowerCase() + ":has-text(" + JSON.stringify(txt.slice(0, 60)) + ")";
+    }
+    function _roleText(role, txt) {
+        return "[role=" + JSON.stringify(role) + "]:has-text(" + JSON.stringify(txt.slice(0, 60)) + ")";
+    }
+    function _isGeneratedId(id) {
+        if (!id) { return true; }
+        // Pure numeric, UUID-ish, or 20+ char random strings are unstable
+        if (/^\d+$/.test(id)) { return true; }
+        if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id)) { return true; }
+        if (id.length >= 20 && /[0-9]/.test(id) && /[a-zA-Z]/.test(id)) { return true; }
+        return false;
+    }
+
+    // Build a selector for elements whose label was found via a preceding sibling.
+    // Uses the exact depth recorded during identity resolution so the selector
+    // matches the real DOM structure without hardcoding depth patterns.
+    //   depth 0 → "label:has-text(...) ~ input"           (direct sibling of input)
+    //   depth 1 → "label:has-text(...) ~ * input"         (sibling of wrapper div)
+    //   depth 2 → "label:has-text(...) ~ * * input"       (sibling of outer wrapper)
+    function _siblingLabelSelector(labelElTag, labelText, inputTag, depth) {
+        var q = JSON.stringify(labelText.slice(0, 60));
+        var nesting = "";
+        for (var _d = 0; _d < depth; _d++) { nesting += "* "; }
+        return labelElTag + ":has-text(" + q + ") ~ " + nesting + inputTag.toLowerCase();
+    }
+
+    // Build a short XPath for the element — an independent structural path that
+    // complements the CSS selector chain.  Prefers stable attribute anchors
+    // (id, data-testid, aria-label) over positional paths.  Falls back to a
+    // depth-limited positional path so there is always some XPath available.
+    function _buildXPath(el) {
+        try {
+            if (el.id && !_isGeneratedId(el.id)) {
+                return '//*[@id=' + JSON.stringify(el.id) + ']';
+            }
+            var _dtid = el.getAttribute ? el.getAttribute("data-testid") : null;
+            if (_dtid) { return '//*[@data-testid=' + JSON.stringify(_dtid) + ']'; }
+            var _al = el.getAttribute ? el.getAttribute("aria-label") : null;
+            if (_al) {
+                return '//' + (el.tagName || "*").toLowerCase()
+                       + '[@aria-label=' + JSON.stringify(_al) + ']';
+            }
+            // Positional path — limited to 5 ancestor levels to stay practical
+            var parts = [];
+            var _xel = el;
+            var _xd  = 0;
+            while (_xel && _xel.tagName && _xd < 5) {
+                var _xtag = _xel.tagName.toLowerCase();
+                var _xidx = 1;
+                var _xsib = _xel.previousElementSibling;
+                while (_xsib) {
+                    if ((_xsib.tagName || "").toLowerCase() === _xtag) { _xidx++; }
+                    _xsib = _xsib.previousElementSibling;
+                }
+                parts.unshift(_xidx > 1 ? _xtag + "[" + _xidx + "]" : _xtag);
+                _xel = _xel.parentElement;
+                _xd++;
+            }
+            return "//" + parts.join("/");
+        } catch (_) { return undefined; }
+    }
+
+    // Capture the element's bounding rect as viewport-relative center point
+    // AND scroll-adjusted page-absolute center point.
+    // Stored so replay can fall back to coordinate-based interaction when every
+    // selector and label strategy fails (e.g. SVG icon buttons with no text).
+    // Returns undefined for all fields if getBoundingClientRect is unavailable.
+    function _getCoords(el) {
+        try {
+            var r = el.getBoundingClientRect();
+            if (!r || (r.width === 0 && r.height === 0)) { return {}; }
+            var cx = Math.round(r.left + r.width  / 2);
+            var cy = Math.round(r.top  + r.height / 2);
+            var sx = Math.round(window.scrollX || window.pageXOffset || 0);
+            var sy = Math.round(window.scrollY || window.pageYOffset || 0);
+            return {
+                viewport_x: cx,
+                viewport_y: cy,
+                page_x:     cx + sx,
+                page_y:     cy + sy,
+                el_width:   Math.round(r.width),
+                el_height:  Math.round(r.height)
+            };
+        } catch (_) { return {}; }
+    }
+
+    // Compute single best CSS/Playwright locator for the element.
+    // Uses labelSrc to pick the correct selector type for each label origin —
+    // no hardcoded assumptions about which attribute the element has.
+    function stableSelector(el, _id) {
+        var tag  = (_id.tag || "INPUT").toLowerCase();
+        var dtid = el.getAttribute ? el.getAttribute("data-testid") : null;
+        if (dtid) { return "[data-testid=" + JSON.stringify(dtid) + "]"; }
+        var dcy = el.getAttribute ? (el.getAttribute("data-cy") || el.getAttribute("data-qa")) : null;
+        if (dcy) { return "[data-cy=" + JSON.stringify(dcy) + "]"; }
+        if (_id.label) {
+            switch (_id.labelSrc) {
+                case "aria-label":
+                    return _attr(_id.tag, "aria-label", _id.label);
+                case "aria-labelledby":
+                    var _lbyAttr = el.getAttribute ? el.getAttribute("aria-labelledby") : null;
+                    if (_lbyAttr) { return _attr(_id.tag, "aria-labelledby", _lbyAttr); }
+                    break;
+                case "title":
+                    return _attr(_id.tag, "title", _id.label);
+                case "label-for":
+                    if (el.id && !_isGeneratedId(el.id)) { return "#" + el.id; }
+                    break;
+                case "label-wrap":
+                    // Input is inside a <label> — descendant selector
+                    return "label:has-text(" + JSON.stringify(_id.label.slice(0, 60)) + ") " + tag;
+                case "label-sibling":
+                    // Exact depth-matched selector using the actual sibling element tag
+                    return _siblingLabelSelector(
+                        _id.labelElTag || "label", _id.label, _id.tag, _id.labelDepth || 0
+                    );
+                case "label-sibling-next":
+                    // Following-sibling pattern (Vuetify/Quasar/Angular Material floating
+                    // labels). CSS has no backward-sibling combinator, so no CSS selector
+                    // is generated here — fall through to name/id/placeholder fallbacks.
+                    // Replay uses page.get_by_label(label) as the primary strategy.
+                    break;
+            }
+        }
+        if (el.id && !_isGeneratedId(el.id)) { return "#" + el.id; }
+        if (_id.name) { return _attr(_id.tag, "name", _id.name); }
+        if (_id.role && _id.text) { return _roleText(_id.role, _id.text); }
+        if (_id.text) { return _hasText(_id.tag, _id.text); }
+        if (_id.placeholder) { return _attr(_id.tag, "placeholder", _id.placeholder); }
+        return tag;
+    }
+
+    // Build ordered fallback selector list (max 5, deduplicated).
+    // For sibling-label elements, generates selectors at every depth from 0
+    // up to found depth + 1 so DOM restructuring doesn't break all fallbacks.
+    function buildSelectorChain(el, _id) {
+        var chain = [];
+        function _add(s) {
+            if (s && chain.indexOf(s) === -1 && chain.length < 5) { chain.push(s); }
+        }
+        var dtid = el.getAttribute ? el.getAttribute("data-testid") : null;
+        if (dtid)        { _add("[data-testid=" + JSON.stringify(dtid) + "]"); }
+        var dcy = el.getAttribute ? (el.getAttribute("data-cy") || el.getAttribute("data-qa")) : null;
+        if (dcy)         { _add("[data-cy=" + JSON.stringify(dcy) + "]"); }
+        if (_id.label) {
+            switch (_id.labelSrc) {
+                case "aria-label":
+                    _add(_attr(_id.tag, "aria-label", _id.label)); break;
+                case "aria-labelledby":
+                    var _lbyAttr2 = el.getAttribute ? el.getAttribute("aria-labelledby") : null;
+                    if (_lbyAttr2) { _add(_attr(_id.tag, "aria-labelledby", _lbyAttr2)); } break;
+                case "title":
+                    _add(_attr(_id.tag, "title", _id.label)); break;
+                case "label-for":
+                    if (el.id && !_isGeneratedId(el.id)) { _add("#" + el.id); } break;
+                case "label-wrap":
+                    _add("label:has-text(" + JSON.stringify(_id.label.slice(0, 60)) + ") " + (_id.tag || "input").toLowerCase());
+                    break;
+                case "label-sibling":
+                    // Add selectors at exact found depth AND all shallower depths as
+                    // fallbacks — if DOM restructures, a shallower pattern may still match.
+                    var _ltag = _id.labelElTag || "label";
+                    var _foundDepth = _id.labelDepth || 0;
+                    for (var _fd = 0; _fd <= _foundDepth + 1; _fd++) {
+                        _add(_siblingLabelSelector(_ltag, _id.label, _id.tag, _fd));
+                    }
+                    break;
+                case "label-sibling-next":
+                    // No CSS backward-sibling selector — fall through to name/id/placeholder.
+                    // Replay uses page.get_by_label(label) as primary strategy.
+                    break;
+            }
+        }
+        if (el.id && !_isGeneratedId(el.id)) { _add("#" + el.id); }
+        if (_id.name)    { _add(_attr(_id.tag, "name", _id.name)); }
+        if (_id.role && _id.text) { _add(_roleText(_id.role, _id.text)); }
+        if (_id.text)    { _add(_hasText(_id.tag, _id.text)); }
+        if (_id.placeholder) { _add(_attr(_id.tag, "placeholder", _id.placeholder)); }
+        return chain;
+    }
+
     function _phantomOnClick(e) {
         window.__phantomClickCount++;
         if (!e.isTrusted) { return; }
@@ -146,52 +540,34 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
             // attributed to the correct interactive element.
             var el = _resolveTarget(e.target);
 
-            var tag   = _s(el.tagName, 16).toUpperCase();
             var itype = _s(el.type, 32).toLowerCase();
-            var role  = _s(el.getAttribute ? el.getAttribute("role") : "", 64)
-                        || _s(el.role, 64);
-            var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
-            var ph    = _s(el.placeholder, 128);
-            var name  = _s(el.name, 64);
-
-            // Capture visible text for elements whose text content is their
-            // primary identity: buttons, links, labels, list items, native
-            // options, and ARIA selectable roles (option, menuitem, tab, etc.).
-            var _TEXT_ROLES = {
-                "option":1, "menuitem":1, "menuitemcheckbox":1,
-                "menuitemradio":1, "tab":1, "treeitem":1
-            };
-            var text = (tag === "BUTTON" || tag === "A" || tag === "LABEL"
-                        || tag === "LI"  || tag === "OPTION"
-                        || !!_TEXT_ROLES[role])
-                ? _s((el.textContent || "").replace(/\\s+/g, " "), 80)
-                : "";
-
-            // Generic visible-text fallback: if no identity was captured above,
-            // try the element's own textContent.  Only use it when the FULL
-            // text is short enough to be a label rather than a content block
-            // (e.g. a dropdown option "Enter options manually" passes, but a
-            // container div holding all options at once does not).
-            if (!text && !label && !name) {
-                var _rawFull = ((el.textContent || "").replace(/\\s+/g, " ")).trim();
-                if (_rawFull && _rawFull.length <= 60) { text = _rawFull; }
-            }
+            var _id   = _resolveIdentity(el);
+            var tag   = _id.tag;
+            var role  = _id.role        || "";
+            var label = _id.label       || "";
+            var ph    = _id.placeholder || "";
+            var name  = _id.name        || "";
+            var text  = _id.text        || "";
 
             var isCheckable = (tag === "INPUT"
                 && (itype === "checkbox" || itype === "radio"));
+            var _sel   = stableSelector(el, _id);
+            var _chain = buildSelectorChain(el, _id);
 
             _push({
-                kind:        "click",
-                tag:         tag,
-                type:        itype  || undefined,
-                role:        role   || undefined,
-                label:       label  || undefined,
-                placeholder: ph     || undefined,
-                name:        name   || undefined,
-                text:        text   || undefined,
-                checked:     isCheckable ? !!el.checked : undefined,
-                url:         _s(window.location.href, 512),
-                timestamp:   Date.now(),
+                kind:           "click",
+                tag:            tag,
+                type:           itype  || undefined,
+                role:           role   || undefined,
+                label:          label  || undefined,
+                placeholder:    ph     || undefined,
+                name:           name   || undefined,
+                text:           text   || undefined,
+                checked:        isCheckable ? !!el.checked : undefined,
+                selector:       _sel,
+                selector_chain: _chain,
+                url:            _s(window.location.href, 512),
+                timestamp:      Date.now(),
                 fingerprint: {
                     tag:         tag,
                     role:        role   || undefined,
@@ -206,6 +582,10 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
 
     // ---- shared buffer push ----
     function _push(entry) {
+        // Hard gate: drop events unless the recording window is explicitly open.
+        // Playwright CDP clicks are isTrusted=true, so isTrusted alone cannot
+        // distinguish agent actions from human ones.
+        if (!window.__phantomCapturing) { return; }
         var buf = null;
         try { buf = window.top.__phantomInteractions; } catch (_cx) {}
         if (!buf) {
@@ -218,38 +598,40 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
 
     // ---- shared value-event builder ----
     function _valueEntry(el, kind) {
-        var tag   = _s(el.tagName, 16).toUpperCase();
         var itype = _s(el.type, 32).toLowerCase();
         var isCheckable = (itype === "checkbox" || itype === "radio");
-        var label = _s(el.getAttribute ? el.getAttribute("aria-label") : "", 128);
-        var ph    = _s(el.placeholder, 128);
-        // Resolve visible label text via <label for=id> or wrapping <label>.
-        if (!label && el.id) {
-            try {
-                var lbl = document.querySelector("label[for='" + el.id + "']");
-                if (lbl) { label = _s((lbl.textContent || "").replace(/\\s+/g, " "), 80); }
-            } catch (_) {}
-        }
-        if (!label) {
-            try {
-                var closest = el.closest ? el.closest("label") : null;
-                if (closest) { label = _s((closest.textContent || "").replace(/\\s+/g, " "), 80); }
-            } catch (_) {}
+        var isSelect    = (el.tagName || "").toUpperCase() === "SELECT";
+        var isTextInput = !isCheckable && !isSelect;
+        var _id   = _resolveIdentity(el);
+        var tag   = _id.tag;
+        var label = _id.label       || "";
+        var ph    = _id.placeholder || "";
+        var _sel   = stableSelector(el, _id);
+        var _chain = buildSelectorChain(el, _id);
+        // For SELECT: capture the visible label of the chosen option alongside value
+        var _optText = undefined;
+        if (isSelect && el.selectedIndex >= 0) {
+            var _opt = el.options[el.selectedIndex];
+            if (_opt) { _optText = _s(_opt.text || "", 128) || undefined; }
         }
         return {
-            kind:        kind,
-            tag:         tag,
-            type:        itype  || undefined,
-            name:        _s(el.name, 64) || undefined,
-            role:        _s(el.getAttribute ? el.getAttribute("role") : "", 64) || undefined,
-            label:       label  || undefined,
-            placeholder: ph     || undefined,
-            value:       isCheckable    ? undefined
-                         : itype === "password" ? "[REDACTED]"
-                         : _s(el.value, 256) || undefined,
-            checked:     isCheckable ? !!el.checked : undefined,
-            url:         _s(window.location.href, 512),
-            timestamp:   Date.now()
+            kind:           kind,
+            tag:            tag,
+            type:           itype        || undefined,
+            name:           _id.name     || undefined,
+            role:           _id.role     || undefined,
+            label:          label        || undefined,
+            placeholder:    ph           || undefined,
+            value:          isCheckable    ? undefined
+                            : itype === "password" ? "[REDACTED]"
+                            : _s(el.value, 256) || undefined,
+            checked:        isCheckable ? !!el.checked : undefined,
+            selector:       _sel,
+            selector_chain: _chain,
+            option_text:    _optText,
+            clear_first:    isTextInput ? true : undefined,
+            url:            _s(window.location.href, 512),
+            timestamp:      Date.now()
         };
     }
 
@@ -352,10 +734,14 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
                        + "|" + Math.floor(Date.now() / 300);
 
             // Hold the entry — push only if click doesn't supersede within 300ms.
-            _lastMousedownEntry = { sig: _sig, ts: Date.now(), entry: _entry };
+            // Use a token object so the timeout can detect if it was superseded
+            // even when mousedown and click fire at the exact same millisecond
+            // (same 300ms bucket), which would otherwise cause both to push.
+            var _token = { sig: _sig, ts: Date.now(), entry: _entry, superseded: false };
+            _lastMousedownEntry = _token;
             setTimeout(function () {
-                if (_lastMousedownEntry && _lastMousedownEntry.sig === _sig) {
-                    _push(_lastMousedownEntry.entry);
+                if (_token === _lastMousedownEntry && !_token.superseded) {
+                    _push(_token.entry);
                     _lastMousedownEntry = null;
                 }
             }, 300);
@@ -379,6 +765,9 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
                         + "|" + Math.floor(Date.now() / 300);
             if (_sig === _lastMousedownEntry.sig) {
                 // click arrived for the same element — prefer click, discard mousedown.
+                // Mark the token superseded so the setTimeout callback is a no-op
+                // even if mousedown and click fire at the exact same millisecond.
+                _lastMousedownEntry.superseded = true;
                 _lastMousedownEntry = null;
                 _lastTrustedClickMs = Date.now();
                 _phantomOnClickOrig(e);
@@ -388,7 +777,12 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
         _phantomOnClickOrig(e);
     };
 
-    window.__phantomClickHandler = _phantomOnClick;
+    // Store all handler references so the NEXT injection can remove these exact
+    // functions via removeEventListener before registering fresh ones.
+    window.__phantomClickHandler     = _phantomOnClick;
+    window.__phantomMousedownHandler = _phantomOnMousedown;
+    window.__phantomInputHandler     = _phantomOnInput;
+    window.__phantomChangeHandler    = _phantomOnChange;
     document.addEventListener("mousedown", _phantomOnMousedown, true);
     document.addEventListener("click",     _phantomOnClick,     true);
     document.addEventListener("input",     _phantomOnInput,     true);
@@ -400,9 +794,21 @@ _RECOVERY_RECORDER_SCRIPT: str = """\
 # Injected when recovery_mode exits (success, timeout, or cancellation).
 _RECOVERY_RECORDER_TEARDOWN_SCRIPT: str = """\
 (function () {
+    // Disable the capture gate first so no events sneak in during teardown.
+    window.__phantomCapturing = false;
+    // Remove the event listeners using the stored function references.
+    // This is the definitive cleanup — the next injection's removeEventListener
+    // calls are a belt-and-suspenders fallback in case teardown is skipped.
+    if (window.__phantomClickHandler)    { document.removeEventListener("click",     window.__phantomClickHandler,    true); }
+    if (window.__phantomMousedownHandler){ document.removeEventListener("mousedown",  window.__phantomMousedownHandler, true); }
+    if (window.__phantomInputHandler)    { document.removeEventListener("input",      window.__phantomInputHandler,     true); }
+    if (window.__phantomChangeHandler)   { document.removeEventListener("change",     window.__phantomChangeHandler,    true); }
+    window.__phantomClickHandler     = null;
+    window.__phantomMousedownHandler = null;
+    window.__phantomInputHandler     = null;
+    window.__phantomChangeHandler    = null;
     window.__phantomRecording = false;
     window.__phantomClickCount = 0;
-    window.__phantomClickHandler = null;
     if (window === window.top) { window.__phantomInteractions = []; }
 })();
 """
@@ -2460,13 +2866,15 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
                 # Verify globals are visible on the main frame.
                 verify = await page.evaluate(
                     "({ recording: window.__phantomRecording,"
+                    "   capturing: window.__phantomCapturing,"
                     "   interactionsReady: !!window.__phantomInteractions })"
                 )
                 LOGGER.info(
                     "Run %s: recovery recorder injected — url=%r frames=%d"
-                    " recording=%s interactionsReady=%s",
+                    " recording=%s capturing=%s interactionsReady=%s",
                     run_id, page_url, frame_count,
                     verify.get("recording"),
+                    verify.get("capturing"),
                     verify.get("interactionsReady"),
                 )
 
