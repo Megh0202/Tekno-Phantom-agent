@@ -818,28 +818,6 @@ _MOCK_SCREENSHOT_BYTES = base64.b64decode(
 )
 
 
-def _extract_drag_label(selector: str) -> str | None:
-    text = selector.strip()
-    lower = text.lower()
-    if "short-answer" in lower or "short answer" in lower or "field-short" in lower:
-        return "Short answer"
-    if "field-dropdown" in lower or "linked dropdown" in lower or "dropdown" in lower:
-        return "Dropdown"
-    if "field-email" in lower:
-        return "Email"
-    if "aria-label" in lower and "email" in lower:
-        return "Email"
-    if "aria-label" in lower and "short" in lower:
-        return "Short answer"
-    has_text = re.search(r":has-text\((['\"])(.*?)\1\)", text, re.IGNORECASE)
-    if has_text and has_text.group(2).strip():
-        return has_text.group(2).strip()
-    text_selector = re.search(r"^text\s*=\s*(.+)$", text, re.IGNORECASE)
-    if text_selector and text_selector.group(1).strip():
-        return text_selector.group(1).strip().strip("'\"")
-    return None
-
-
 def image_delta_ratio(baseline_bytes: bytes, current_bytes: bytes) -> float:
     if Image is None or ImageChops is None:
         raise RuntimeError("Pillow is required for image verification. Install with `pip install pillow`.")
@@ -1215,33 +1193,16 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             before_page_count = len(context.context.pages)
         except Exception:
             before_page_count = 0
-        selector_lower = selector.lower()
-        is_add_option_click = (
-            "add-option" in selector_lower
-            or "text=+" in selector_lower
-            or ":has-text('+')" in selector_lower
-            or "placeholder='value']) button" in selector_lower
-            or 'placeholder="value"]) button' in selector_lower
-        )
-        if is_add_option_click:
-            dialog = context.page.locator("div[role='dialog']").first
-            before_count = await dialog.locator("input[placeholder='Value']").count()
-            candidate_selectors = [
-                selector,
-                "div[role='dialog'] button:has(svg[class*='plus'])",
-                "div[role='dialog'] button:has(i[class*='plus'])",
-                "div[role='dialog'] [data-testid*='add-option']",
-                "div[role='dialog'] [aria-label*='Add option']",
-                "div[role='dialog'] div:has(input[placeholder='Value']) button",
-                "div[role='dialog'] button:has-text('+')",
-            ]
-            for candidate in candidate_selectors:
+        # If clicking a native <select> option, translate to select_option on the parent.
+        _opt_m = re.match(r'^(.+?)\s+option\[value="([^"]*)"\]$', selector)
+        if _opt_m:
+            _parent_sel, _opt_val = _opt_m.group(1), _opt_m.group(2)
+            _parent_loc = context.page.locator(_parent_sel).first
+            for _kwargs in ({"value": _opt_val}, {"label": _opt_val}):
                 try:
-                    await context.page.locator(candidate).first.click(timeout=1400)
-                    await context.page.wait_for_timeout(180)
-                    after_count = await dialog.locator("input[placeholder='Value']").count()
-                    if after_count > before_count:
-                        return f"Clicked {candidate}"
+                    _selected = await _parent_loc.select_option(timeout=2500, **_kwargs)
+                    if _selected:
+                        return f"Selected option '{_opt_val}' in {_parent_sel}"
                 except Exception:
                     continue
         locator = context.page.locator(selector).first
@@ -1323,13 +1284,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
         context = self._active_context()
-        selector_lower = selector.lower()
-        if "div[role='dialog'] input[placeholder='label']" in selector_lower and "enter a label" not in selector_lower:
-            locator = context.page.locator("div[role='dialog'] input[placeholder='Label']").last
-        elif "div[role='dialog'] input[placeholder='value']" in selector_lower:
-            locator = context.page.locator("div[role='dialog'] input[placeholder='Value']").last
-        else:
-            locator = context.page.locator(selector).first
+        locator = context.page.locator(selector).first
         if clear_first:
             await locator.fill(text)
             mode = "after clear"
@@ -1341,9 +1296,20 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def select(self, selector: str, value: str) -> str:
         context = self._active_context()
-        selected_values = await context.page.locator(selector).first.select_option(value=value)
+        locator = context.page.locator(selector).first
+        selected_values = None
+        last_err: Exception | None = None
+        for kwargs in ({"value": value}, {"label": value}):
+            try:
+                selected_values = await locator.select_option(**kwargs)
+                if selected_values:
+                    break
+            except Exception as exc:
+                last_err = exc
         if not selected_values:
-            raise ValueError(f"No option with value '{value}' found in {selector}")
+            raise ValueError(
+                f"No option matching '{value}' found in {selector}"
+            ) from last_err
         return f"Selected {value} in {selector}"
 
     async def drag_and_drop(
@@ -1354,401 +1320,44 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
         target_offset_y: int | None = None,
     ) -> str:
         context = self._active_context()
-        current_url = (context.page.url or "").lower()
-        is_vitaone = "vitaone.io" in current_url
         source = context.page.locator(source_selector).first
         target = context.page.locator(target_selector).first
-        placeholder = context.page.locator("text=Drag and drop fields here").first
-        canvas_root = context.page.locator(
-            "div.form-row[draggable='true']:has-text('Drag and drop fields here'), "
-            "div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here'), "
-            "[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas, section:has-text('Drag and drop fields here')"
-        ).first
-        inserted_fields = context.page.locator(
-            "[data-testid='form-builder-canvas'] [data-testid*='field-'], "
-            "[data-testid='form-builder-canvas'] input[placeholder='Label'], "
-            "[data-testid='form-builder-canvas'] textarea[placeholder='Label'], "
-            ".form-canvas input[placeholder='Label'], "
-            ".form-canvas textarea[placeholder='Label']"
-        )
-        canvas_rows = context.page.locator(
-            "[data-row-id].form-row[draggable='true'], "
-            "[data-testid='form-builder-canvas'] .form-row[draggable='true'], "
-            ".form-canvas .form-row[draggable='true'], "
-            ".form-drop-area .form-row[draggable='true']"
-        )
-        had_placeholder = False
-        before_inserted_count = 0
-        before_row_count = 0
-        before_canvas_text = ""
-        before_short_answer_in_canvas = 0
+        quick_timeout_ms = min(max(self._settings.playwright_default_timeout_ms // 4, 900), 2200)
         try:
-            had_placeholder = await placeholder.is_visible()
-        except Exception:
-            had_placeholder = False
-        try:
-            before_inserted_count = await inserted_fields.count()
-        except Exception:
-            before_inserted_count = 0
-        try:
-            before_row_count = await canvas_rows.count()
-        except Exception:
-            before_row_count = 0
-        try:
-            before_canvas_text = (await canvas_root.text_content() or "").strip()
-        except Exception:
-            before_canvas_text = ""
-        try:
-            before_short_answer_in_canvas = await canvas_root.locator("text=Short answer").count()
-        except Exception:
-            before_short_answer_in_canvas = 0
-        try:
-            before_source_label_in_canvas = (
-                await canvas_root.locator(f"text={source_label}").count() if source_label else 0
-            )
-        except Exception:
-            before_source_label_in_canvas = 0
-
-        source_label = _extract_drag_label(source_selector)
-        if source_label:
-            source_candidates = [
-                context.page.locator(f"[data-testid*='field-']:has-text(\"{source_label}\")").first,
-                context.page.locator(f"[data-testid='field-{source_label.lower().replace(' ', '-')}']").first,
-                context.page.locator(f"[data-rbd-draggable-id*='{source_label.lower().split()[0]}']").first,
-                context.page.locator(f"[draggable='true']:has-text(\"{source_label}\")").first,
-                context.page.locator(f"[role='listitem']:has-text(\"{source_label}\")").first,
-                context.page.locator(f"button:has-text(\"{source_label}\")").first,
-                context.page.locator(f"[role='button']:has-text(\"{source_label}\")").first,
-                context.page.get_by_text(source_label, exact=False).first,
-            ]
-            try:
-                for candidate in source_candidates:
-                    try:
-                        if await candidate.count() == 0:
-                            continue
-                        await candidate.wait_for(state="visible", timeout=1200)
-                        source = candidate
-                        break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        try:
+            if await source.count() == 0:
+                raise ValueError(f"Drag source not found: {source_selector}")
+            await source.wait_for(state="visible", timeout=quick_timeout_ms)
             if await target.count() == 0:
-                if await canvas_root.count() > 0:
-                    target = canvas_root
-                elif had_placeholder:
-                    target = placeholder
+                raise ValueError(f"Drag target not found: {target_selector}")
+            await target.wait_for(state="visible", timeout=quick_timeout_ms)
+        except Exception as exc:
+            compact = str(exc).strip().replace("\r", " ").replace("\n", " ")
+            compact = re.sub(r"\s+", " ", compact)
+            if not compact:
+                compact = repr(exc)
+            raise ValueError(
+                f"Drag precheck failed for source={source_selector} target={target_selector}: {compact}"
+            ) from exc
+
+        before_text = ""
+        try:
+            before_text = await context.page.evaluate(
+                "() => (document.body?.textContent || '').replace(/\s+/g, ' ').trim()"
+            )
         except Exception:
             pass
 
-        quick_timeout_ms = min(max(self._settings.playwright_default_timeout_ms // 4, 900), 2200)
-        if not is_vitaone:
-            try:
-                if await source.count() == 0:
-                    raise ValueError(f"Drag source not found: {source_selector}")
-                await source.wait_for(state="visible", timeout=quick_timeout_ms)
-                if await target.count() == 0:
-                    raise ValueError(f"Drag target not found: {target_selector}")
-                await target.wait_for(state="visible", timeout=quick_timeout_ms)
-            except Exception as exc:
-                compact = str(exc).strip().replace("\r", " ").replace("\n", " ")
-                compact = re.sub(r"\s+", " ", compact)
-                if not compact:
-                    compact = repr(exc)
-                raise ValueError(
-                    f"Drag precheck failed for source={source_selector} target={target_selector}: {compact}"
-                ) from exc
-
         async def _validate_drop_effect() -> None:
             await context.page.wait_for_timeout(max(self._settings.drag_validation_wait_ms, 100))
-            placeholder_visible = False
-            if had_placeholder:
-                try:
-                    placeholder_visible = await placeholder.is_visible()
-                except Exception:
-                    placeholder_visible = False
             try:
-                current_count = await inserted_fields.count()
-            except Exception:
-                current_count = before_inserted_count
-            try:
-                current_row_count = await canvas_rows.count()
-            except Exception:
-                current_row_count = before_row_count
-            try:
-                current_canvas_text = (await canvas_root.text_content() or "").strip()
-            except Exception:
-                current_canvas_text = before_canvas_text
-            try:
-                current_short_answer_in_canvas = await canvas_root.locator("text=Short answer").count()
-            except Exception:
-                current_short_answer_in_canvas = before_short_answer_in_canvas
-            try:
-                current_source_label_in_canvas = (
-                    await canvas_root.locator(f"text={source_label}").count() if source_label else 0
+                after_text = await context.page.evaluate(
+                    "() => (document.body?.textContent || '').replace(/\s+/g, ' ').trim()"
                 )
+                if after_text != before_text:
+                    return
             except Exception:
-                current_source_label_in_canvas = before_source_label_in_canvas
-            try:
-                short_answer_modal_visible = await context.page.locator(
-                    "div[role='dialog']:has-text('Short answer'), "
-                    "div[role='dialog'] input[placeholder='Enter a label'], "
-                    "div[role='dialog'] button:has-text('Save')"
-                ).first.is_visible()
-            except Exception:
-                short_answer_modal_visible = False
-
-            if had_placeholder and not placeholder_visible:
                 return
-            if current_row_count > before_row_count:
-                return
-            if current_count > before_inserted_count:
-                return
-            if is_vitaone and current_short_answer_in_canvas > before_short_answer_in_canvas:
-                return
-            if source_label and current_source_label_in_canvas > before_source_label_in_canvas:
-                return
-            if is_vitaone and short_answer_modal_visible:
-                return
-            if current_canvas_text and current_canvas_text != before_canvas_text:
-                return
-            if had_placeholder:
-                raise ValueError("Drop not applied: canvas placeholder still visible and no new field appeared")
-            raise ValueError("Drop not applied: no new field appeared in canvas")
-
-        # Strategy 0: VitaOne pointer-driven drag (stable for the form builder canvas).
-        if is_vitaone:
-            try:
-                token = (source_label or "Short answer").strip()
-                token_l = token.lower()
-                key_token = token_l.split()[0] if token_l else "short"
-                vita_source_candidates = [
-                    context.page.locator(f"[draggable='true']:has-text(\"{token}\")").first,
-                    context.page.locator(f"[role='listitem']:has-text(\"{token}\")").first,
-                    context.page.locator(f"[data-rbd-draggable-id*='{key_token}']").first,
-                    context.page.locator(f"[data-testid='field-{token_l.replace(' ', '-')}']").first,
-                    context.page.locator(f"[data-testid*='{token_l.replace(' ', '-')}']").first,
-                    context.page.locator(f"button:has-text(\"{token}\")").first,
-                    context.page.locator(f"[role='button']:has-text(\"{token}\")").first,
-                    source,
-                ]
-                vita_canvas_candidates = [
-                    context.page.locator("[data-row-id].form-row[draggable='true']").last,
-                    context.page.locator("[data-row-id]").last,
-                    context.page.locator("[data-testid='form-builder-canvas']").first,
-                    context.page.locator(".form-canvas").first,
-                    context.page.locator(".form-builder-canvas").first,
-                    context.page.locator(".form-drop-area").first,
-                    context.page.locator("[data-testid='form-builder-canvas'] .form-row[draggable='true']").last,
-                    context.page.locator(".form-canvas .form-row[draggable='true']").last,
-                    context.page.locator(".form-drop-area .form-row[draggable='true']").last,
-                    context.page.locator("div.form-row[draggable='true']:has-text('Drag and drop fields here')").first,
-                    context.page.locator("div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')").first,
-                    canvas_root,
-                    target,
-                ]
-                vita_target = target
-                for candidate in vita_canvas_candidates:
-                    try:
-                        if await candidate.count() == 0:
-                            continue
-                        await candidate.wait_for(state="visible", timeout=1000)
-                        box = await candidate.bounding_box()
-                        if box and box["x"] > 250 and box["width"] > 220:
-                            vita_target = candidate
-                            break
-                        vita_target = candidate
-                        break
-                    except Exception:
-                        continue
-                await vita_target.wait_for(state="visible", timeout=2500)
-                target_box = await vita_target.bounding_box()
-                if not target_box:
-                    raise ValueError("VitaOne canvas bounding box not found")
-                canvas_container = context.page.locator(
-                    "[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas"
-                ).first
-                canvas_box = target_box
-                try:
-                    if await canvas_container.count() > 0:
-                        await canvas_container.wait_for(state="visible", timeout=1000)
-                        container_box = await canvas_container.bounding_box()
-                        if container_box:
-                            canvas_box = container_box
-                except Exception:
-                    pass
-
-                vita_source = source
-                for candidate in vita_source_candidates:
-                    try:
-                        if await candidate.count() == 0:
-                            continue
-                        await candidate.wait_for(state="visible", timeout=1200)
-                        box = await candidate.bounding_box()
-                        if not box:
-                            continue
-                        # Prefer the source tile in left palette, not any dropped field in canvas.
-                        if box["x"] < target_box["x"]:
-                            vita_source = candidate
-                            break
-                    except Exception:
-                        continue
-
-                # Prefer draggable/container ancestor when the matched node is an inner label/button.
-                try:
-                    ancestor_candidates = [
-                        vita_source.locator("xpath=ancestor::*[@draggable='true'][1]").first,
-                        vita_source.locator("xpath=ancestor::*[@data-rbd-draggable-id][1]").first,
-                        vita_source.locator("xpath=ancestor::*[contains(@data-testid,'field-')][1]").first,
-                    ]
-                    for anc in ancestor_candidates:
-                        try:
-                            if await anc.count() == 0:
-                                continue
-                            await anc.wait_for(state="visible", timeout=900)
-                            anc_box = await anc.bounding_box()
-                            if anc_box and anc_box["x"] < target_box["x"]:
-                                vita_source = anc
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-
-                source_box = await vita_source.bounding_box()
-                if not source_box:
-                    raise ValueError("VitaOne source bounding box not found")
-
-                sx = source_box["x"] + max(min(source_box["width"] * 0.30, source_box["width"] - 10), 10)
-                sy = source_box["y"] + max(min(source_box["height"] * 0.50, source_box["height"] - 6), 6)
-                requested_x = int(target_offset_x) if target_offset_x is not None else 220
-                requested_y = int(target_offset_y) if target_offset_y is not None else 200
-                safe_x = min(max(requested_x, 120), max(int(canvas_box["width"]) - 120, 120))
-                safe_y = min(max(requested_y, 120), max(int(canvas_box["height"]) - 120, 120))
-                tx = canvas_box["x"] + safe_x
-                ty = canvas_box["y"] + safe_y
-                drop_points: list[tuple[float, float]] = [(tx, ty)]
-
-                # Prefer dropping below the last existing builder row to avoid side-by-side placement.
-                try:
-                    existing_rows = vita_target.locator(":scope .form-row[draggable='true']")
-                    if await existing_rows.count() == 0:
-                        existing_rows = context.page.locator(
-                            "[data-row-id].form-row[draggable='true'], "
-                            "[data-testid='form-builder-canvas'] .form-row[draggable='true'], "
-                            ".form-canvas .form-row[draggable='true'], "
-                            ".form-drop-area .form-row[draggable='true']"
-                        )
-                    row_count = await existing_rows.count()
-                    if row_count > 0:
-                        max_bottom = canvas_box["y"] + 80
-                        best_left = canvas_box["x"] + 140
-                        sample_limit = min(row_count, 15)
-                        for idx in range(sample_limit):
-                            try:
-                                row = existing_rows.nth(idx)
-                                row_text = ((await row.text_content()) or "").strip().lower()
-                                if "drag and drop fields here" in row_text:
-                                    continue
-                                row_box = await row.bounding_box()
-                                if not row_box:
-                                    continue
-                                row_bottom = row_box["y"] + row_box["height"]
-                                if row_bottom > max_bottom:
-                                    max_bottom = row_bottom
-                                    best_left = row_box["x"] + 40
-                                    # Keep latest row for alternate right-slot insertion point.
-                                    last_row_box = row_box
-                            except Exception:
-                                continue
-
-                        tx = min(
-                            max(best_left, canvas_box["x"] + 90),
-                            canvas_box["x"] + max(int(canvas_box["width"]) - 130, 130),
-                        )
-                        # Keep drop point inside canvas but below last row.
-                        canvas_top = canvas_box["y"] + 100
-                        canvas_bottom = canvas_box["y"] + max(canvas_box["height"] - 80, 180)
-                        desired = max_bottom + 56
-                        ty = min(max(desired, canvas_top), canvas_bottom)
-                        drop_points = [(tx, ty)]
-                        # Alternate: insert in same row right-side slot (works for some layouts).
-                        if "last_row_box" in locals():
-                            right_slot_x = min(
-                                max(last_row_box["x"] + (last_row_box["width"] * 0.78), canvas_box["x"] + 120),
-                                canvas_box["x"] + max(int(canvas_box["width"]) - 110, 110),
-                            )
-                            right_slot_y = min(
-                                max(last_row_box["y"] + (last_row_box["height"] * 0.52), canvas_box["y"] + 80),
-                                canvas_box["y"] + max(int(canvas_box["height"]) - 80, 160),
-                            )
-                            drop_points.insert(0, (right_slot_x, right_slot_y))
-                        # Alternate: center-below fallback.
-                        center_below_x = canvas_box["x"] + (canvas_box["width"] * 0.52)
-                        center_below_y = min(
-                            max(max_bottom + 64, canvas_box["y"] + 100),
-                            canvas_box["y"] + max(int(canvas_box["height"]) - 80, 160),
-                        )
-                        drop_points.append((center_below_x, center_below_y))
-                except Exception:
-                    pass
-
-                last_pointer_error: Exception | None = None
-                for dx, dy in drop_points[:4]:
-                    try:
-                        await context.page.mouse.move(sx, sy)
-                        await context.page.mouse.down()
-                        await context.page.wait_for_timeout(110)
-                        # Tiny move first to trigger drag start in builder DnD libs.
-                        await context.page.mouse.move(sx + 18, sy + 4, steps=8)
-                        await context.page.wait_for_timeout(30)
-                        await context.page.mouse.move(dx, dy, steps=max(self._settings.drag_mouse_steps, 34))
-                        await context.page.wait_for_timeout(100)
-                        await context.page.mouse.up()
-                        await _validate_drop_effect()
-                        return f"Dragged {source_selector} to {target_selector} (vitaone pointer drag)"
-                    except Exception as drag_try_exc:
-                        last_pointer_error = drag_try_exc
-                        # Ensure mouse is released before next attempt.
-                        try:
-                            await context.page.mouse.up()
-                        except Exception:
-                            pass
-                        continue
-
-                # VitaOne sometimes applies drop but keeps placeholder DOM briefly.
-                # Treat as success when we can detect any field editor controls.
-                relaxed_hit = False
-                relaxed_checks = [
-                    "[data-testid='form-builder-canvas'] input[placeholder='Label']",
-                    "[data-testid='form-builder-canvas'] textarea[placeholder='Label']",
-                    ".form-canvas input[placeholder='Label']",
-                    ".form-canvas textarea[placeholder='Label']",
-                    "[data-testid*='field-short-answer']",
-                    "[class*='field-short-answer']",
-                    "[data-testid*='field-email']",
-                    "[class*='field-email']",
-                    "div[role='dialog']:has-text('Short answer')",
-                    "div[role='dialog']:has-text('Email')",
-                    "div[role='dialog'] input[placeholder='Enter a label']",
-                    "div[role='dialog'] button:has-text('Save')",
-                ]
-                for check_selector in relaxed_checks:
-                    try:
-                        if await context.page.locator(check_selector).count() > 0:
-                            relaxed_hit = True
-                            break
-                    except Exception:
-                        continue
-                if relaxed_hit:
-                    return f"Dragged {source_selector} to {target_selector} (vitaone pointer drag relaxed)"
-                if last_pointer_error:
-                    raise last_pointer_error
-                raise ValueError("VitaOne pointer drag failed: no valid drop point")
-            except Exception:
-                pass
+            raise ValueError("Drop not applied: no DOM change detected after drag")
 
         # Strategy 1: native playwright drag API.
         try:
@@ -2098,7 +1707,7 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
   };
   const detectScope = (el) => {
     const scopes = [
-      ["[role='listbox'], .oxd-select-dropdown, [class*='dropdown-menu'], [class*='select-dropdown']", "listbox"],
+      ["[role='listbox'], [class*='dropdown-menu'], [class*='select-dropdown']", "listbox"],
       ["form", "form"],
       ["[role='search']", "search"],
       ["main, [role='main']", "main"],
@@ -2179,11 +1788,11 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
       const container = el.closest([
         "[role='group']", "[role='listitem']", "[role='row']",
         "fieldset", "li", "td",
-        ".oxd-input-group", ".oxd-form-row", ".form-group",
+        ".form-group",
         "[class*='input-group']", "[class*='form-field']", "[class*='field-row']",
       ].join(","));
       if (container) {
-        const label = container.querySelector("label, .oxd-label, [class*='label']:not(input):not(button)");
+        const label = container.querySelector("label, [class*='label']:not(input):not(button)");
         if (label && label !== el) {
           const t = (label.innerText || label.textContent || "").replace(/\s+/g, " ").trim();
           if (t) return t;
@@ -2192,8 +1801,35 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
     } catch (e) {}
     return "";
   };
-  const pick = (elements) => elements
-    .map((el) => {
+  // Single-pass recursive collection: walks each DOM root exactly once,
+  // checking interactivity and shadow host in the same loop.
+  // Playwright's locator() auto-pierces open shadow roots for CSS selectors,
+  // so shadow DOM elements can reuse the same id/testid/aria selectors without >> prefix.
+  const INTERACTIVE_SELECTOR = "button, a, input, textarea, select, summary, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [role='option'], [role='menuitem'], [role='menuitemcheckbox'], [role='menuitemradio'], [role='tab'], [role='combobox'], [role='treeitem'], [data-testid]";
+  function collectFromRoot(root, inShadow, depth) {
+    if (depth > 4) return [];
+    const results = [];
+    try {
+      for (const el of root.querySelectorAll("*")) {
+        if (el.matches(INTERACTIVE_SELECTOR)) {
+          results.push({ el, inShadow });
+        }
+        if (el.shadowRoot) {
+          results.push(...collectFromRoot(el.shadowRoot, true, depth + 1));
+        }
+      }
+    } catch (e) {}
+    return results;
+  }
+  const seenEls = new Set();
+  const dedupedElements = collectFromRoot(document, false, 0).filter(({ el }) => {
+    if (seenEls.has(el)) return false;
+    seenEls.add(el);
+    return true;
+  });
+
+  const pick = (items) => items
+    .map(({ el, inShadow }) => {
       const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
       const aria = el.getAttribute("aria-label") || "";
       const name = el.getAttribute("name") || "";
@@ -2224,11 +1860,13 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
       if (name && ["input", "textarea", "select"].includes(tag)) {
         selectors.push(`${tag}[name="${String(name).replace(/"/g, '\\"')}"]`);
       }
-      const titleLink = titleLinkSelector(el);
-      if (titleLink) selectors.push(titleLink);
-      if (tag === "a" && href) {
-        const safeHref = href.slice(0, 120).replace(/"/g, '\\"');
-        selectors.push(`a[href*="${safeHref}"]`);
+      if (!inShadow) {
+        const titleLink = titleLinkSelector(el);
+        if (titleLink) selectors.push(titleLink);
+        if (tag === "a" && href) {
+          const safeHref = href.slice(0, 120).replace(/"/g, '\\"');
+          selectors.push(`a[href*="${safeHref}"]`);
+        }
       }
       if (!(text || aria || name || id || testid || placeholder || title || nearbyLabel)) return null;
       return {
@@ -2251,9 +1889,46 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
       };
     })
     .filter(Boolean)
-    .slice(0, 40);
+    .sort((a, b) => {
+      const pri = {dialog:0,form:1,main:1,search:1,listbox:1,body:2,article:2,nav:3,header:3,aside:3,footer:4};
+      if (a.visible !== b.visible) return a.visible ? -1 : 1;
+      return (a.scope in pri ? pri[a.scope] : 2) - (b.scope in pri ? pri[b.scope] : 2);
+    })
+    .slice(0, 60);
 
-  const interactive = pick(Array.from(document.querySelectorAll("button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [data-testid]")));
+  const rawInteractive = pick(dedupedElements);
+  const optionElements = [];
+  rawInteractive.forEach(function(item) {
+    if (item.tag !== 'select' || !item.selectors || !item.selectors[0]) return;
+    try {
+      const selectEl = document.querySelector(item.selectors[0]);
+      if (!selectEl) return;
+      Array.from(selectEl.options).slice(0, 8).forEach(function(opt) {
+        const optText = (opt.textContent || '').trim();
+        const optValue = opt.value || '';
+        if (!optText && !optValue) return;
+        optionElements.push({
+          tag: 'option',
+          type: '',
+          text: optText.slice(0, 120),
+          aria: '',
+          name: '',
+          id: '',
+          testid: '',
+          role: 'option',
+          placeholder: '',
+          title: '',
+          label: (item.label || item.text || '').slice(0, 80),
+          href: '',
+          scope: item.scope,
+          visible: true,
+          enabled: !opt.disabled,
+          selectors: [item.selectors[0] + ' option[value=' + JSON.stringify(optValue) + ']'],
+        });
+      });
+    } catch(e) {}
+  });
+  const interactive = rawInteractive.concat(optionElements);
   const textExcerpt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
   return {
     url: window.location.href,
@@ -3104,46 +2779,28 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
 
     async def click(self, selector: str) -> str:
         message = f"Clicked {selector}"
-        selector_lower = selector.lower()
-        is_add_option_click = (
-            "add-option" in selector_lower
-            or "text=+" in selector_lower
-            or ":has-text('+')" in selector_lower
-            or "placeholder='value']) button" in selector_lower
-            or 'placeholder="value"]) button' in selector_lower
-        )
-        if is_add_option_click:
-            add_option_candidates = [
-                selector,
-                "div[role='dialog'] button:has(svg[class*='plus'])",
-                "div[role='dialog'] button:has(i[class*='plus'])",
-                "div[role='dialog'] [data-testid*='add-option']",
-                "div[role='dialog'] [aria-label*='Add option']",
-                "div[role='dialog'] div:has(input[placeholder='Value']) button",
-                "div[role='dialog'] button:has-text('+')",
-            ]
-            code = (
+        # If clicking a native <select> option, translate to selectOption on the parent.
+        _opt_m = re.match(r'^(.+?)\s+option\[value="([^"]*)"\]$', selector)
+        if _opt_m:
+            _parent_sel, _opt_val = _opt_m.group(1), _opt_m.group(2)
+            _err_msg = f"No option matching '{_opt_val}' in {_parent_sel}"
+            _ok_msg = f"Selected option '{_opt_val}' in {_parent_sel}"
+            _opt_code = (
                 "async (page) => {"
-                "  const dialog = page.locator(\"div[role='dialog']\").first();"
-                "  const values = dialog.locator(\"input[placeholder='Value']\");"
-                "  const before = await values.count();"
-                f"  const candidates = {json.dumps(add_option_candidates)};"
-                "  for (const c of candidates) {"
-                "    try {"
-                "      await page.locator(c).first().click({ timeout: 1400 });"
-                "      await page.waitForTimeout(180);"
-                "      const after = await values.count();"
-                "      if (after > before) {"
-                "        return `Clicked ${c}`;"
-                "      }"
-                "    } catch (e) {}"
+                f"  const loc = page.locator({json.dumps(_parent_sel)}).first();"
+                f"  let sel = await loc.selectOption({{ value: {json.dumps(_opt_val)} }}).catch(() => []);"
+                "  if (!sel || sel.length === 0) {"
+                f"    sel = await loc.selectOption({{ label: {json.dumps(_opt_val)} }}).catch(() => []);"
                 "  }"
-                f"  await page.locator({json.dumps(selector)}).first().click();"
-                f"  return {json.dumps(message)};"
+                f"  if (!sel || sel.length === 0) throw new Error({json.dumps(_err_msg)});"
+                f"  return {json.dumps(_ok_msg)};"
                 "}"
             )
-            result = await self._run_code(code)
-            return str(result) if result else message
+            try:
+                _result = await self._run_code(_opt_code)
+                return str(_result) if _result else _ok_msg
+            except Exception:
+                pass
         code = (
             "async (page) => {"
             f"  const locator = page.locator({json.dumps(selector)}).first();"
@@ -3195,67 +2852,6 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
                 f"reason={self._compact_click_error(exc)}"
             ) from exc
 
-    async def type_text(self, selector: str, text: str, clear_first: bool = True) -> str:
-        mode = "after clear" if clear_first else "append"
-        message = f"Typed into {selector} ({mode})"
-        selector_lower = selector.lower()
-        use_last_label = "div[role='dialog'] input[placeholder='label']" in selector_lower and "enter a label" not in selector_lower
-        use_last_value = "div[role='dialog'] input[placeholder='value']" in selector_lower
-        if use_last_label or use_last_value:
-            specific = "div[role='dialog'] input[placeholder='Label']" if use_last_label else "div[role='dialog'] input[placeholder='Value']"
-            if clear_first:
-                code = (
-                    "async (page) => {"
-                    f"  const locator = page.locator({json.dumps(specific)}).last();"
-                    f"  await locator.fill({json.dumps(text)});"
-                    f"  return {json.dumps(message)};"
-                    "}"
-                )
-            else:
-                code = (
-                    "async (page) => {"
-                    f"  const locator = page.locator({json.dumps(specific)}).last();"
-                    "  await locator.click();"
-                    f"  await locator.type({json.dumps(text)});"
-                    f"  return {json.dumps(message)};"
-                    "}"
-                )
-            await self._run_code(code)
-            return message
-        if clear_first:
-            code = (
-                "async (page) => {"
-                f"  await page.locator({json.dumps(selector)}).first().fill({json.dumps(text)});"
-                f"  return {json.dumps(message)};"
-                "}"
-            )
-        else:
-            code = (
-                "async (page) => {"
-                f"  const locator = page.locator({json.dumps(selector)}).first();"
-                "  await locator.click();"
-                f"  await locator.type({json.dumps(text)});"
-                f"  return {json.dumps(message)};"
-                "}"
-            )
-        await self._run_code(code)
-        return message
-
-    async def select(self, selector: str, value: str) -> str:
-        message = f"Selected {value} in {selector}"
-        no_option_message = f"No option with value '{value}' found in {selector}"
-        code = (
-            "async (page) => {"
-            f"  const selected = await page.locator({json.dumps(selector)}).first().selectOption({{ value: {json.dumps(value)} }});"
-            "  if (!selected || selected.length === 0) {"
-            f"    throw new Error({json.dumps(no_option_message)});"
-            "  }"
-            f"  return {json.dumps(message)};"
-            "}"
-        )
-        await self._run_code(code)
-        return message
-
     async def drag_and_drop(
         self,
         source_selector: str,
@@ -3274,279 +2870,54 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "async (page) => {"
             f"  const source = page.locator({json.dumps(source_selector)}).first();"
             f"  const target = page.locator({json.dumps(target_selector)}).first();"
-            f"  const sourceSelectorText = {json.dumps(source_selector)};"
-            "  const currentUrl = (typeof page.url === 'function' ? page.url() : '') || '';"
-            "  const isVitaOne = /vitaone\\.io/i.test(currentUrl);"
-            "  const placeholder = page.locator('text=Drag and drop fields here').first();"
-            "  const canvasRoot = page.locator(\"[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas, section:has-text('Drag and drop fields here')\").first();"
-            "  const insertedFields = page.locator(\"[data-testid='form-builder-canvas'] [data-testid*='field-'], [data-testid='form-builder-canvas'] input[placeholder='Label'], [data-testid='form-builder-canvas'] textarea[placeholder='Label'], .form-canvas input[placeholder='Label'], .form-canvas textarea[placeholder='Label']\");"
-            "  const canvasRows = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true'], .form-drop-area .form-row[draggable='true']\");"
-            "  const extractLabel = (selector) => {"
-            "    if (!selector) return null;"
-            "    const lower = selector.toLowerCase();"
-            "    if (lower.includes('short-answer') || lower.includes('short answer') || lower.includes('field-short')) return 'Short answer';"
-            "    if (lower.includes('field-email')) return 'Email';"
-            "    if (lower.includes('aria-label') && lower.includes('email')) return 'Email';"
-            "    if (lower.includes('aria-label') && lower.includes('short')) return 'Short answer';"
-            "    const m1 = selector.match(/:has-text\\((['\\\"])(.*?)\\1\\)/i);"
-            "    if (m1 && m1[2] && m1[2].trim()) return m1[2].trim();"
-            "    const m2 = selector.match(/^text\\s*=\\s*(.+)$/i);"
-            "    if (m2 && m2[1] && m2[1].trim()) return m2[1].trim().replace(/^['\\\"]|['\\\"]$/g, '');"
-            "    return null;"
-            "  };"
-            "  const sourceLabel = extractLabel(sourceSelectorText);"
-            "  let hadPlaceholder = false;"
-            "  let beforeInsertedCount = 0;"
-            "  let beforeRowCount = 0;"
-            "  let beforeCanvasText = '';"
-            "  try { hadPlaceholder = await placeholder.isVisible(); } catch (e) {}"
-            "  try { beforeInsertedCount = await insertedFields.count(); } catch (e) {}"
-            "  try {"
-            "    const rows = await canvasRows.count();"
-            "    let usable = 0;"
-            "    for (let i = 0; i < rows; i += 1) {"
-            "      const row = canvasRows.nth(i);"
-            "      const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
-            "      if (rowText.includes('drag and drop fields here')) continue;"
-            "      usable += 1;"
-            "    }"
-            "    beforeRowCount = usable;"
-            "  } catch (e) {}"
-            "  try { beforeCanvasText = ((await canvasRoot.textContent()) || '').trim(); } catch (e) {}"
-            "  let sourceLocator = source;"
-            "  let targetLocator = target;"
-            "  try {"
-            "    const targetCandidates = ["
-            "      page.locator(\"[data-testid='form-builder-canvas']\").first(),"
-            "      page.locator('.form-canvas').first(),"
-            "      page.locator('.form-builder-canvas').first(),"
-            "      page.locator('.form-drop-area').first(),"
-            "      page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true']\").last(),"
-            "      page.locator('.form-canvas .form-row[draggable='true']').last(),"
-            "      page.locator('.form-drop-area .form-row[draggable='true']').last(),"
-            "      page.locator(\"div.form-row[draggable='true']:has-text('Drag and drop fields here')\").first(),"
-            "      page.locator(\"div.form-row.relative.flex.w-full[draggable='true']:has-text('Drag and drop fields here')\").first(),"
-            "      canvasRoot,"
-            "      target,"
-            "      placeholder,"
-            "    ];"
-            "    let fallbackTarget = null;"
-            "    for (const candidate of targetCandidates) {"
-            "      try {"
-            "        if ((await candidate.count()) === 0) continue;"
-            "        await candidate.waitFor({ state: 'visible', timeout: 1100 });"
-            "        const box = await candidate.boundingBox();"
-            "        if (!box) continue;"
-            "        if (!fallbackTarget) fallbackTarget = candidate;"
-            "        if (box.x > 250 && box.width > 220) {"
-            "          targetLocator = candidate;"
-            "          break;"
-            "        }"
-            "      } catch (e) {}"
-            "    }"
-            "    if ((await targetLocator.count()) === 0 && fallbackTarget) targetLocator = fallbackTarget;"
-            "  } catch (e) {}"
-            "  if (isVitaOne) {"
-            "    try {"
-            "      const strongCanvas = page.locator(\"[data-testid='form-builder-canvas'], .form-canvas, .form-drop-area, .form-builder-canvas\").first();"
-            "      if ((await strongCanvas.count()) > 0) {"
-            "        await strongCanvas.waitFor({ state: 'visible', timeout: 1200 });"
-            "        targetLocator = strongCanvas;"
-            "      }"
-            "    } catch (e) {}"
-            "  }"
             "  const quickTimeoutMs = 1600;"
-            f"  if ((await targetLocator.count()) === 0) throw new Error({json.dumps('Drag target not found: ' + target_selector)});"
-            "  await targetLocator.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
-            "  const targetBoxPre = await targetLocator.boundingBox();"
-            "  try {"
-            "    const sourceCandidates = [];"
-            "    if (sourceLabel) {"
-            "      const key = sourceLabel.toLowerCase().split(/\\s+/)[0] || sourceLabel.toLowerCase();"
-            "      sourceCandidates.push("
-            "        page.locator(`[draggable='true']:has-text(\"${sourceLabel}\")`).first(),"
-            "        page.locator(`[draggable='true'][aria-label*='${sourceLabel}']`).first(),"
-            "        page.locator(`[role='listitem']:has-text(\"${sourceLabel}\")`).first(),"
-            "        page.locator(`[data-rbd-draggable-id*='${key}']`).first(),"
-            "        page.locator(`[data-testid*='${key}']`).first(),"
-            "        page.locator(`button:has-text(\"${sourceLabel}\")`).first(),"
-            "        page.locator(`[role='button']:has-text(\"${sourceLabel}\")`).first(),"
-            "        page.getByText(sourceLabel, { exact: false }).first(),"
-            "      );"
-            "    }"
-            "    sourceCandidates.push(source);"
-            "    let fallbackSource = null;"
-            "    for (const candidate of sourceCandidates) {"
-            "      try {"
-            "        if ((await candidate.count()) === 0) continue;"
-            "        await candidate.waitFor({ state: 'visible', timeout: 1100 });"
-            "        const box = await candidate.boundingBox();"
-            "        if (!box) continue;"
-            "        if (!fallbackSource) fallbackSource = candidate;"
-            "        if (targetBoxPre && box.x < targetBoxPre.x) {"
-            "          sourceLocator = candidate;"
-            "          break;"
-            "        }"
-            "      } catch (e) {}"
-            "    }"
-            "    if ((await sourceLocator.count()) === 0 && fallbackSource) sourceLocator = fallbackSource;"
-            "  } catch (e) {}"
-            "  if ((await sourceLocator.count()) === 0) throw new Error(`Drag source not found: ${sourceSelectorText}`);"
-            "  await sourceLocator.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
-            "  if (isVitaOne) {"
-            "    try {"
-            "      await sourceLocator.click({ timeout: 900 });"
-            "      await page.waitForTimeout(140);"
-            "      let quickCount = beforeInsertedCount;"
-            "      let quickRows = beforeRowCount;"
-            "      try { quickCount = await insertedFields.count(); } catch (e) {}"
-            "      try {"
-            "        const rows = await canvasRows.count();"
-            "        let usable = 0;"
-            "        for (let i = 0; i < rows; i += 1) {"
-            "          const row = canvasRows.nth(i);"
-            "          const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
-            "          if (rowText.includes('drag and drop fields here')) continue;"
-            "          usable += 1;"
-            "        }"
-            "        quickRows = usable;"
-            "      } catch (e) {}"
-            "      let quickDialogVisible = false;"
-            "      try {"
-            "        quickDialogVisible = await page.locator(\"div[role='dialog'] input[placeholder='Enter a label'], div[role='dialog'] button:has-text('Save')\").first().isVisible();"
-            "      } catch (e) {}"
-            "      if (quickRows > beforeRowCount || quickCount > beforeInsertedCount || quickDialogVisible) {"
-            f"        return {json.dumps(message + ' (vitaone click-insert fast path)')};"
-            "      }"
-            "    } catch (eFastInsert) {"
-            "      // continue with drag strategies"
-            "    }"
-            "  }"
+            f"  if ((await source.count()) === 0) throw new Error({json.dumps('Drag source not found: ' + source_selector)});"
+            "  await source.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
+            f"  if ((await target.count()) === 0) throw new Error({json.dumps('Drag target not found: ' + target_selector)});"
+            "  await target.waitFor({ state: 'visible', timeout: quickTimeoutMs });"
+            "  let beforeText = '';"
+            "  try { beforeText = ((await page.locator('body').textContent()) || '').replace(/\s+/g, ' ').trim(); } catch (e) {}"
             "  const validate = async () => {"
             f"    await page.waitForTimeout({validation_wait});"
-            "    let placeholderVisible = false;"
-            "    if (hadPlaceholder) {"
-            "      try { placeholderVisible = await placeholder.isVisible(); } catch (e) {}"
-            "    }"
-            "    let currentCount = beforeInsertedCount;"
-            "    let currentRows = beforeRowCount;"
-            "    try { currentCount = await insertedFields.count(); } catch (e) {}"
             "    try {"
-            "      const rows = await canvasRows.count();"
-            "      let usable = 0;"
-            "      for (let i = 0; i < rows; i += 1) {"
-            "        const row = canvasRows.nth(i);"
-            "        const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
-            "        if (rowText.includes('drag and drop fields here')) continue;"
-            "        usable += 1;"
-            "      }"
-            "      currentRows = usable;"
-            "    } catch (e) {}"
-            "    let currentCanvasText = beforeCanvasText;"
-            "    try { currentCanvasText = ((await canvasRoot.textContent()) || '').trim(); } catch (e) {}"
-            "    if (hadPlaceholder && !placeholderVisible) return true;"
-            "    if (currentRows > beforeRowCount) return true;"
-            "    if (currentCount > beforeInsertedCount) return true;"
-            "    if (currentCanvasText && currentCanvasText !== beforeCanvasText) return true;"
-            "    if (hadPlaceholder) throw new Error('Drop not applied: canvas placeholder still visible and no new field appeared');"
-            "    throw new Error(`Drop not applied: no new field appeared in canvas (rows ${beforeRowCount}->${currentRows}, fields ${beforeInsertedCount}->${currentCount})`);"
+            "      const after = ((await page.locator('body').textContent()) || '').replace(/\s+/g, ' ').trim();"
+            "      if (after !== beforeText) return true;"
+            "    } catch (e) { return true; }"
+            "    throw new Error('Drop not applied: no DOM change detected after drag');"
             "  };"
-            "  if (isVitaOne) {"
-            "    try {"
-            "      await sourceLocator.scrollIntoViewIfNeeded();"
-            "      await targetLocator.scrollIntoViewIfNeeded();"
-            "      const sbV = await sourceLocator.boundingBox();"
-            "      const tbV = await targetLocator.boundingBox();"
-            "      if (sbV && tbV) {"
-            "        let tx = tbV.x + Math.min(Math.max(220, 120), Math.max(Math.floor(tbV.width) - 120, 120));"
-            "        let ty = tbV.y + Math.min(Math.max(200, 120), Math.max(Math.floor(tbV.height) - 120, 120));"
-            "        if (" + ("true" if fixed_coords else "false") + ") {"
-            f"          const reqX = {x_offset};"
-            f"          const reqY = {y_offset};"
-            "          const safeX = Math.min(Math.max(reqX, 120), Math.max(Math.floor(tbV.width) - 120, 120));"
-            "          const safeY = Math.min(Math.max(reqY, 120), Math.max(Math.floor(tbV.height) - 120, 120));"
-            "          tx = tbV.x + safeX;"
-            "          ty = tbV.y + safeY;"
-            "        }"
-            "        try {"
-            "          const rowLocator = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true']\");"
-            "          const rowCount = await rowLocator.count();"
-            "          if (rowCount > 0) {"
-            "            let maxBottom = tbV.y + 80;"
-            "            let leftX = tbV.x + 140;"
-            "            const sample = Math.min(rowCount, 15);"
-            "            for (let i = 0; i < sample; i += 1) {"
-            "              const row = rowLocator.nth(i);"
-            "              const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
-            "              if (rowText.includes('drag and drop fields here')) continue;"
-            "              const rb = await row.boundingBox();"
-            "              if (!rb) continue;"
-            "              const bottom = rb.y + rb.height;"
-            "              if (bottom > maxBottom) {"
-            "                maxBottom = bottom;"
-            "                leftX = rb.x + 40;"
-            "              }"
-            "            }"
-            "            tx = Math.min(Math.max(leftX, tbV.x + 90), tbV.x + Math.max(Math.floor(tbV.width) - 130, 130));"
-            "            const topSafe = tbV.y + 100;"
-            "            const bottomSafe = tbV.y + Math.max(Math.floor(tbV.height) - 80, 180);"
-            "            ty = Math.min(Math.max(maxBottom + 56, topSafe), bottomSafe);"
-            "          }"
-            "        } catch (eRows) {}"
-            "        const sx = sbV.x + Math.max(Math.min(sbV.width * 0.30, sbV.width - 10), 10);"
-            "        const sy = sbV.y + Math.max(Math.min(sbV.height * 0.50, sbV.height - 6), 6);"
-            "        await page.mouse.move(sx, sy);"
-            "        await page.mouse.down();"
-            "        await page.waitForTimeout(120);"
-            "        await page.mouse.move(sx + 18, sy + 4, { steps: 8 });"
-            "        await page.waitForTimeout(40);"
-            f"        await page.mouse.move(tx, ty, {{ steps: {max(mouse_steps, 36)} }});"
-            "        await page.waitForTimeout(120);"
-            "        await page.mouse.up();"
-            "        await validate();"
-            f"        return {json.dumps(message + ' (vitaone pointer drag)')};"
-            "      }"
-            "    } catch (eVitaPointer) {"
-            "      // continue with generic strategies"
-            "    }"
-            "  }"
             "  try {"
-            "    const sb0 = await sourceLocator.boundingBox();"
-            "    const tb0 = await targetLocator.boundingBox();"
-            "    const dragTimeoutMs = isVitaOne ? 700 : 1400;"
-            "    if (isVitaOne) {"
-            "      throw new Error('skip native dragTo for vitaone');"
-            "    }"
+            "    const sb0 = await source.boundingBox();"
+            "    const tb0 = await target.boundingBox();"
             "    if (sb0 && tb0) {"
             "      const srcPoints = ["
             "        { x: Math.max(Math.min(sb0.width * 0.18, sb0.width - 6), 6), y: sb0.height * 0.50 },"
             "        { x: sb0.width * 0.50, y: sb0.height * 0.50 },"
             "      ];"
             "      const tgtPoints = ["
-            "        { x: Math.max(Math.min(tb0.width * 0.30, tb0.width - 16), 16), y: Math.max(Math.min(tb0.height * 0.30, tb0.height - 16), 16) },"
-            "        { x: Math.max(Math.min(tb0.width * 0.50, tb0.width - 16), 16), y: Math.max(Math.min(tb0.height * 0.50, tb0.height - 16), 16) },"
+            "        { x: Math.max(Math.min(tb0.width * 0.30, tb0.width - 16), 16),"
+            "          y: Math.max(Math.min(tb0.height * 0.30, tb0.height - 16), 16) },"
+            "        { x: Math.max(Math.min(tb0.width * 0.50, tb0.width - 16), 16),"
+            "          y: Math.max(Math.min(tb0.height * 0.50, tb0.height - 16), 16) },"
             "      ];"
             "      for (const sp of srcPoints) {"
             "        for (const tp of tgtPoints) {"
             "          try {"
-            "            await sourceLocator.dragTo(targetLocator, { sourcePosition: sp, targetPosition: tp, timeout: dragTimeoutMs, force: true });"
+            "            await source.dragTo(target, { sourcePosition: sp, targetPosition: tp, timeout: 1400, force: true });"
             "            await validate();"
             f"            return {json.dumps(message)};"
-            "          } catch (eDragPos) {"
-            "            // continue"
-            "          }"
+            "          } catch (eDragPos) {}"
             "        }"
             "      }"
             "    }"
-            "    await sourceLocator.dragTo(targetLocator, { timeout: dragTimeoutMs, force: true });"
+            "    await source.dragTo(target, { timeout: 1400, force: true });"
             "    await validate();"
             f"    return {json.dumps(message)};"
             "  } catch (e1) {"
             "    try {"
-            "      await sourceLocator.scrollIntoViewIfNeeded();"
-            "      await targetLocator.scrollIntoViewIfNeeded();"
-            "      const sb = await sourceLocator.boundingBox();"
-            "      const tb = await targetLocator.boundingBox();"
+            "      await source.scrollIntoViewIfNeeded();"
+            "      await target.scrollIntoViewIfNeeded();"
+            "      const sb = await source.boundingBox();"
+            "      const tb = await target.boundingBox();"
             "      if (sb && tb) {"
             "        const sx = sb.x + sb.width / 2;"
             "        const sy = sb.y + sb.height / 2;"
@@ -3558,39 +2929,8 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "        if (useFixed) {"
             "          const safeX = Math.min(Math.max(requestedX, 16), Math.max(Math.floor(tb.width) - 16, 16));"
             "          const safeY = Math.min(Math.max(requestedY, 16), Math.max(Math.floor(tb.height) - 16, 16));"
-            "          let baseX = tb.x + safeX;"
-            "          let baseY = tb.y + safeY;"
-            "          if (isVitaOne) {"
-            "            try {"
-            "              const rowLocator = page.locator(\"[data-testid='form-builder-canvas'] .form-row[draggable='true'], .form-canvas .form-row[draggable='true']\");"
-            "              const rowCount = await rowLocator.count();"
-            "              if (rowCount > 0) {"
-            "                let maxBottom = tb.y + 80;"
-            "                let leftX = tb.x + 120;"
-            "                const sample = Math.min(rowCount, 15);"
-            "                for (let i = 0; i < sample; i += 1) {"
-            "                  const row = rowLocator.nth(i);"
-            "                  const rowText = (((await row.textContent()) || '').trim().toLowerCase());"
-            "                  if (rowText.includes('drag and drop fields here')) continue;"
-            "                  const rb = await row.boundingBox();"
-            "                  if (!rb) continue;"
-            "                  const bottom = rb.y + rb.height;"
-            "                  if (bottom > maxBottom) {"
-            "                    maxBottom = bottom;"
-            "                    leftX = rb.x + 40;"
-            "                  }"
-            "                }"
-            "                const minX = tb.x + 90;"
-            "                const maxX = tb.x + Math.max(Math.floor(tb.width) - 130, 130);"
-            "                baseX = Math.min(Math.max(leftX, minX), maxX);"
-            "                const topSafe = tb.y + 100;"
-            "                const bottomSafe = tb.y + Math.max(Math.floor(tb.height) - 80, 180);"
-            "                baseY = Math.min(Math.max(maxBottom + 56, topSafe), bottomSafe);"
-            "              }"
-            "            } catch (eStack) {"
-            "              // keep default drop offsets"
-            "            }"
-            "          }"
+            "          const baseX = tb.x + safeX;"
+            "          const baseY = tb.y + safeY;"
             "          const nearLeftX = tb.x + Math.min(Math.max(64, 16), Math.max(Math.floor(tb.width) - 16, 16));"
             "          const nearTopY = tb.y + Math.min(Math.max(96, 16), Math.max(Math.floor(tb.height) - 16, 16));"
             "          points = ["
@@ -3619,21 +2959,17 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "          try {"
             "            await validate();"
             f"            return {json.dumps(message + ' (mouse fallback)')};"
-            "          } catch (e3) {"
-            "            // try next point"
-            "          }"
+            "          } catch (e3) {}"
             "        }"
             "      }"
-            "    } catch (e2) {"
-            "      // ignore and continue with click-insert fallbacks"
-            "    }"
+            "    } catch (e2) {}"
             "    try {"
-            "      await sourceLocator.click({ timeout: 1200 });"
+            "      await source.click({ timeout: 1200 });"
             "      await validate();"
             f"      return {json.dumps(message + ' (click-insert fallback)')};"
             "    } catch (e4) {}"
             "    try {"
-            "      await sourceLocator.dblclick({ timeout: 1200 });"
+            "      await source.dblclick({ timeout: 1200 });"
             "      await validate();"
             f"      return {json.dumps(message + ' (double-click fallback)')};"
             "    } catch (e5) {}"
@@ -3882,7 +3218,7 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "  };"
             "  const detectScope = (el) => {"
             "    const scopes = ["
-            "      [\"[role='listbox'], .oxd-select-dropdown, [class*='dropdown-menu'], [class*='select-dropdown']\", 'listbox'],"
+            "      [\"[role='listbox'], [class*='dropdown-menu'], [class*='select-dropdown']\", 'listbox'],"
             "      ['form', 'form'],"
             "      [\"[role='search']\", 'search'],"
             "      ['main, [role=\"main\"]', 'main'],"
@@ -3947,11 +3283,11 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "      const container = el.closest(["
             "        \\\"[role='group']\\\", \\\"[role='listitem']\\\", \\\"[role='row']\\\","
             "        'fieldset', 'li', 'td',"
-            "        '.oxd-input-group', '.oxd-form-row', '.form-group',"
+            "        '.form-group',"
             "        \\\"[class*='input-group']\\\", \\\"[class*='form-field']\\\", \\\"[class*='field-row']\\\","
             "      ].join(','));"
             "      if (container) {"
-            "        const lbl = container.querySelector(\\\"label, .oxd-label, [class*='label']:not(input):not(button)\\\");"
+            "        const lbl = container.querySelector(\\\"label, [class*='label']:not(input):not(button)\\\");"
             "        if (lbl && lbl !== el) {"
             "          const t = (lbl.innerText || lbl.textContent || '').replace(/\\\\s+/g, ' ').trim();"
             "          if (t) return t;"
@@ -3960,8 +3296,25 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    } catch (e) {}"
             "    return '';"
             "  };"
-            "  const nodes = Array.from(document.querySelectorAll(\"button, a, input, textarea, select, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [data-testid]\"));"
-            "  const interactive = nodes.map((el) => {"
+            "  const INTERACTIVE_SELECTOR = \"button, a, input, textarea, select, summary, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [role='option'], [role='menuitem'], [role='menuitemcheckbox'], [role='menuitemradio'], [role='tab'], [role='combobox'], [role='treeitem'], [data-testid]\";"
+            "  function collectFromRoot(root, inShadow, depth) {"
+            "    if (depth > 4) return [];"
+            "    const results = [];"
+            "    try {"
+            "      for (const el of root.querySelectorAll('*')) {"
+            "        if (el.matches(INTERACTIVE_SELECTOR)) results.push({ el, inShadow });"
+            "        if (el.shadowRoot) results.push(...collectFromRoot(el.shadowRoot, true, depth + 1));"
+            "      }"
+            "    } catch (e) {}"
+            "    return results;"
+            "  }"
+            "  const seenEls = new Set();"
+            "  const dedupedElements = collectFromRoot(document, false, 0).filter(({ el }) => {"
+            "    if (seenEls.has(el)) return false;"
+            "    seenEls.add(el);"
+            "    return true;"
+            "  });"
+            "  const rawInteractive = dedupedElements.map(({ el, inShadow }) => {"
             "    const tag = (el.tagName || '').toLowerCase();"
             "    const text = ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()).slice(0, 120);"
             "    const aria = el.getAttribute('aria-label') || '';"
@@ -3983,11 +3336,40 @@ class MCPPlaywrightBrowserMCPClient(BrowserMCPClient):
             "    if (id) selectors.push(`#${cssEscape(id)}`);"
             "    if (testid) selectors.push(`[data-testid=\\\"${String(testid).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
             "    if (name && ['input', 'textarea', 'select'].includes(tag)) selectors.push(`${tag}[name=\\\"${String(name).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
-            "    const titleLink = titleLinkSelector(el);"
-            "    if (titleLink) selectors.push(titleLink);"
-            "    if (tag === 'a' && href) selectors.push(`a[href*=\\\"${href.slice(0, 120).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
+            "    if (!inShadow) {"
+            "      const titleLink = titleLinkSelector(el);"
+            "      if (titleLink) selectors.push(titleLink);"
+            "      if (tag === 'a' && href) selectors.push(`a[href*=\\\"${href.slice(0, 120).replace(/\\\"/g, '\\\\\\\"')}\\\"]`);"
+            "    }"
             "    return { tag, type: inputType, text, aria, name, id, testid, role, placeholder, title, label: nearbyLabel.slice(0, 80), href: href.slice(0, 120), scope, visible, enabled, selectors };"
-            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder || item.label).slice(0, 40);"
+            "  }).filter((item) => item.text || item.aria || item.name || item.id || item.testid || item.placeholder || item.label)"
+            "  .sort((a, b) => {"
+            "    const pri = {dialog:0,form:1,main:1,search:1,listbox:1,body:2,article:2,nav:3,header:3,aside:3,footer:4};"
+            "    if (a.visible !== b.visible) return a.visible ? -1 : 1;"
+            "    return (a.scope in pri ? pri[a.scope] : 2) - (b.scope in pri ? pri[b.scope] : 2);"
+            "  })"
+            "  .slice(0, 60);"
+            "  const optionElements = [];"
+            "  rawInteractive.forEach(function(item) {"
+            "    if (item.tag !== 'select' || !item.selectors || !item.selectors[0]) return;"
+            "    try {"
+            "      const selectEl = document.querySelector(item.selectors[0]);"
+            "      if (!selectEl) return;"
+            "      Array.from(selectEl.options).slice(0, 8).forEach(function(opt) {"
+            "        const optText = (opt.textContent || '').trim();"
+            "        const optValue = opt.value || '';"
+            "        if (!optText && !optValue) return;"
+            "        optionElements.push({"
+            "          tag: 'option', type: '', text: optText.slice(0, 120), aria: '', name: '', id: '', testid: '',"
+            "          role: 'option', placeholder: '', title: '',"
+            "          label: (item.label || item.text || '').slice(0, 80), href: '', scope: item.scope,"
+            "          visible: true, enabled: !opt.disabled,"
+            "          selectors: [item.selectors[0] + ' option[value=' + JSON.stringify(optValue) + ']'],"
+            "        });"
+            "      });"
+            "    } catch(e) {}"
+            "  });"
+            "  const interactive = rawInteractive.concat(optionElements);"
             "  return {"
             "    url: page.url(),"
             "    title: await page.title(),"

@@ -707,218 +707,6 @@ def _split_and_convert_prompt(prompt: str) -> list[str]:
     return result
 
 
-_SELECTOR_LABEL_MAP: dict[str, str] = {
-    "{{selector.login_button}}": ("Login", "button"),
-    "{{selector.logout_link}}": ("Logout", "link"),
-    "{{selector.create_form}}": ("Create Form", "button"),
-    "{{selector.save_form}}": ("Save", "button"),
-    "{{selector.cancel_button}}": ("Cancel", "button"),
-    "{{selector.create_account}}": ("Create Account", "button"),
-    "{{selector.next_button}}": ("Next", "button"),
-    "{{selector.back_button}}": ("Back", "button"),
-    "{{selector.save_changes_button}}": ("Save Changes", "button"),
-    "{{selector.save_workflow}}": ("Save Workflow", "button"),
-    "{{selector.add_status_button}}": ("Add Status", "button"),
-    "{{selector.transition_button}}": ("Transition", "button"),
-    "{{selector.create_workflow}}": ("Create Workflow", "button"),
-    "{{selector.top_left_corner}}": ("menu", "icon"),
-    "{{selector.workflows_module}}": ("Workflows", "link"),
-    "{{selector.email}}": "Email",
-    "{{selector.password}}": "Password",
-    "{{selector.first_name}}": "First Name",
-    "{{selector.surname}}": "Last Name",
-    "{{selector.phone}}": "Phone",
-    "{{selector.confirm_password}}": "Confirm Password",
-    "{{selector.username}}": "Username",
-    "{{selector.form_name}}": "Form Name",
-    "{{selector.workflow_name}}": "Workflow Name",
-    "{{selector.workflow_description}}": "Description",
-    "{{selector.status_name}}": "Status Name",
-    "{{selector.transition_name}}": "Transition Name",
-    "{{selector.form_label}}": "Label",
-    "{{selector.dropdown_option_label}}": "Option Label",
-    "{{selector.dropdown_option_value}}": "Option Value",
-}
-
-
-def _selector_to_label(selector: str) -> str:
-    """Extract a short human-readable label from a raw CSS/Playwright selector."""
-    s = selector.strip()
-    if not s:
-        return ""
-
-    # Take only the first candidate if comma-separated list
-    first = s.split(",")[0].strip()
-
-    # text= or :has-text()
-    m = re.search(r":has-text\(['\"](.+?)['\"]\)", first)
-    if m:
-        return m.group(1)
-    if first.lower().startswith("text="):
-        return first[5:].strip().strip("'\"")
-
-    # aria-label
-    m = re.search(r'\[aria-label=["\']([^"\']+)["\']', first)
-    if m:
-        return m.group(1)
-
-    # placeholder
-    m = re.search(r'\[placeholder=["\']([^"\']+)["\']', first)
-    if m:
-        return m.group(1)
-
-    # name attribute
-    m = re.search(r'\[name=["\']([^"\']+)["\']', first)
-    if m:
-        return m.group(1)
-
-    # id — #searchInput → "search input"
-    m = re.match(r"#([a-zA-Z][\w-]*)", first)
-    if m:
-        raw = m.group(1)
-        # camelCase / PascalCase → spaced words
-        spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw)
-        spaced = re.sub(r"[-_]", " ", spaced)
-        return spaced.lower().strip()
-
-    # tag only — button, select, input
-    m = re.match(r"^(button|select|input|textarea|a)\b", first)
-    if m:
-        tag_labels = {"button": "button", "select": "dropdown", "input": "input field", "textarea": "text area", "a": "link"}
-        return tag_labels.get(m.group(1), m.group(1))
-
-    # class — .btn-primary → "btn primary"
-    m = re.match(r"\.([a-zA-Z][\w-]*)", first)
-    if m:
-        return re.sub(r"[-_]", " ", m.group(1)).lower()
-
-    return ""
-
-
-def _step_to_text(step: dict[str, object]) -> str:
-    """Convert a JSON step dict into a short human-readable action line."""
-    step_type = str(step.get("type") or "").strip()
-
-    if step_type == "navigate":
-        url = str(step.get("url") or "").strip()
-        return f"Go to {url}" if url else ""
-
-    if step_type == "click":
-        selector = str(step.get("selector") or "").strip()
-        target = step.get("target")
-
-        # text_hint — primary source, set by the planner
-        text_hint = str(step.get("text_hint") or "").strip()
-        if text_hint:
-            lower = text_hint.lower()
-            kind = "button" if any(w in lower for w in _BUTTON_KEYWORDS) else "link"
-            return f'click the "{text_hint}" {kind}'
-
-        # Semantic target dict
-        if isinstance(target, dict):
-            text = str(target.get("text") or target.get("label") or "").strip()
-            role = str(target.get("role") or "").lower()
-            if text:
-                element = "button" if "button" in role else "link"
-                return f'click the "{text}" {element}'
-
-        # text= selector
-        if selector.startswith("text="):
-            label = selector[5:].strip()
-            return f'click the "{label}" link'
-
-        # Known profile selector
-        mapping = _SELECTOR_LABEL_MAP.get(selector)
-        if isinstance(mapping, tuple):
-            label, kind = mapping
-            return f'click the "{label}" {kind}'
-
-        # Extract readable label from raw selector
-        label = _selector_to_label(selector)
-        if label:
-            return f'click the "{label}" element'
-        return 'click the element'
-
-    if step_type == "type":
-        text = str(step.get("text") or "").strip()
-        selector = str(step.get("selector") or "").strip()
-        target = step.get("target")
-
-        field = str(step.get("text_hint") or "").strip()
-        if not field and isinstance(target, dict):
-            field = str(target.get("label") or target.get("placeholder") or target.get("text") or "").strip()
-        if not field:
-            mapping = _SELECTOR_LABEL_MAP.get(selector)
-            if isinstance(mapping, str):
-                field = mapping
-        if not field:
-            field = _selector_to_label(selector)
-        if field and text:
-            return f'type "{text}" into the "{field}" field'
-        if text:
-            return f'type "{text}"'
-        return ""
-
-    if step_type == "select":
-        value = str(step.get("value") or "").strip()
-        selector = str(step.get("selector") or "").strip()
-        field = ""
-        mapping = _SELECTOR_LABEL_MAP.get(selector)
-        if isinstance(mapping, str):
-            field = mapping
-        if not field:
-            field = _selector_to_label(selector)
-        if field and value:
-            return f'select "{value}" from the "{field}" dropdown'
-        if value:
-            return f'select "{value}"'
-        return ""
-
-    if step_type == "wait":
-        until = str(step.get("until") or "timeout").lower()
-        ms = step.get("ms")
-        ms_val = int(ms) if isinstance(ms, (int, float)) else 500
-        if until == "timeout":
-            return f"wait {ms_val}ms"
-        selector = str(step.get("selector") or "").strip()
-        if until == "selector_visible":
-            label = selector[5:].strip() if selector.startswith("text=") else selector
-            display = re.sub(r"\{\{selector\.[^}]+\}\}", "", label).strip()
-            if display:
-                return f'wait for "{display}" to be visible'
-            return "wait for element to be visible"
-        if until == "selector_hidden":
-            return "wait for element to be hidden"
-        if until == "load_state":
-            return "wait for page to load"
-        return f"wait {ms_val}ms"
-
-    if step_type == "verify_text":
-        value = str(step.get("value") or "").strip()
-        if value:
-            return f'verify text "{value}" is visible'
-        return ""
-
-    if step_type == "scroll":
-        direction = str(step.get("direction") or "down").lower()
-        return f"scroll {direction}"
-
-    if step_type == "drag":
-        source = str(step.get("source_selector") or "").strip()
-        target_sel = str(step.get("target_selector") or "").strip()
-        s_label = re.sub(r"\{\{selector\.[^}]+\}\}", "", source).strip()
-        t_label = re.sub(r"\{\{selector\.[^}]+\}\}", "", target_sel).strip()
-        return f'drag "{s_label or source}" to "{t_label or target_sel}"'
-
-    if step_type == "handle_popup":
-        action = str(step.get("action") or "accept").lower()
-        return f"{action} the popup dialog"
-
-    if step_type == "verify_image":
-        return "verify image on page"
-
-    return ""
-
 
 def _build_structured_plan_attempt(
     request: PlanGenerateRequest,
@@ -1126,6 +914,8 @@ def build_app() -> FastAPI:
             )
 
         run = run_store.create(expanded_request, user_id=_run_owner_id(actor))
+        if request.step_source_map:
+            run.step_source_map = request.step_source_map
         prepare_run_viewer(run)
         run_store.persist(run)
         background_tasks.add_task(executor.execute, run.run_id)
@@ -2132,6 +1922,129 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Artifact not found")
 
         return FileResponse(artifact_path)
+
+    @app.get("/api/diagnostics/latest")
+    async def get_latest_diagnostic(
+        actor: User | None = Depends(require_api_access),
+    ) -> JSONResponse:
+        runs = sorted(
+            run_store.list(),
+            key=lambda r: r.started_at or "",
+            reverse=True,
+        )
+        accessible = [r for r in runs if _can_access_owned_resource(actor, r.user_id)]
+        if not accessible:
+            raise HTTPException(status_code=404, detail="No runs found")
+        run = accessible[0]
+        diag_path = (settings.artifact_root / run.run_id / "diagnostic.json").resolve()
+        if not diag_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"diagnostic.json not yet written for run {run.run_id} — run may still be in progress or was created before diagnostics were enabled",
+            )
+        return JSONResponse(content=json.loads(diag_path.read_text("utf-8")))
+
+    @app.get("/api/diagnostics/latest.html", response_class=HTMLResponse)
+    async def get_latest_diagnostic_html(
+        actor: User | None = Depends(require_api_access),
+    ) -> HTMLResponse:
+        runs = sorted(
+            run_store.list(),
+            key=lambda r: r.started_at or "",
+            reverse=True,
+        )
+        accessible = [r for r in runs if _can_access_owned_resource(actor, r.user_id)]
+        if not accessible:
+            raise HTTPException(status_code=404, detail="No runs found")
+        run = accessible[0]
+        html_path = (settings.artifact_root / run.run_id / "diagnostic.html").resolve()
+        if not html_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"diagnostic.html not yet written for run {run.run_id}",
+            )
+        return HTMLResponse(content=html_path.read_text("utf-8"))
+
+    @app.get("/api/diagnostics/{run_id}.html", response_class=HTMLResponse)
+    async def get_diagnostic_html(
+        run_id: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> HTMLResponse:
+        run = run_store.get(run_id)
+        if not run or not _can_access_owned_resource(actor, run.user_id):
+            raise HTTPException(status_code=404, detail="Run not found")
+        html_path = (settings.artifact_root / run_id / "diagnostic.html").resolve()
+        if not html_path.exists():
+            raise HTTPException(status_code=404, detail="diagnostic.html not found")
+        return HTMLResponse(content=html_path.read_text("utf-8"))
+
+    def _load_step_traces(run_id: str) -> list[dict]:
+        run_dir = (settings.artifact_root / run_id).resolve()
+        traces = []
+        for trace_file in sorted(run_dir.glob("step-*.trace.json")):
+            try:
+                traces.append(json.loads(trace_file.read_text("utf-8")))
+            except Exception:
+                pass
+        return traces
+
+    @app.get("/api/diagnostics/latest/traces")
+    async def get_latest_traces(
+        actor: User | None = Depends(require_api_access),
+    ) -> JSONResponse:
+        runs = sorted(run_store.list(), key=lambda r: r.started_at or "", reverse=True)
+        accessible = [r for r in runs if _can_access_owned_resource(actor, r.user_id)]
+        if not accessible:
+            raise HTTPException(status_code=404, detail="No runs found")
+        run = accessible[0]
+        traces = _load_step_traces(run.run_id)
+        if not traces:
+            raise HTTPException(status_code=404, detail=f"No step traces found for run {run.run_id}")
+        return JSONResponse(content={"run_id": run.run_id, "run_name": run.run_name, "steps": traces})
+
+    @app.get("/api/diagnostics/latest/traces/{step_index}")
+    async def get_latest_trace_step(
+        step_index: int,
+        actor: User | None = Depends(require_api_access),
+    ) -> JSONResponse:
+        runs = sorted(run_store.list(), key=lambda r: r.started_at or "", reverse=True)
+        accessible = [r for r in runs if _can_access_owned_resource(actor, r.user_id)]
+        if not accessible:
+            raise HTTPException(status_code=404, detail="No runs found")
+        run = accessible[0]
+        run_dir = (settings.artifact_root / run.run_id).resolve()
+        trace_path = (run_dir / f"step-{step_index:03d}.trace.json").resolve()
+        if not trace_path.exists():
+            raise HTTPException(status_code=404, detail=f"No trace for step {step_index}")
+        return JSONResponse(content=json.loads(trace_path.read_text("utf-8")))
+
+    @app.get("/api/diagnostics/{run_id}/traces")
+    async def get_run_traces(
+        run_id: str,
+        actor: User | None = Depends(require_api_access),
+    ) -> JSONResponse:
+        run = run_store.get(run_id)
+        if not run or not _can_access_owned_resource(actor, run.user_id):
+            raise HTTPException(status_code=404, detail="Run not found")
+        traces = _load_step_traces(run_id)
+        if not traces:
+            raise HTTPException(status_code=404, detail="No step traces found")
+        return JSONResponse(content={"run_id": run_id, "run_name": run.run_name, "steps": traces})
+
+    @app.get("/api/diagnostics/{run_id}/traces/{step_index}")
+    async def get_run_trace_step(
+        run_id: str,
+        step_index: int,
+        actor: User | None = Depends(require_api_access),
+    ) -> JSONResponse:
+        run = run_store.get(run_id)
+        if not run or not _can_access_owned_resource(actor, run.user_id):
+            raise HTTPException(status_code=404, detail="Run not found")
+        run_dir = (settings.artifact_root / run_id).resolve()
+        trace_path = (run_dir / f"step-{step_index:03d}.trace.json").resolve()
+        if not trace_path.exists():
+            raise HTTPException(status_code=404, detail=f"No trace for step {step_index}")
+        return JSONResponse(content=json.loads(trace_path.read_text("utf-8")))
 
     @app.post("/api/runs/{run_id}/cancel", response_model=CancelRunResponse)
     async def cancel_run(

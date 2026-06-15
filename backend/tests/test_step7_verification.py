@@ -2,7 +2,7 @@
 Verification tests for Steps 5, 6, and 7:
   - Step 5: Fast-fail probe (_probe_element_present + candidate loop skipping)
   - Step 6: DOM Signature Memory (remember/recall + find_by_signatures)
-  - Step 7: Pre-action page health check (_check_page_health)
+  - Step 7: Pre-action page health check (check_page_health)
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from app.runtime.executor import AgentExecutor
+from app.runtime.page_health import check_page_health
 from app.runtime.perception import (
     ElementIndex,
     IndexedElement,
@@ -282,20 +283,20 @@ def _snap(
 
 def test_health_check_blocks_on_404_title() -> None:
     snap = _snap(title="404 Not Found", text_excerpt="The page you requested could not be found.")
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "block"
     assert any(i["type"] == "error_page" for i in result["issues"])
 
 
 def test_health_check_blocks_on_500_title() -> None:
     snap = _snap(title="500 Internal Server Error")
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "block"
 
 
 def test_health_check_blocks_on_forbidden_title() -> None:
     snap = _snap(title="403 Forbidden")
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "block"
 
 
@@ -305,7 +306,7 @@ def test_health_check_blocks_on_browser_dns_error() -> None:
         text_excerpt="err_connection_refused",
         interactive_elements=[],
     )
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "block"
     assert any(i["type"] == "browser_error" for i in result["issues"])
 
@@ -317,7 +318,7 @@ def test_health_check_blocks_on_nearly_empty_page_with_404_text() -> None:
         text_excerpt="404 The resource you requested was not found.",
         interactive_elements=[{"tag": "a", "text": "Go home", "visible": True, "role": "link"}],
     )
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "block"
 
 
@@ -330,7 +331,7 @@ def test_health_check_ok_on_normal_page_containing_404_in_body() -> None:
         text_excerpt="We handle 404 errors gracefully in our API",
         interactive_elements=elements,
     )
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "ok"
 
 
@@ -338,26 +339,26 @@ def test_health_check_ok_on_normal_page_containing_404_in_body() -> None:
 
 def test_health_check_warns_on_domain_mismatch() -> None:
     snap = _snap(url="https://evil.phishing.com/login")
-    result = AgentExecutor._check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
+    result = check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
     assert result["status"] == "warn"
     assert any(i["type"] == "domain_mismatch" for i in result["issues"])
 
 
 def test_health_check_ok_on_same_domain() -> None:
     snap = _snap(url="https://example.com/checkout")
-    result = AgentExecutor._check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
+    result = check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
     assert result["status"] == "ok"
 
 
 def test_health_check_ok_on_subdomain_of_expected() -> None:
     snap = _snap(url="https://app.example.com/dashboard")
-    result = AgentExecutor._check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
+    result = check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
     assert result["status"] == "ok"
 
 
 def test_health_check_ok_on_www_variant() -> None:
     snap = _snap(url="https://www.example.com/page")
-    result = AgentExecutor._check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
+    result = check_page_health(snap, _make_run(start_url="https://example.com"), _make_step())
     assert result["status"] == "ok"
 
 
@@ -369,7 +370,7 @@ def test_health_check_warns_on_blocking_dialog() -> None:
         {"tag": "button", "role": "button", "text": "Submit", "visible": True},
     ]
     snap = _snap(interactive_elements=elements)
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "warn"
     assert any(i["type"] == "modal_overlay" for i in result["issues"])
 
@@ -381,7 +382,7 @@ def test_health_check_does_not_warn_for_cookie_consent_dialog() -> None:
         {"tag": "button", "role": "button", "text": "Accept all", "visible": True},
     ]
     snap = _snap(interactive_elements=elements)
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     modal_issues = [i for i in result.get("issues", []) if i["type"] == "modal_overlay"]
     assert modal_issues == []
 
@@ -390,7 +391,7 @@ def test_health_check_does_not_warn_for_cookie_consent_dialog() -> None:
 
 def test_health_check_warns_on_loading_state() -> None:
     snap = _snap(title="loading...", interactive_elements=[])
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "warn"
     assert any(i["type"] == "loading_state" for i in result["issues"])
 
@@ -398,13 +399,13 @@ def test_health_check_warns_on_loading_state() -> None:
 # --- OK cases ---
 
 def test_health_check_ok_for_none_snapshot() -> None:
-    result = AgentExecutor._check_page_health(None, _make_run(), _make_step())
+    result = check_page_health(None, _make_run(), _make_step())
     assert result["status"] == "ok"
     assert result["issues"] == []
 
 
 def test_health_check_ok_for_healthy_page() -> None:
     snap = _snap()
-    result = AgentExecutor._check_page_health(snap, _make_run(), _make_step())
+    result = check_page_health(snap, _make_run(), _make_step())
     assert result["status"] == "ok"
     assert result["issues"] == []

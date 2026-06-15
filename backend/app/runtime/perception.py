@@ -81,6 +81,8 @@ class PerceptionMatch:
     score: int
     confidence: str        # "unique" | "high" | "medium" | "ambiguous"
     alternative_count: int # how many other elements also scored above threshold
+    scored_elements: list[dict] = field(default_factory=list)  # top candidates with scores for trace
+    decision_trace: dict = field(default_factory=dict)  # full decision chain for step trace
 
 
 @dataclass
@@ -702,6 +704,54 @@ def find_by_signatures(
     return selectors
 
 
+def _score_breakdown(el: IndexedElement, tokens: list[str], step_type: str) -> dict:
+    """Return a field-level contribution map for the top candidates only (not called on all 83)."""
+    haystack = _element_haystack(el)
+    el_text_lower = el.text.lower()
+    matched_tokens = [t for t in tokens if t in haystack]
+    contributions: dict[str, int] = {}
+
+    for token in matched_tokens:
+        base = max(10, len(token) * 3)
+        contributions["token_base"] = contributions.get("token_base", 0) + base
+        if token in el_text_lower:
+            contributions["visible_text"] = contributions.get("visible_text", 0) + 8
+        if el_text_lower == token:
+            contributions["exact_text"] = contributions.get("exact_text", 0) + 25
+        if token in el.aria.lower():
+            contributions["aria_label"] = contributions.get("aria_label", 0) + 12
+        if token in el.testid.lower():
+            contributions["testid"] = contributions.get("testid", 0) + 15
+        if token in el.placeholder.lower():
+            contributions["placeholder"] = contributions.get("placeholder", 0) + 10
+        if token in el.name.lower():
+            contributions["name_attr"] = contributions.get("name_attr", 0) + 8
+        if el.label and token in el.label.lower():
+            contributions["label"] = contributions.get("label", 0) + 10
+
+    if len(tokens) >= 2:
+        phrase = " ".join(tokens)
+        if phrase in el_text_lower:
+            contributions["phrase_text"] = 22
+        elif phrase in haystack:
+            contributions["phrase_attr"] = 10
+
+    if step_type == "click" and el.tag in {"button", "a"}:
+        contributions["tag_alignment"] = contributions.get("tag_alignment", 0) + 20
+    elif step_type == "type" and el.tag in {"input", "textarea"}:
+        contributions["tag_alignment"] = contributions.get("tag_alignment", 0) + 25
+
+    if el.el_id:
+        contributions["stable_id"] = 8
+    if el.testid:
+        contributions["stable_testid"] = 10
+    region_delta = _REGION_SCORE_DELTA.get(el.scope, 0)
+    if region_delta:
+        contributions["region_scope"] = region_delta
+
+    return {"matched_tokens": matched_tokens, "field_contributions": contributions}
+
+
 def find_best_match(
     intent_text: str,
     step_type: str,
@@ -784,12 +834,74 @@ def find_best_match(
         selector, top_el.text[:60], intent_text[:60],
     )
 
+    scored_trace = [
+        {
+            "score": s,
+            "tag": el.tag,
+            "role": el.role or el.semantic_role,
+            "text": el.text[:80],
+            "aria": el.aria[:80],
+            "label": el.label[:80],
+            "id": el.el_id,
+            "name": el.name,
+            "scope": el.scope,
+            "selector": el.best_selector or "",
+        }
+        for s, el in scored[:12]
+    ]
+
+    top5_trace = []
+    for s, el in scored[:5]:
+        breakdown = _score_breakdown(el, tokens, step_type)
+        top5_trace.append({
+            "score": s,
+            "selector": el.best_selector or "",
+            "tag": el.tag,
+            "role": el.role or el.semantic_role or "",
+            "text": el.text[:80],
+            "label": el.label[:80],
+            "id": el.el_id,
+            "scope": el.scope,
+            "matched_tokens": breakdown["matched_tokens"],
+            "field_contributions": breakdown["field_contributions"],
+        })
+
+    if confidence == "unique":
+        confidence_reason = f"only 1 element above threshold (score={top_score})"
+    elif confidence == "high":
+        confidence_reason = f"gap={gap} >= unique_gap={_UNIQUE_GAP}, score={top_score} >= high_score={_HIGH_SCORE}"
+    elif confidence == "medium":
+        confidence_reason = f"gap={gap} >= high_gap={_HIGH_GAP} but < unique_gap={_UNIQUE_GAP}"
+    else:
+        confidence_reason = f"gap={gap} < high_gap={_HIGH_GAP} — {above_threshold} candidates score similarly"
+
+    decision_trace = {
+        "tokens": tokens,
+        "candidates_evaluated": element_index.count,
+        "candidates_above_threshold": above_threshold,
+        "top_candidates": top5_trace,
+        "winner_selector": selector,
+        "winner_score": top_score,
+        "second_score": second_score,
+        "gap": gap,
+        "confidence": confidence,
+        "confidence_reason": confidence_reason,
+        "thresholds": {
+            "min_score": min_score,
+            "high_score": _HIGH_SCORE,
+            "high_gap": _HIGH_GAP,
+            "unique_gap": _UNIQUE_GAP,
+        },
+    }
+
     return PerceptionMatch(
         element=top_el,
         selector=selector,
         score=top_score,
         confidence=confidence,
         alternative_count=above_threshold - 1,
+        scored_elements=scored_trace,
+        decision_trace=decision_trace,
     )
 
 
@@ -1133,10 +1245,27 @@ def find_best_match_for_target(
         canonical.get("semantic_name"), canonical.get("accessible_name"), expected_role or top_el.semantic_role,
     )
 
+    scored_trace = [
+        {
+            "score": s,
+            "tag": el.tag,
+            "role": el.role or el.semantic_role,
+            "text": el.text[:80],
+            "aria": el.aria[:80],
+            "label": el.label[:80],
+            "id": el.el_id,
+            "name": el.name,
+            "scope": el.scope,
+            "selector": el.best_selector or "",
+        }
+        for s, el in scored[:12]
+    ]
+
     return PerceptionMatch(
         element=top_el,
         selector=selector,
         score=top_score,
         confidence=confidence,
         alternative_count=above_threshold - 1,
+        scored_elements=scored_trace,
     )

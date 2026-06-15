@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Shadow DOM Traversal Fixture</title>
+</head>
+<body>
+  <h1>Shadow DOM inspect_page() verification</h1>
+
+  <!-- 1. Plain main-document controls (baseline — must still appear) -->
+  <button id="main-submit" aria-label="Submit form">Submit</button>
+  <input id="main-email" type="email" placeholder="Email address" name="email">
+
+  <!-- 2. Web component with an OPEN shadow root containing a button -->
+  <my-login-button id="login-wc"></my-login-button>
+
+  <!-- 3. Nested: outer web component whose shadow root contains another web component -->
+  <my-card id="card-wc"></my-card>
+
+  <!-- 4. Web component with a CLOSED shadow root (should NOT appear — inaccessible) -->
+  <my-closed id="closed-wc"></my-closed>
+
+  <script>
+    // --- Component 2: open shadow, single button ---
+    class MyLoginButton extends HTMLElement {
+      constructor() {
+        super();
+        const shadow = this.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <button id="shadow-login" aria-label="Log in to your account">Log In</button>
+          <input type="password" placeholder="Password" name="shadow-password">
+        `;
+      }
+    }
+    customElements.define('my-login-button', MyLoginButton);
+
+    // --- Component 3: nested open shadow ---
+    class MyInnerWidget extends HTMLElement {
+      constructor() {
+        super();
+        const shadow = this.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <button id="nested-confirm" aria-label="Confirm nested action">Confirm</button>
+        `;
+      }
+    }
+    customElements.define('my-inner-widget', MyInnerWidget);
+
+    class MyCard extends HTMLElement {
+      constructor() {
+        super();
+        const shadow = this.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <div role="dialog">
+            <my-inner-widget></my-inner-widget>
+          </div>
+        `;
+        // inner web component must be defined before the outer renders
+      }
+    }
+    customElements.define('my-card', MyCard);
+
+    // --- Component 4: CLOSED shadow root ---
+    class MyClosed extends HTMLElement {
+      constructor() {
+        super();
+        const shadow = this.attachShadow({ mode: 'closed' });
+        shadow.innerHTML = `<button id="closed-btn">Should not appear</button>`;
+      }
+    }
+    customElements.define('my-closed', MyClosed);
+  </script>
+</body>
+</html>

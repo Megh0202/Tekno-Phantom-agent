@@ -196,6 +196,7 @@ class RunCreateRequest(BaseModel):
     selector_profile: dict[str, list[str]] = Field(default_factory=dict)
     source_test_case_id: str | None = None
     resume_from_step_index: int | None = Field(default=None, ge=0)
+    step_source_map: list[dict[str, Any]] | None = None
 
     @field_validator("prompt")
     @classmethod
@@ -859,6 +860,7 @@ class RunState(BaseModel):
     summary: str | None = None
     report_artifact: str | None = None
     recovery_mode: bool = False
+    step_source_map: list[dict[str, Any]] | None = None
 
 
 class RunListResponse(BaseModel):

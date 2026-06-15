@@ -10,6 +10,7 @@ import pytest
 from app.runtime.executor import AgentExecutor, CandidateConfidence, CandidateValidationResult, StepIntent
 from app.runtime.perception import build_element_index, find_best_match
 from app.runtime.selector_memory import InMemorySelectorMemoryStore
+from app.runtime.template_engine import TemplateEngine
 from app.schemas import RunState, RunStatus, StepRuntimeState, StepStatus
 
 
@@ -28,6 +29,8 @@ def _executor(step_timeout_seconds: int = 15) -> AgentExecutor:
     executor._selector_timeout_tasks = {}
     executor._step_trace_context = ContextVar("executor_step_trace_context_test", default=None)
     executor._step_state_context = ContextVar("executor_step_state_context_test", default=None)
+    executor._run_context: dict = {}
+    executor._template_engine = TemplateEngine(executor._run_context)
     return executor
 
 
@@ -1168,7 +1171,6 @@ def test_execute_step_continues_to_selector_pipeline_after_page_assertion_failur
     executor._assert_step_page_state = _raise_page_assertion
     executor._dispatch_step = _dispatch_step
     executor._safe_page_snapshot = _noop
-    executor._check_page_health = lambda *args, **kwargs: {"status": "ok", "issues": []}
     executor._files = SimpleNamespace(
         write_text_artifact=_noop,
         write_bytes_artifact=_noop,
