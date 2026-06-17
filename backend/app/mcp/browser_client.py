@@ -955,6 +955,64 @@ class BrowserMCPClient:
         baseline = baseline_path or "none"
         return f"Image verification passed on {target} (baseline={baseline}, threshold={threshold})"
 
+    async def hover(self, selector: str) -> str:
+        await asyncio.sleep(0.1)
+        return f"Hovered over {selector}"
+
+    async def double_click(self, selector: str) -> str:
+        await asyncio.sleep(0.1)
+        return f"Double-clicked {selector}"
+
+    async def right_click(self, selector: str) -> str:
+        await asyncio.sleep(0.1)
+        return f"Right-clicked {selector}"
+
+    async def press_key(self, key: str, selector: str | None = None) -> str:
+        await asyncio.sleep(0.1)
+        if selector:
+            return f"Pressed {key} on {selector}"
+        return f"Pressed {key}"
+
+    async def upload(self, selector: str, file_path: str) -> str:
+        await asyncio.sleep(0.1)
+        return f"Uploaded {file_path} to {selector}"
+
+    async def manage_tab(
+        self,
+        action: str,
+        url: str | None = None,
+        index: int | None = None,
+        title: str | None = None,
+    ) -> str:
+        await asyncio.sleep(0.1)
+        if action == "open":
+            return f"Opened new tab{f' with {url}' if url else ''}"
+        if action == "close":
+            return "Closed current tab"
+        if action == "switch":
+            target = f"index {index}" if index is not None else (f"title '{title}'" if title else "index 0")
+            return f"Switched to tab {target}"
+        return f"Tab action: {action}"
+
+    async def manage_window(
+        self,
+        action: str,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> str:
+        await asyncio.sleep(0.1)
+        if action == "resize" and width is not None and height is not None:
+            return f"Resized window to {width}x{height}"
+        if action == "maximize":
+            return "Maximized window"
+        if action == "fullscreen":
+            return "Set window to fullscreen"
+        return f"Window action: {action}"
+
+    async def fill_prompt(self, value: str, policy: str = "accept") -> str:
+        await asyncio.sleep(0.1)
+        return f"Prompt filled with '{value}' and {policy}ed"
+
     async def capture_screenshot(self, selector: str | None = None) -> bytes:
         await asyncio.sleep(0.05)
         return _MOCK_SCREENSHOT_BYTES
@@ -1046,6 +1104,7 @@ class _PlaywrightRunContext:
     page: Any
     dialog_policy: str = "dismiss"
     last_dialog_message: str | None = None
+    dialog_prompt_text: str | None = None
 
 
 class PlaywrightBrowserMCPClient(BrowserMCPClient):
@@ -1689,6 +1748,134 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
             f"Image verification passed on {target} "
             f"(baseline={baseline}, threshold={threshold}, difference={delta:.4f})"
         )
+
+    async def hover(self, selector: str) -> str:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            await locator.wait_for(state="visible", timeout=2200)
+        except Exception:
+            pass
+        await locator.hover()
+        return f"Hovered over {selector}"
+
+    async def double_click(self, selector: str) -> str:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            await locator.wait_for(state="visible", timeout=2200)
+        except Exception:
+            pass
+        try:
+            await locator.scroll_into_view_if_needed(timeout=1200)
+        except Exception:
+            pass
+        await locator.dblclick()
+        return f"Double-clicked {selector}"
+
+    async def right_click(self, selector: str) -> str:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            await locator.wait_for(state="visible", timeout=2200)
+        except Exception:
+            pass
+        try:
+            await locator.scroll_into_view_if_needed(timeout=1200)
+        except Exception:
+            pass
+        await locator.click(button="right")
+        return f"Right-clicked {selector}"
+
+    async def press_key(self, key: str, selector: str | None = None) -> str:
+        context = self._active_context()
+        if selector:
+            locator = context.page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=2200)
+            except Exception:
+                pass
+            await locator.focus()
+            await locator.press(key)
+            return f"Pressed {key} on {selector}"
+        await context.page.keyboard.press(key)
+        return f"Pressed {key}"
+
+    async def upload(self, selector: str, file_path: str) -> str:
+        context = self._active_context()
+        locator = context.page.locator(selector).first
+        try:
+            await locator.wait_for(state="attached", timeout=2200)
+        except Exception:
+            pass
+        await locator.set_input_files(file_path)
+        return f"Uploaded {file_path} to {selector}"
+
+    async def manage_tab(
+        self,
+        action: str,
+        url: str | None = None,
+        index: int | None = None,
+        title: str | None = None,
+    ) -> str:
+        context = self._active_context()
+        if action == "open":
+            new_page = await context.context.new_page()
+            context.page = new_page
+            if url:
+                await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                return f"Opened new tab with {url}"
+            return "Opened new tab"
+        if action == "close":
+            await context.page.close()
+            pages = context.context.pages
+            context.page = pages[-1] if pages else await context.context.new_page()
+            return "Closed current tab"
+        if action == "switch":
+            pages = context.context.pages
+            if index is not None:
+                if 0 <= index < len(pages):
+                    context.page = pages[index]
+                    return f"Switched to tab index {index}"
+                raise ValueError(f"Tab index {index} out of range (have {len(pages)} tabs)")
+            if title:
+                for pg in pages:
+                    pg_title = await pg.title()
+                    if title.lower() in pg_title.lower():
+                        context.page = pg
+                        return f"Switched to tab with title '{pg_title}'"
+                raise ValueError(f"No tab with title containing '{title}'")
+            if pages:
+                context.page = pages[-1]
+                return "Switched to last tab"
+            raise ValueError("No tabs available to switch to")
+        raise ValueError(f"Unsupported manage_tab action: {action}")
+
+    async def manage_window(
+        self,
+        action: str,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> str:
+        context = self._active_context()
+        if action == "resize":
+            w = width or 1280
+            h = height or 800
+            await context.page.set_viewport_size({"width": w, "height": h})
+            return f"Resized window to {w}x{h}"
+        if action == "maximize":
+            await context.page.set_viewport_size({"width": 1920, "height": 1080})
+            return "Maximized window to 1920x1080"
+        if action == "fullscreen":
+            await context.page.evaluate("document.documentElement.requestFullscreen().catch(()=>{})")
+            return "Requested fullscreen"
+        raise ValueError(f"Unsupported manage_window action: {action}")
+
+    async def fill_prompt(self, value: str, policy: str = "accept") -> str:
+        context = self._active_context()
+        context.dialog_policy = policy
+        context.dialog_prompt_text = value if policy == "accept" else None
+        return f"Prompt configured: will fill '{value}' and {policy}"
 
     async def capture_screenshot(self, selector: str | None = None) -> bytes:
         context = self._active_context()
@@ -2429,10 +2616,15 @@ class PlaywrightBrowserMCPClient(BrowserMCPClient):
 
         context.last_dialog_message = dialog.message
         policy = context.dialog_policy
+        prompt_text = context.dialog_prompt_text
+        context.dialog_prompt_text = None
 
         try:
             if policy == "accept":
-                await dialog.accept()
+                if dialog.type == "prompt" and prompt_text is not None:
+                    await dialog.accept(prompt_text)
+                else:
+                    await dialog.accept()
             elif policy in ("dismiss", "close", "ignore"):
                 await dialog.dismiss()
             else:

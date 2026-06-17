@@ -165,6 +165,74 @@ class VerifyImageStep(BaseModel):
     threshold: float = 0.05
 
 
+class HoverStep(BaseModel):
+    type: Literal["hover"]
+    selector: str = ""
+    target: SemanticTarget | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("hover step requires selector or target")
+
+
+class DoubleClickStep(BaseModel):
+    type: Literal["double_click"]
+    selector: str = ""
+    target: SemanticTarget | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("double_click step requires selector or target")
+
+
+class RightClickStep(BaseModel):
+    type: Literal["right_click"]
+    selector: str = ""
+    target: SemanticTarget | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("right_click step requires selector or target")
+
+
+class PressKeyStep(BaseModel):
+    type: Literal["press_key"]
+    key: str
+    selector: str | None = None
+
+
+class UploadStep(BaseModel):
+    type: Literal["upload"]
+    selector: str = ""
+    target: SemanticTarget | None = None
+    file_path: str
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.selector and self.target is None:
+            raise ValueError("upload step requires selector or target")
+
+
+class ManageTabStep(BaseModel):
+    type: Literal["manage_tab"]
+    action: Literal["open", "close", "switch"] = "open"
+    url: str | None = None
+    index: int | None = None
+    title: str | None = None
+
+
+class ManageWindowStep(BaseModel):
+    type: Literal["manage_window"]
+    action: Literal["resize", "maximize", "fullscreen"] = "maximize"
+    width: int | None = None
+    height: int | None = None
+
+
+class FillPromptStep(BaseModel):
+    type: Literal["fill_prompt"]
+    value: str
+    policy: Literal["accept", "dismiss"] = "accept"
+
+
 ActionStep = Annotated[
     Union[
         NavigateStep,
@@ -177,6 +245,14 @@ ActionStep = Annotated[
         HandlePopupStep,
         VerifyTextStep,
         VerifyImageStep,
+        HoverStep,
+        DoubleClickStep,
+        RightClickStep,
+        PressKeyStep,
+        UploadStep,
+        ManageTabStep,
+        ManageWindowStep,
+        FillPromptStep,
     ],
     Field(discriminator="type"),
 ]

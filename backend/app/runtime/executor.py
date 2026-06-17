@@ -62,6 +62,7 @@ from app.runtime.intent_builder import (
 from app.runtime.report_builder import (
     build_diagnostic_html,
     build_diagnostic_json,
+    build_failure_classification,
     build_html_report,
     build_summary,
 )
@@ -118,6 +119,13 @@ class CandidateValidationResult:
 
 class _FastPathEscalation(Exception):
     pass
+
+
+class _UploadFileRequired:
+    """Sentinel returned when the upload step's file_path cannot be resolved locally.
+    The caller (execute_step) inspects this and triggers a HITL file_upload pause."""
+    def __init__(self, original_path: str) -> None:
+        self.original_path = original_path
 
 
 class AgentExecutor:
@@ -1191,7 +1199,7 @@ class AgentExecutor:
                 return {"path": "fast", "reason": "simple_timeout_wait"}
             return {"path": "slow", "reason": f"wait_condition_{until}"}
 
-        if step_type not in {"click", "type", "select"}:
+        if step_type not in {"click", "type", "select", "hover", "double_click", "right_click", "upload"}:
             return {"path": "slow", "reason": f"{step_type}_requires_full_pipeline"}
 
         grounded_selector = step_input.get("_grounded_selector")
@@ -1819,7 +1827,7 @@ class AgentExecutor:
             #                  contract present
             # Transition → Phase 4 (assertion skipped if strong_live_grounding)
             strong_live_grounding = False
-            if step.type in {"click", "type", "select"} and before_snapshot:
+            if step.type in {"click", "type", "select", "hover", "double_click", "right_click", "upload"} and before_snapshot:
                 perception_match, _perception_index_meta = await self._perceive_before_act(
                     run, step, snapshot=before_snapshot
                 )
@@ -2084,8 +2092,8 @@ class AgentExecutor:
                 before_snapshot=before_snapshot,
                 click_pre_state=slow_path_pre_state,
             )
-            step_trace["page_state_verification"] = outcome_verification
             step_trace["page_state_after"] = outcome_verification.get("after_state")
+            step_trace["page_state_verification"] = {k: v for k, v in outcome_verification.items() if k != "after_state"}
             step.status = StepStatus.completed
             step.message = message
             step_trace["result"] = message
@@ -2322,6 +2330,7 @@ class AgentExecutor:
             step_trace["failure_screenshot"] = step.failure_screenshot
             step_trace["ended_at"] = step.ended_at
             step_trace["total_step_ms"] = self._elapsed_ms(step_started_perf)
+            step_trace["failure_classification"] = build_failure_classification(step_trace)
             self._run_step_traces.setdefault(run.run_id, []).append(dict(step_trace))
             log_filename = f"step-{step.index:03d}.log"
             trace_filename = f"step-{step.index:03d}.trace.json"
@@ -2770,6 +2779,46 @@ class AgentExecutor:
         run.status = RunStatus.running
         run.finished_at = None
         self._run_store.persist(run)
+        return run
+
+    def _resolve_upload_path(self, file_path: str) -> str | None:
+        """Return a valid container-local path for the file, or None if not found.
+
+        Resolution order:
+        1. The path as-is (already absolute and exists)
+        2. Basename lookup in uploads_dir (user pre-uploaded the file)
+        """
+        if not file_path:
+            return None
+        p = Path(file_path)
+        if p.exists():
+            return file_path
+        uploads_dir = self._settings.uploads_dir
+        candidate = uploads_dir / p.name
+        if candidate.exists():
+            return str(candidate)
+        return None
+
+    def apply_file_upload(self, run_id: str, step_id: str, saved_path: str) -> RunState | None:
+        """Inject the uploaded file path into the paused upload step and resume execution."""
+        run = self._run_store.get(run_id)
+        if not run:
+            return None
+        step = next((s for s in run.steps if s.step_id == step_id), None)
+        if not step:
+            return None
+        if step.status != StepStatus.waiting_for_input or step.user_input_kind != "file_upload":
+            raise ValueError(f"Step is not awaiting file upload (status={step.status!r}, kind={step.user_input_kind!r}).")
+        inp = dict(step.input or {})
+        inp["file_path"] = saved_path
+        step.input = inp
+        step.user_input_kind = None
+        step.user_input_prompt = None
+        step.status = StepStatus.pending
+        self._run_store.persist(run)
+        asyncio.get_event_loop().call_soon_threadsafe(
+            lambda: asyncio.ensure_future(self.execute(run.run_id, resume_step_id=step_id))
+        )
         return run
 
     def apply_human_recovery_confirmation(
@@ -3356,6 +3405,118 @@ class AgentExecutor:
                 threshold=threshold,
             )
 
+        if step_type == "hover":
+            selector = _resolve_interaction_selector()
+            return await self._run_with_selector_fallback(
+                selector,
+                step_type,
+                selector_profile,
+                test_data,
+                run_domain,
+                lambda resolved: self._browser.hover(resolved),
+                text_hint=step_text_hint(raw_step, step_type),
+                grounded_selector=raw_step.get("_grounded_selector"),
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
+            )
+
+        if step_type == "double_click":
+            selector = _resolve_interaction_selector()
+            return await self._run_with_selector_fallback(
+                selector,
+                step_type,
+                selector_profile,
+                test_data,
+                run_domain,
+                lambda resolved: self._browser.double_click(resolved),
+                text_hint=step_text_hint(raw_step, step_type),
+                grounded_selector=raw_step.get("_grounded_selector"),
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
+            )
+
+        if step_type == "right_click":
+            selector = _resolve_interaction_selector()
+            return await self._run_with_selector_fallback(
+                selector,
+                step_type,
+                selector_profile,
+                test_data,
+                run_domain,
+                lambda resolved: self._browser.right_click(resolved),
+                text_hint=step_text_hint(raw_step, step_type),
+                grounded_selector=raw_step.get("_grounded_selector"),
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
+            )
+
+        if step_type == "press_key":
+            key = str(raw_step["key"])
+            _raw_press_sel = raw_step.get("selector")
+            selector = _raw_press_sel if isinstance(_raw_press_sel, str) and _raw_press_sel.strip() else None
+            if selector:
+                resolved_selector = await self._resolve_selector(
+                    selector,
+                    step_type,
+                    selector_profile,
+                    test_data,
+                    run_domain,
+                )
+                return await self._browser.press_key(key=key, selector=resolved_selector)
+            return await self._browser.press_key(key=key, selector=None)
+
+        if step_type == "upload":
+            selector = _resolve_interaction_selector()
+            raw_file_path = str(raw_step.get("file_path") or "")
+            file_path = self._template_engine.apply_template(raw_file_path, test_data, run_id=run.run_id)
+            file_path = self._resolve_upload_path(file_path)
+            if not file_path:
+                return _UploadFileRequired(raw_file_path)
+            return await self._run_with_selector_fallback(
+                selector,
+                step_type,
+                selector_profile,
+                test_data,
+                run_domain,
+                lambda resolved: self._browser.upload(selector=resolved, file_path=file_path),
+                text_hint=step_text_hint(raw_step, step_type),
+                grounded_selector=raw_step.get("_grounded_selector"),
+                semantic_confidence=raw_step.get("_semantic_confidence"),
+                element_candidates=raw_step.get("_grounded_selectors") or None,
+            )
+
+        if step_type == "manage_tab":
+            action = str(raw_step.get("action", "open"))
+            url = raw_step.get("url")
+            index = raw_step.get("index")
+            title = raw_step.get("title")
+            resolved_url = (
+                self._template_engine.apply_template(str(url), test_data, run_id=run.run_id)
+                if url is not None
+                else None
+            )
+            return await self._browser.manage_tab(
+                action=action,
+                url=resolved_url,
+                index=int(index) if index is not None else None,
+                title=str(title) if title is not None else None,
+            )
+
+        if step_type == "manage_window":
+            action = str(raw_step.get("action", "maximize"))
+            width = raw_step.get("width")
+            height = raw_step.get("height")
+            return await self._browser.manage_window(
+                action=action,
+                width=int(width) if width is not None else None,
+                height=int(height) if height is not None else None,
+            )
+
+        if step_type == "fill_prompt":
+            value = self._template_engine.apply_template(str(raw_step["value"]), test_data, run_id=run.run_id)
+            policy = str(raw_step.get("policy", "accept"))
+            return await self._browser.fill_prompt(value=value, policy=policy)
+
         # ── Phase 3: Unknown Step Type ────────────────────────────────────────────
         raise ValueError(f"Unsupported step type: {step_type}")
 
@@ -3615,21 +3776,16 @@ class AgentExecutor:
             return None
         interactive_elements = snapshot.get("interactive_elements")
         visible_count = 0
-        sample: list[dict[str, Any]] = []
         if isinstance(interactive_elements, list):
             for item in interactive_elements:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("visible", True):
+                if isinstance(item, dict) and item.get("visible", True):
                     visible_count += 1
-                sample.append(snapshot_item_summary(item))
         return {
             "url": str(snapshot.get("url", ""))[:240],
             "title": str(snapshot.get("title", ""))[:160],
             "text_excerpt": str(snapshot.get("text_excerpt", ""))[:240],
             "visible_interactive_count": visible_count,
             "page_count": int(snapshot.get("page_count") or 1),
-            "interactive_sample": sample,
         }
 
     def _focused_snapshot_for_suggestion(
@@ -4981,7 +5137,7 @@ class AgentExecutor:
                     # element; give them the full grounded timeout.
                     is_grounded = _element_constrained or bool(grounded_selector and selector == grounded_selector)
                     probe_timeout_ms = 3000 if is_grounded else 1500
-                    probe_ok = await self._probe_element_present(selector, timeout_ms=probe_timeout_ms)
+                    probe_ok, probe_detail = await self._probe_element_present(selector, timeout_ms=probe_timeout_ms)
                     if not probe_ok:
                         compact_error = f"probe: element not visible within {probe_timeout_ms} ms"
                         LOGGER.warning(
@@ -5001,6 +5157,7 @@ class AgentExecutor:
                                 "grounded": is_grounded,
                                 "elapsed_ms": self._elapsed_ms(attempt_started),
                                 "error": compact_error,
+                                "probe_result": probe_detail or None,
                             },
                         )
                         continue
@@ -5958,23 +6115,16 @@ class AgentExecutor:
             return score
         return score + sel_utils.selector_stability_score(selector)
 
-    async def _probe_element_present(self, selector: str, timeout_ms: int = 1500) -> bool:
+    async def _probe_element_present(self, selector: str, timeout_ms: int = 1500) -> tuple[bool, dict]:
         """
-        Fast-fail DOM probe: returns True if the selector resolves to at least
-        one visible element, False otherwise.
-
-        Uses an immediate is_visible() check on ALL matches (not just DOM-first)
-        to avoid false failures caused by a hidden element appearing before a
-        visible one in DOM order.  Falls back to a short wait_for_selector if
-        none are immediately visible.
+        Fast-fail DOM probe: returns (True, {}) if the selector resolves to at least
+        one visible element. On miss, returns (False, probe_result) where probe_result
+        contains found_in_dom, dom_match_count, and visible for trace diagnostics.
         """
         browser = getattr(self, "_browser", None)
         if browser is None:
-            return True
+            return True, {}
 
-        # Try immediate is_visible() check on each matching locator first.
-        # This avoids waiting for a hidden first-match when a later match is
-        # already visible (common when nav and form both have the same button text).
         try:
             page = browser._active_context().page  # type: ignore[attr-defined]
             locators = page.locator(selector)
@@ -5982,7 +6132,7 @@ class AgentExecutor:
             for i in range(min(count, 6)):
                 try:
                     if await locators.nth(i).is_visible():
-                        return True
+                        return True, {}
                 except Exception:
                     continue
             # If none are immediately visible, give a short wait for slow renders.
@@ -5992,15 +6142,16 @@ class AgentExecutor:
                         page.wait_for_selector(selector, state="visible", timeout=min(timeout_ms, 1500)),
                         timeout=min(timeout_ms, 1500) / 1000 + 0.5,
                     )
-                    return True
+                    return True, {}
                 except Exception:
-                    return False
+                    return False, {"found_in_dom": True, "dom_match_count": count, "visible": False}
+            return False, {"found_in_dom": False, "dom_match_count": 0, "visible": False}
         except AttributeError:
             pass
 
         # Fallback: original wait_for path (for non-Playwright browser clients).
         if not hasattr(browser, "wait_for"):
-            return True
+            return True, {}
         try:
             await asyncio.wait_for(
                 browser.wait_for(
@@ -6011,9 +6162,9 @@ class AgentExecutor:
                 ),
                 timeout=timeout_ms / 1000 + 0.5,
             )
-            return True
+            return True, {}
         except Exception:
-            return False
+            return False, {"found_in_dom": None, "dom_match_count": None, "visible": False}
 
     def _candidate_timeout_seconds(self, candidate_count: int, step_type: str | None = None) -> float:
         step_timeout = max(float(self._settings.step_timeout_seconds), 1.0)

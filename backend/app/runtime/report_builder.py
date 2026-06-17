@@ -464,7 +464,7 @@ def classify_failure_layer(step_trace: dict[str, Any]) -> str | None:
       Execution   — action threw an unexpected exception
       Unknown     — failed but no classifiable signal
     """
-    if step_trace.get("status") != "failed":
+    if step_trace.get("status") not in ("failed", "waiting_for_input"):
         return None
 
     page_health = step_trace.get("page_health") or {}
@@ -1255,6 +1255,461 @@ def build_diagnostic_html(run: RunState, step_traces: list[dict[str, Any]]) -> s
   <div class="steps">
     {cards_html}
   </div>
+</div>
+</body>
+</html>"""
+
+
+# ── Failure Classification Summary ────────────────────────────────────────────
+
+def build_failure_classification(step_trace: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compute pass/fail verdict for each execution layer and identify the root cause.
+    Written into every step trace before it is flushed to disk.
+
+    Verdicts:
+      PASS = layer was traversed successfully; execution continued past it
+      FAIL = this layer is where execution stopped
+      N/A  = this layer was never reached
+    """
+    status = step_trace.get("status", "")
+
+    # Determine recovery verdict independently of layer classification
+    if status == "waiting_for_input" or step_trace.get("requested_selector_target"):
+        recovery = "FAIL"   # HITL triggered, awaiting human input
+    elif step_trace.get("provided_selector") and status == "failed":
+        recovery = "FAIL"   # HITL was used but step still failed
+    elif step_trace.get("provided_selector") and status == "completed":
+        recovery = "PASS"   # HITL provided and step succeeded
+    elif status == "completed":
+        recovery = "N/A"    # Recovery was not needed
+    else:
+        recovery = "N/A"
+
+    if status not in ("failed", "waiting_for_input"):
+        return {
+            "extraction": "PASS",
+            "matching": "PASS",
+            "execution": "PASS",
+            "validation": "PASS",
+            "recovery": recovery,
+            "root_cause_layer": None,
+            "root_cause": None,
+        }
+
+    layer = classify_failure_layer(step_trace)
+    reason = _derive_failure_reason(step_trace)
+
+    # Map layer → per-layer verdicts
+    # Layers before root cause = PASS (they were cleared)
+    # Root cause layer = FAIL
+    # Layers after root cause = N/A (never reached)
+    verdicts: dict[str, str] = {
+        "extraction": "PASS",
+        "matching": "PASS",
+        "execution": "PASS",
+        "validation": "PASS",
+    }
+
+    if layer == "PageHealth":
+        verdicts = {"extraction": "N/A", "matching": "N/A", "execution": "N/A", "validation": "N/A"}
+    elif layer == "Extraction":
+        verdicts["extraction"] = "FAIL"
+        verdicts["matching"] = "N/A"
+        verdicts["execution"] = "N/A"
+        verdicts["validation"] = "N/A"
+    elif layer in ("Matching", "Perception"):
+        verdicts["matching"] = "FAIL"
+        verdicts["execution"] = "N/A"
+        verdicts["validation"] = "N/A"
+        layer = "Matching"   # Normalise "Perception" to "Matching" in output
+    elif layer == "Execution":
+        verdicts["execution"] = "FAIL"
+        verdicts["validation"] = "N/A"
+    elif layer == "Validation":
+        verdicts["validation"] = "FAIL"
+    else:
+        # Unknown — can't determine which layers passed
+        verdicts = {"extraction": "N/A", "matching": "N/A", "execution": "N/A", "validation": "N/A"}
+
+    return {
+        **verdicts,
+        "recovery": recovery,
+        "root_cause_layer": layer or "Unknown",
+        "root_cause": reason,
+    }
+
+
+# ── Step Diagnosis Report ──────────────────────────────────────────────────────
+
+_LAYER_DEFINITIONS: dict[str, str] = {
+    "Extraction": (
+        "The browser snapshot did not export the target element. "
+        "The element class was absent from the DOM index — either not yet injected, "
+        "inside a shadow DOM, or gated behind JavaScript that had not executed."
+    ),
+    "Matching": (
+        "The element type exists in the snapshot but the selector failed to resolve it. "
+        "The selector may point to a hidden element, use incorrect attributes, "
+        "or match the wrong element among multiple candidates."
+    ),
+    "Execution": (
+        "The selector resolved to a visible element but the browser action threw an exception. "
+        "The element may have become stale, is disabled, or an overlay intercepted the action."
+    ),
+    "Validation": (
+        "The action executed without error but the page did not respond as expected. "
+        "The click landed but produced no observable side-effect, or the expected "
+        "navigation/text change was not observed within the validation window."
+    ),
+    "PageHealth": (
+        "The page was in a blocked state (spinner, modal, or error) before this step ran. "
+        "Execution was prevented before any selector was attempted."
+    ),
+    "Recovery": (
+        "All selector candidates were exhausted without a successful action. "
+        "Human-in-the-loop (HITL) intervention was requested to provide an alternative selector."
+    ),
+    "Unknown": "The failure cause could not be classified from available trace data.",
+}
+
+_LAYER_COLORS: dict[str, str] = {
+    "Extraction": "#f59e0b",
+    "Matching":   "#ef4444",
+    "Execution":  "#a855f7",
+    "Validation": "#3b82f6",
+    "PageHealth": "#ef4444",
+    "Recovery":   "#FFB300",
+    "Unknown":    "#6b7280",
+}
+
+
+def _diag_evidence(step_trace: dict[str, Any], layer: str | None) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+
+    def add(sign: str, field: str, value: str, why: str) -> None:
+        items.append({"sign": sign, "field": field, "value": value, "why": why})
+
+    perception = step_trace.get("perception") or {}
+    page_health = step_trace.get("page_health") or {}
+    gate = (step_trace.get("semantic_gate_trace") or {}).get("fast_path") or {}
+
+    # First probe_miss probe_result anywhere in attempt_groups
+    probe_result: dict | None = None
+    for ag in (step_trace.get("attempt_groups") or []):
+        for att in (ag.get("attempts") or []):
+            if att.get("status") == "probe_miss" and att.get("probe_result"):
+                probe_result = att["probe_result"]
+                break
+        if probe_result:
+            break
+
+    if layer == "Extraction":
+        if probe_result:
+            fid = probe_result.get("found_in_dom")
+            count = probe_result.get("dom_match_count", 0)
+            if fid is False:
+                add("✗", "probe_result.found_in_dom", f"false  (dom_match_count={count})",
+                    "Selector matched zero DOM nodes — element does not exist on page")
+            elif fid is True:
+                add("→", "probe_result", f"found_in_dom=true  dom_match_count={count}  visible=false",
+                    "Element is in DOM but failed visibility check")
+
+        conf = perception.get("confidence")
+        idx_count = perception.get("index_count")
+        if conf == "no_match":
+            suffix = f"  ({idx_count} elements evaluated)" if idx_count is not None else ""
+            add("✗", "perception.confidence", f"'no_match'{suffix}",
+                "Perception scored all snapshot elements; none reached minimum score threshold")
+
+        expected_role = _extract_expected_role(step_trace)
+        idx_types: list[str] = perception.get("index_element_types") or []
+        if expected_role:
+            in_snap = expected_role in idx_types
+            add(
+                "✓" if in_snap else "✗",
+                f"expected_role '{expected_role}' in snapshot",
+                str(in_snap),
+                "Role was present in snapshot (selector wrong)" if in_snap
+                else "Role was NOT in snapshot (element never exported by browser)",
+            )
+
+        role_counts: dict = perception.get("role_counts") or {}
+        if role_counts:
+            rc_str = "  ".join(f"{k}:{v}" for k, v in role_counts.items())
+            add("→", "perception.role_counts", rc_str, "Role distribution in the DOM snapshot")
+
+        ph_status = page_health.get("status", "ok")
+        add("✓" if ph_status == "ok" else "✗", "page_health.status", f"'{ph_status}'",
+            "Page was not in a blocked/loading state when snapshot was taken")
+
+    elif layer == "Matching":
+        if probe_result:
+            fid = probe_result.get("found_in_dom")
+            count = probe_result.get("dom_match_count", 0)
+            vis = probe_result.get("visible", False)
+            if fid is True and not vis:
+                add("✗", "probe_result", f"found_in_dom=true  dom_match_count={count}  visible=false",
+                    "Element is in DOM but is hidden, off-screen, or covered by an overlay")
+            elif fid is False:
+                add("✗", "probe_result", "found_in_dom=false  dom_match_count=0",
+                    "Selector resolves to no DOM node — selector attributes or CSS class is wrong")
+
+        if gate.get("decision") == "rejected":
+            add("✗", "semantic_gate.decision",
+                f"rejected — {str(gate.get('reason', ''))[:120]}",
+                "Semantic gate rejected the resolved element — element text does not match intent")
+
+        conf = perception.get("confidence")
+        if conf == "ambiguous":
+            alt = perception.get("alternative_count", "?")
+            add("✗", "perception.confidence", f"'ambiguous'  ({alt} alternatives scored similarly)",
+                "Multiple elements scored close together — wrong element may have been selected")
+        elif conf == "no_match":
+            add("✗", "perception.confidence", "'no_match'",
+                "No snapshot element matched selector-level targeting")
+
+        ph_status = page_health.get("status", "ok")
+        if ph_status != "ok":
+            add("✗", "page_health.status", f"'{ph_status}'",
+                "Page was not ready when the step ran")
+
+    elif layer == "Execution":
+        exception = step_trace.get("exception") or step_trace.get("error") or ""
+        add("✗", "exception", str(exception)[:240],
+            "Action threw an exception after element was located and probe passed")
+        if probe_result and probe_result.get("visible"):
+            add("✓", "probe_result.visible", "true",
+                "Element was visible — probe passed before the exception")
+
+    elif layer == "Validation":
+        verification = step_trace.get("page_state_verification") or {}
+        val_trace = step_trace.get("validation_trace") or {}
+        outcome = verification.get("outcome") or val_trace.get("outcome")
+        if outcome:
+            add("✗", "validation.outcome", f"'{outcome}'", "Post-action outcome check result")
+        reason = verification.get("outcome_reason") or val_trace.get("detail")
+        if reason:
+            add("✗", "validation.outcome_reason", str(reason)[:200],
+                "Detail of what the validation check observed after the action")
+        for key in ("url_changed", "text_changed", "diff_size"):
+            v = val_trace.get(key)
+            if v is not None:
+                add("→", f"validation_trace.{key}", str(v), "")
+
+    elif layer == "PageHealth":
+        issues = page_health.get("issues") or []
+        add("✗", "page_health.status", f"'{page_health.get('status', 'block')}'",
+            "Page was in a blocked state before this step ran")
+        for issue in issues:
+            add("✗", f"page_health.issue  [{issue.get('type', '?')}]",
+                str(issue.get("detail", ""))[:200], "")
+
+    elif layer == "Recovery":
+        req_target = step_trace.get("requested_selector_target")
+        if req_target:
+            add("→", "requested_selector_target", f"'{req_target}'",
+                "Selector the HITL resolver was asked to fix")
+        for ag in (step_trace.get("attempt_groups") or []):
+            policy = ag.get("execution_policy") or {}
+            allow_llm = policy.get("allow_llm_recovery")
+            if allow_llm is not None:
+                add("→", "execution_policy.allow_llm_recovery", str(allow_llm),
+                    "Whether LLM selector recovery was permitted")
+                break
+        add("→", "status", f"'{step_trace.get('status', '?')}'",
+            "Step ended waiting for human input")
+
+    # Pre-action assertion warning (any layer)
+    assertion = step_trace.get("page_state_assertion") or {}
+    if assertion.get("status") in ("warn", "failed"):
+        detail = assertion.get("detail") or assertion.get("reason") or ""
+        add("⚠", "page_state_assertion.status",
+            f"'{assertion['status']}'  — {str(detail)[:160]}", "Pre-action assertion fired before execution")
+
+    return items
+
+
+def _diag_timeline(step_trace: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for ag in (step_trace.get("attempt_groups") or []):
+        kind = ag.get("kind", "?")
+        for att in (ag.get("attempts") or []):
+            rows.append({
+                "kind": kind,
+                "phase": att.get("phase", "?"),
+                "cycle": att.get("cycle"),
+                "selector": str(att.get("selector", ""))[:80],
+                "status": att.get("status", "?"),
+                "elapsed_ms": att.get("elapsed_ms"),
+                "error": str(att.get("error", ""))[:160],
+                "probe_result": att.get("probe_result"),
+            })
+    return rows
+
+
+_SIGN_COLOR = {"✓": "#22c55e", "✗": "#ef4444", "→": "#FFB300", "⚠": "#f59e0b"}
+_STATUS_COLOR = {"probe_miss": "#ef4444", "failed": "#ef4444", "success": "#22c55e",
+                 "passed": "#22c55e", "gate_rejected": "#f59e0b"}
+
+
+def build_step_diagnosis_html(step_trace: dict[str, Any]) -> str:
+    step_idx = step_trace.get("index", "?")
+    step_type = step_trace.get("type", "unknown")
+    status = step_trace.get("status", "unknown")
+
+    inp = step_trace.get("input") or {}
+    selector = (
+        inp.get("selector") or inp.get("source_selector") or inp.get("target_selector") or ""
+    )
+    sel_display = (selector[:70] + "…") if len(selector) > 70 else selector
+
+    layer = classify_failure_layer(step_trace)
+    layer_label = layer or "Unknown"
+    layer_color = _LAYER_COLORS.get(layer_label, "#6b7280")
+    layer_def = _LAYER_DEFINITIONS.get(layer_label, "")
+
+    evidence = _diag_evidence(step_trace, layer)
+    timeline = _diag_timeline(step_trace)
+
+    page_before = step_trace.get("page_state_before") or {}
+    perception = step_trace.get("perception") or {}
+    role_counts: dict = perception.get("role_counts") or {}
+
+    # ── Evidence rows ──
+    ev_rows = ""
+    for item in evidence:
+        sign = item["sign"]
+        sc = _SIGN_COLOR.get(sign, "#888")
+        field_esc = _esc(item["field"])
+        value_esc = _esc(item["value"])
+        why_esc = _esc(item["why"])
+        ev_rows += (
+            f'<tr>'
+            f'<td style="color:{sc};font-weight:700;font-size:15px;padding:6px 10px 6px 0;white-space:nowrap">{sign}</td>'
+            f'<td style="font-family:monospace;font-size:12px;color:#c9d1d9;padding:6px 14px 6px 0;white-space:nowrap"><code>{field_esc}</code></td>'
+            f'<td style="font-family:monospace;font-size:12px;color:#FFB300;padding:6px 14px 6px 0">{value_esc}</td>'
+            f'<td style="font-size:12px;color:#888;padding:6px 0">{why_esc}</td>'
+            f'</tr>'
+        )
+    ev_html = f'<table style="border-collapse:collapse;width:100%">{ev_rows}</table>' if ev_rows else "<p style='color:#666'>No evidence fields extracted.</p>"
+
+    # ── Timeline rows ──
+    tl_rows = ""
+    for i, row in enumerate(timeline):
+        sc = _STATUS_COLOR.get(row["status"], "#888")
+        ms = f"{row['elapsed_ms']:.0f}ms" if isinstance(row.get("elapsed_ms"), (int, float)) else "—"
+        pr = row.get("probe_result")
+        probe_cell = ""
+        if pr:
+            fid = pr.get("found_in_dom")
+            count = pr.get("dom_match_count", "?")
+            vis = pr.get("visible", False)
+            probe_cell = (
+                f'<span style="font-size:11px;color:#888;margin-left:10px">'
+                f'found_in_dom={fid}  dom_match_count={count}  visible={vis}'
+                f'</span>'
+            )
+        tl_rows += (
+            f'<tr style="border-top:1px solid rgba(255,255,255,0.06)">'
+            f'<td style="padding:7px 10px 7px 0;color:#666;font-size:12px">#{i+1}</td>'
+            f'<td style="padding:7px 10px 7px 0;font-size:11px;color:#888">{_esc(row["kind"])}/{_esc(row["phase"])}</td>'
+            f'<td style="padding:7px 14px 7px 0"><code style="font-size:11px;color:#c9d1d9">{_esc(row["selector"])}</code></td>'
+            f'<td style="padding:7px 10px 7px 0;white-space:nowrap"><span style="color:{sc};font-weight:600;font-size:12px">{_esc(row["status"])}</span></td>'
+            f'<td style="padding:7px 10px 7px 0;color:#888;font-size:12px;white-space:nowrap">{ms}</td>'
+            f'<td style="padding:7px 0;color:#ef4444;font-size:11px">{_esc(row["error"])}{probe_cell}</td>'
+            f'</tr>'
+        )
+    tl_html = f'<table style="border-collapse:collapse;width:100%">{tl_rows}</table>' if tl_rows else "<p style='color:#666'>No attempts recorded.</p>"
+
+    # ── Page context ──
+    url = _esc(page_before.get("url") or "")
+    title = _esc(page_before.get("title") or "")
+    el_count = page_before.get("visible_interactive_count", "?")
+    rc_str = "  ".join(f"{k}:{v}" for k, v in role_counts.items()) if role_counts else "—"
+    exec_path = _esc(str(step_trace.get("execution_path") or "?"))
+    exec_reason = _esc(str(step_trace.get("execution_path_reason") or ""))
+
+    # ── Step header info ──
+    status_color = "#22c55e" if status == "completed" else "#ef4444"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Diagnosis — Step {step_idx}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: #0a0a0a;
+      color: #e0e0e0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      padding: 28px 32px;
+    }}
+    .page {{ max-width: 960px; margin: 0 auto; }}
+    h2 {{ font-size: 13px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+          color: #555; margin-bottom: 10px; padding-bottom: 6px;
+          border-bottom: 1px solid rgba(255,255,255,0.07); }}
+    .section {{ background: #111; border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px; padding: 18px 20px; margin-bottom: 14px; }}
+    code {{ font-family: "Cascadia Code","Fira Mono",monospace; font-size: 12px;
+            background: #0d0d0d; border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 4px; padding: 1px 6px; color: #c9d1d9; }}
+    .verdict {{ border-radius: 8px; padding: 16px 20px; margin-bottom: 14px;
+                border: 1px solid; }}
+    .step-header {{ font-size: 18px; font-weight: 700; margin-bottom: 6px; color: #fff; }}
+    .step-meta {{ font-size: 13px; color: #666; }}
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="section" style="margin-bottom:14px">
+    <div class="step-header">Step {step_idx} &nbsp;·&nbsp; {_esc(step_type)}</div>
+    <div class="step-meta">
+      Selector: <code>{_esc(sel_display)}</code>
+      &nbsp;&nbsp;·&nbsp;&nbsp;
+      Status: <span style="color:{status_color};font-weight:600">{_esc(status)}</span>
+      &nbsp;&nbsp;·&nbsp;&nbsp;
+      Duration: {f'{step_trace.get("total_step_ms", 0):.0f}ms' if step_trace.get("total_step_ms") else "—"}
+    </div>
+  </div>
+
+  <!-- Verdict -->
+  <div class="verdict" style="background:rgba(0,0,0,0.3);border-color:{layer_color}40">
+    <div style="font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:{layer_color};margin-bottom:6px">Failure Layer</div>
+    <div style="font-size:26px;font-weight:800;color:{layer_color};letter-spacing:-.01em;margin-bottom:10px">{_esc(layer_label)}</div>
+    <div style="font-size:13px;color:#aaa;max-width:740px;line-height:1.7">{_esc(layer_def)}</div>
+  </div>
+
+  <!-- Evidence -->
+  <div class="section">
+    <h2>Evidence</h2>
+    {ev_html}
+  </div>
+
+  <!-- Timeline -->
+  <div class="section">
+    <h2>Attempt Timeline</h2>
+    {tl_html}
+  </div>
+
+  <!-- Page Context -->
+  <div class="section">
+    <h2>Page Context</h2>
+    <table style="border-collapse:collapse;width:100%">
+      <tr><td style="color:#555;font-size:12px;padding:4px 12px 4px 0;white-space:nowrap">URL</td><td><code>{url}</code></td></tr>
+      <tr><td style="color:#555;font-size:12px;padding:4px 12px 4px 0;white-space:nowrap">Title</td><td style="font-size:13px;color:#ccc">{title}</td></tr>
+      <tr><td style="color:#555;font-size:12px;padding:4px 12px 4px 0;white-space:nowrap">Interactive Elements</td><td style="font-size:13px;color:#ccc">{el_count}</td></tr>
+      <tr><td style="color:#555;font-size:12px;padding:4px 12px 4px 0;white-space:nowrap">Role Distribution</td><td style="font-family:monospace;font-size:12px;color:#888">{_esc(rc_str)}</td></tr>
+      <tr><td style="color:#555;font-size:12px;padding:4px 12px 4px 0;white-space:nowrap">Execution Path</td><td><code>{exec_path}</code> <span style="color:#555;font-size:12px">— {exec_reason}</span></td></tr>
+    </table>
+  </div>
+
 </div>
 </body>
 </html>"""

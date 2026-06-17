@@ -319,6 +319,143 @@ def _normalize_step(raw_step: dict[str, Any], step_index: int = -1) -> dict[str,
             step["threshold"] = threshold
         return step
 
+    if step_type == "hover":
+        selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="hover")
+        if not selector and not target:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=hover dropped — no selector and no semantic target in %r",
+                step_index, list(raw_step.keys()),
+            )
+            return None
+        step = {"type": "hover", "selector": selector or ""}
+        if target:
+            step["target"] = target
+        return step
+
+    if step_type == "double_click":
+        selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="double_click")
+        if not selector and not target:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=double_click dropped — no selector and no semantic target in %r",
+                step_index, list(raw_step.keys()),
+            )
+            return None
+        step = {"type": "double_click", "selector": selector or ""}
+        if target:
+            step["target"] = target
+        return step
+
+    if step_type == "right_click":
+        selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="right_click")
+        if not selector and not target:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=right_click dropped — no selector and no semantic target in %r",
+                step_index, list(raw_step.keys()),
+            )
+            return None
+        step = {"type": "right_click", "selector": selector or ""}
+        if target:
+            step["target"] = target
+        return step
+
+    if step_type == "press_key":
+        key = (
+            _as_str(raw_step.get("key"))
+            or _as_str(raw_step.get("keys"))
+            or _as_str(raw_step.get("shortcut"))
+            or _as_str(raw_step.get("value"))
+        )
+        if not key:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=press_key dropped — no key field in %r",
+                step_index, list(raw_step.keys()),
+            )
+            return None
+        step: dict[str, Any] = {"type": "press_key", "key": key}
+        selector = _pick_selector(raw_step)
+        if selector:
+            step["selector"] = selector
+        return step
+
+    if step_type == "upload":
+        selector = _pick_selector(raw_step)
+        target = _normalize_semantic_target(raw_step)
+        if not selector and target:
+            selector = _selector_seed_from_target(target, step_type="upload")
+        file_path = (
+            _as_str(raw_step.get("file_path"))
+            or _as_str(raw_step.get("path"))
+            or _as_str(raw_step.get("file"))
+            or _as_str(raw_step.get("value"))
+        )
+        if (not selector and not target) or not file_path:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=upload dropped — %s",
+                step_index,
+                "no selector and no target" if (not selector and not target) else "file_path is missing",
+            )
+            return None
+        step = {"type": "upload", "selector": selector or "", "file_path": file_path}
+        if target:
+            step["target"] = target
+        return step
+
+    if step_type == "manage_tab":
+        action = _as_str(raw_step.get("action")) or "open"
+        if action not in {"open", "close", "switch"}:
+            action = "open"
+        step: dict[str, Any] = {"type": "manage_tab", "action": action}
+        url = _as_str(raw_step.get("url")) or _extract_url(_as_str(raw_step.get("value")) or "")
+        if url:
+            step["url"] = url
+        index = _to_int(raw_step.get("index")) or _to_int(raw_step.get("tab_index"))
+        if index is not None:
+            step["index"] = index
+        title = _as_str(raw_step.get("title")) or _as_str(raw_step.get("tab_title"))
+        if title:
+            step["title"] = title
+        return step
+
+    if step_type == "manage_window":
+        action = _as_str(raw_step.get("action")) or "maximize"
+        if action not in {"resize", "maximize", "fullscreen"}:
+            action = "maximize"
+        step: dict[str, Any] = {"type": "manage_window", "action": action}
+        width = _to_int(raw_step.get("width")) or _to_int(raw_step.get("w"))
+        height = _to_int(raw_step.get("height")) or _to_int(raw_step.get("h"))
+        if width is not None:
+            step["width"] = width
+        if height is not None:
+            step["height"] = height
+        return step
+
+    if step_type == "fill_prompt":
+        value = (
+            _as_str(raw_step.get("value"))
+            or _as_str(raw_step.get("text"))
+            or _as_str(raw_step.get("prompt_text"))
+            or _as_str(raw_step.get("input"))
+        )
+        if value is None:
+            LOGGER.warning(
+                "normalize_plan_steps: step[%d] type=fill_prompt dropped — no value field in %r",
+                step_index, list(raw_step.keys()),
+            )
+            return None
+        policy = _as_str(raw_step.get("policy")) or "accept"
+        if policy not in {"accept", "dismiss"}:
+            policy = "accept"
+        return {"type": "fill_prompt", "value": value, "policy": policy}
+
     # step_type is recognized but has no handler — should not happen
     LOGGER.warning(
         "normalize_plan_steps: step[%d] type=%r dropped — recognized type but no normalization handler",
@@ -408,6 +545,39 @@ def _normalize_type(raw_type: Any) -> str | None:
         "wait_until": "wait",
         "scroll_up": "scroll",
         "scroll_down": "scroll",
+        "mouse_over": "hover",
+        "mouseover": "hover",
+        "move_to": "hover",
+        "move_mouse": "hover",
+        "hover_over": "hover",
+        "dblclick": "double_click",
+        "doubleclick": "double_click",
+        "rightclick": "right_click",
+        "context_menu": "right_click",
+        "contextmenu": "right_click",
+        "press": "press_key",
+        "keyboard": "press_key",
+        "key_press": "press_key",
+        "keypress": "press_key",
+        "key": "press_key",
+        "upload_file": "upload",
+        "file_upload": "upload",
+        "attach_file": "upload",
+        "choose_file": "upload",
+        "open_tab": "manage_tab",
+        "close_tab": "manage_tab",
+        "switch_tab": "manage_tab",
+        "new_tab": "manage_tab",
+        "tab": "manage_tab",
+        "resize_window": "manage_window",
+        "maximize_window": "manage_window",
+        "set_viewport": "manage_window",
+        "window": "manage_window",
+        "viewport": "manage_window",
+        "fill_alert": "fill_prompt",
+        "alert_fill": "fill_prompt",
+        "prompt_fill": "fill_prompt",
+        "prompt": "fill_prompt",
     }
 
     normalized = alias_map.get(normalized, normalized)
@@ -422,6 +592,14 @@ def _normalize_type(raw_type: Any) -> str | None:
         "handle_popup",
         "verify_text",
         "verify_image",
+        "hover",
+        "double_click",
+        "right_click",
+        "press_key",
+        "upload",
+        "manage_tab",
+        "manage_window",
+        "fill_prompt",
     }
     if normalized in supported:
         return normalized

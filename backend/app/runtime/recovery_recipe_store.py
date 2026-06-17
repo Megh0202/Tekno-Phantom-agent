@@ -171,6 +171,13 @@ class InMemoryRecoveryRecipeStore:
             ),
         )
 
+    def clear_all(self) -> int:
+        """Delete all recipes. Returns the count of deleted records."""
+        with self._lock:
+            count = len(self._store)
+            self._store.clear()
+        return count
+
 
 # ---------------------------------------------------------------------------
 # SQLite implementation (production)
@@ -346,6 +353,16 @@ class SqliteRecoveryRecipeStore(InMemoryRecoveryRecipeStore):
             times_succeeded=row["times_succeeded"],
         )
 
+    def clear_all(self) -> int:
+        count = super().clear_all()
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM recovery_recipes")
+                conn.commit()
+        except Exception as exc:
+            LOGGER.exception("Recipe store: clear_all db delete failed: %s", exc)
+        return count
+
 
 # ---------------------------------------------------------------------------
 # Noop implementation (when store is disabled in config)
@@ -377,6 +394,9 @@ class NoopRecoveryRecipeStore:
 
     def list_recipes(self) -> list[RecoveryRecipe]:
         return []
+
+    def clear_all(self) -> int:
+        return 0
 
 
 # ---------------------------------------------------------------------------

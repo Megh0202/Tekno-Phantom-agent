@@ -24,7 +24,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://127.0.0.1}
     volumes:
       - backend_data:/app/data
-      - backend_artifacts:/app/artifacts
+      - ./backend/artifacts:/app/artifacts
 
   brain:
     build: ./brain
@@ -46,4 +46,3 @@ services:
 
 volumes:
   backend_data:
-  backend_artifacts:

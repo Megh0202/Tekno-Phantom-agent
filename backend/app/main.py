@@ -26,6 +26,7 @@ from app.mcp.filesystem_client import build_filesystem_client
 from app.models.user import User
 from app.routes import auth_router
 from app.runtime.executor import AgentExecutor
+from app.runtime.report_builder import build_diagnostic_html, build_step_diagnosis_html
 from app.runtime.instruction_parser import parse_structured_task_steps
 from app.runtime.plan_normalizer import build_recovery_steps, normalize_plan_steps
 from app.runtime.recovery_recipe_store import build_recovery_recipe_store
@@ -115,7 +116,10 @@ def _sanitize_plan_steps(
     def _normalize_target(raw: object) -> dict[str, str] | None:
         if not isinstance(raw, dict):
             return None
-        allowed_fields = ("kind", "role", "text", "label", "placeholder", "context")
+        allowed_fields = (
+            "semantic_name", "expected_role", "accessible_name", "scope",
+            "kind", "role", "text", "label", "placeholder", "context",
+        )
         normalized: dict[str, str] = {}
         for field in allowed_fields:
             value = _clean_text(raw.get(field))
@@ -1461,8 +1465,15 @@ def build_app() -> FastAPI:
             f"{expanded_task}\n\n"
             "Planner constraints:\n"
             "- Return only runnable steps supported by this runtime.\n"
-            "- Allowed step types (use only what the task requires): navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image.\n"
+            "- Allowed step types (use only what the task requires): navigate, click, type, select, drag, scroll, wait, handle_popup, verify_text, verify_image, hover, double_click, right_click, press_key, upload, manage_tab, manage_window, fill_prompt.\n"
             "- For drag-and-drop actions use type='drag' with fields 'source_selector' (element to drag) and 'target_selector' (drop destination). Example: {\"type\": \"drag\", \"source_selector\": \"text=Short answer\", \"target_selector\": \".form-canvas\"}\n"
+            "- For mouse hover (tooltip, dropdown-on-hover): use type='hover' with 'selector'. Example: {\"type\": \"hover\", \"selector\": \"button:has-text('Point Me')\"}\n"
+            "- For double-click: use type='double_click'. For right-click/context menu: use type='right_click'.\n"
+            "- For keyboard key press: use type='press_key' with 'key' (e.g. 'Enter', 'Tab', 'Escape', 'Control+A'). Optionally add 'selector' to focus an element first.\n"
+            "- For file upload: use type='upload' with 'selector' (the file input) and 'file_path'.\n"
+            "- For browser tab operations: use type='manage_tab' with 'action' ('open'/'close'/'switch') and optionally 'url', 'index', or 'title'.\n"
+            "- For window/viewport resize: use type='manage_window' with 'action' ('maximize'/'resize'/'fullscreen') and optionally 'width'/'height'.\n"
+            "- For JS prompt dialogs that require typed input: use type='fill_prompt' with 'value' and 'policy' ('accept'/'dismiss').\n"
             "- Cover every explicit user instruction in order when max_steps allows.\n"
             "- Do not invent extra requirements that are not explicitly requested.\n"
             "- Use Playwright-compatible selectors only.\n"
@@ -1611,6 +1622,10 @@ def build_app() -> FastAPI:
                     }
                 )
             except Exception as exc:
+                LOGGER.error(
+                    "generate_plan[model_validate failed]: %s — steps=%r",
+                    exc, normalized_steps,
+                )
                 raise HTTPException(status_code=502, detail=f"Invalid plan returned by brain: {exc}") from exc
 
             trace["normalized_plan"] = [step.model_dump(exclude_none=True) for step in validated.steps]
@@ -1923,6 +1938,22 @@ def build_app() -> FastAPI:
 
         return FileResponse(artifact_path)
 
+    @app.delete("/api/recovery-recipes", status_code=200)
+    async def clear_recovery_recipes(
+        actor: User | None = Depends(require_api_access),
+    ) -> dict:
+        count = recipe_store.clear_all()
+        LOGGER.info("Recovery recipes cleared: %d record(s) deleted", count)
+        return {"deleted": count}
+
+    @app.delete("/api/selector-memory", status_code=200)
+    async def clear_selector_memory(
+        actor: User | None = Depends(require_api_access),
+    ) -> dict:
+        count = selector_memory.clear_all()
+        LOGGER.info("Selector memory cleared: %d record(s) deleted", count)
+        return {"deleted": count}
+
     @app.get("/api/diagnostics/latest")
     async def get_latest_diagnostic(
         actor: User | None = Depends(require_api_access),
@@ -1973,10 +2004,17 @@ def build_app() -> FastAPI:
         run = run_store.get(run_id)
         if not run or not _can_access_owned_resource(actor, run.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
+        # Prefer pre-written file; fall back to generating from step traces on demand.
         html_path = (settings.artifact_root / run_id / "diagnostic.html").resolve()
-        if not html_path.exists():
-            raise HTTPException(status_code=404, detail="diagnostic.html not found")
-        return HTMLResponse(content=html_path.read_text("utf-8"))
+        if html_path.exists():
+            return HTMLResponse(content=html_path.read_text("utf-8"))
+        step_traces = _load_step_traces(run_id)
+        if not step_traces:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No diagnostic data found for run {run_id} — run may still be in progress",
+            )
+        return HTMLResponse(content=build_diagnostic_html(run, step_traces))
 
     def _load_step_traces(run_id: str) -> list[dict]:
         run_dir = (settings.artifact_root / run_id).resolve()
@@ -2030,6 +2068,22 @@ def build_app() -> FastAPI:
         if not traces:
             raise HTTPException(status_code=404, detail="No step traces found")
         return JSONResponse(content={"run_id": run_id, "run_name": run.run_name, "steps": traces})
+
+    @app.get("/api/diagnostics/{run_id}/traces/{step_index}/diagnosis", response_class=HTMLResponse)
+    async def get_run_trace_step_diagnosis(
+        run_id: str,
+        step_index: int,
+        actor: User | None = Depends(require_api_access),
+    ) -> HTMLResponse:
+        run = run_store.get(run_id)
+        if not run or not _can_access_owned_resource(actor, run.user_id):
+            raise HTTPException(status_code=404, detail="Run not found")
+        run_dir = (settings.artifact_root / run_id).resolve()
+        trace_path = (run_dir / f"step-{step_index:03d}.trace.json").resolve()
+        if not trace_path.exists():
+            raise HTTPException(status_code=404, detail=f"No trace for step {step_index}")
+        step_trace = json.loads(trace_path.read_text("utf-8"))
+        return HTMLResponse(content=build_step_diagnosis_html(step_trace))
 
     @app.get("/api/diagnostics/{run_id}/traces/{step_index}")
     async def get_run_trace_step(

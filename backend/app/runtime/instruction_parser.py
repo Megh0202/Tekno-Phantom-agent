@@ -32,6 +32,54 @@ _VERIFY_CONTAINS_ON_RE = re.compile(
     r"^\s*verify(?:\s+text)?\s+contains\s+(.+?)\s+on\s+(.+?)\s*$",
     flags=re.IGNORECASE,
 )
+_HOVER_RE = re.compile(
+    r"^\s*(?:hover(?:\s+over)?|move\s+mouse\s+(?:over|to)|mouse(?:over|\s+over))\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_DOUBLE_CLICK_RE = re.compile(
+    r"^\s*(?:double[\s\-]?click(?:\s+on)?|dblclick)\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_RIGHT_CLICK_RE = re.compile(
+    r"^\s*(?:right[\s\-]?click(?:\s+on)?|context\s+menu(?:\s+on)?)\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_PRESS_KEY_RE = re.compile(
+    r"^\s*press(?:\s+key)?\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_UPLOAD_RE = re.compile(
+    r"^\s*(?:upload|attach)\s+(.+?)\s+(?:to|in(?:to)?)\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_OPEN_TAB_RE = re.compile(
+    r"^\s*open\s+(?:a\s+)?new\s+tab(?:\s+with\s+(.+?))?\s*$",
+    flags=re.IGNORECASE,
+)
+_CLOSE_TAB_RE = re.compile(
+    r"^\s*close\s+(?:(?:the\s+)?current\s+)?tab\s*$",
+    flags=re.IGNORECASE,
+)
+_SWITCH_TAB_RE = re.compile(
+    r"^\s*switch\s+to\s+tab\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_RESIZE_WINDOW_RE = re.compile(
+    r"^\s*(?:resize\s+window|set\s+(?:viewport|window\s+size))\s+(?:to\s+)?(\d+)\s*[xX×]\s*(\d+)\s*$",
+    flags=re.IGNORECASE,
+)
+_MAXIMIZE_WINDOW_RE = re.compile(
+    r"^\s*(?:maximize|fullscreen)\s+(?:the\s+)?window\s*$",
+    flags=re.IGNORECASE,
+)
+_FILL_PROMPT_RE = re.compile(
+    r"^\s*(?:fill\s+(?:the\s+)?(?:prompt|alert|dialog)\s+with|(?:type|enter)\s+.+?\s+in\s+(?:the\s+)?(?:prompt|alert))\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_FILL_PROMPT_SIMPLE_RE = re.compile(
+    r"^\s*(?:fill\s+prompt|prompt\s+fill)\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def parse_structured_task_steps(
@@ -159,9 +207,41 @@ def _parse_line(
     if explicit_type is not None:
         return explicit_type
 
+    explicit_double_click = _parse_explicit_double_click(line)
+    if explicit_double_click is not None:
+        return explicit_double_click
+
+    explicit_right_click = _parse_explicit_right_click(line)
+    if explicit_right_click is not None:
+        return explicit_right_click
+
+    explicit_hover = _parse_explicit_hover(line)
+    if explicit_hover is not None:
+        return explicit_hover
+
     explicit_click = _parse_explicit_click(line)
     if explicit_click is not None:
         return explicit_click
+
+    explicit_press_key = _parse_explicit_press_key(line)
+    if explicit_press_key is not None:
+        return explicit_press_key
+
+    explicit_upload = _parse_explicit_upload(line)
+    if explicit_upload is not None:
+        return explicit_upload
+
+    explicit_tab = _parse_explicit_tab(line)
+    if explicit_tab is not None:
+        return explicit_tab
+
+    explicit_window = _parse_explicit_window(line)
+    if explicit_window is not None:
+        return explicit_window
+
+    explicit_fill_prompt = _parse_explicit_fill_prompt(line)
+    if explicit_fill_prompt is not None:
+        return explicit_fill_prompt
 
     if "wait" in lower:
         wait_ms = _extract_wait_ms(line)
@@ -509,3 +589,105 @@ def _enforce_login_sequence(
         login_sequence.append({"type": "wait", "until": "timeout", "ms": auto_login_wait_ms})
     merged = steps[: password_index + 1] + login_sequence + steps[password_index + 1:]
     return merged[:max_steps]
+
+
+def _parse_explicit_hover(line: str) -> dict[str, Any] | None:
+    match = _HOVER_RE.match(line)
+    if not match:
+        return None
+    raw_target = _normalize_selector_text(match.group(1))
+    if not raw_target:
+        return None
+    selector = raw_target if _looks_like_explicit_selector(raw_target) else f"text={raw_target}"
+    return {"type": "hover", "selector": selector}
+
+
+def _parse_explicit_double_click(line: str) -> dict[str, Any] | None:
+    match = _DOUBLE_CLICK_RE.match(line)
+    if not match:
+        return None
+    raw_target = _normalize_selector_text(match.group(1))
+    if not raw_target:
+        return None
+    selector = raw_target if _looks_like_explicit_selector(raw_target) else f"text={raw_target}"
+    return {"type": "double_click", "selector": selector}
+
+
+def _parse_explicit_right_click(line: str) -> dict[str, Any] | None:
+    match = _RIGHT_CLICK_RE.match(line)
+    if not match:
+        return None
+    raw_target = _normalize_selector_text(match.group(1))
+    if not raw_target:
+        return None
+    selector = raw_target if _looks_like_explicit_selector(raw_target) else f"text={raw_target}"
+    return {"type": "right_click", "selector": selector}
+
+
+def _parse_explicit_press_key(line: str) -> dict[str, Any] | None:
+    match = _PRESS_KEY_RE.match(line)
+    if not match:
+        return None
+    key = _strip_wrapping_quotes(match.group(1).strip())
+    if not key:
+        return None
+    return {"type": "press_key", "key": key}
+
+
+def _parse_explicit_upload(line: str) -> dict[str, Any] | None:
+    match = _UPLOAD_RE.match(line)
+    if not match:
+        return None
+    raw_file = _strip_wrapping_quotes(match.group(1).strip())
+    raw_target = _normalize_selector_text(match.group(2).strip())
+    if not raw_file or not raw_target:
+        return None
+    selector = raw_target if _looks_like_explicit_selector(raw_target) else f"text={raw_target}"
+    return {"type": "upload", "selector": selector, "file_path": raw_file}
+
+
+def _parse_explicit_tab(line: str) -> dict[str, Any] | None:
+    if _OPEN_TAB_RE.match(line):
+        m = _OPEN_TAB_RE.match(line)
+        url = _extract_url(m.group(1) or "") if m and m.group(1) else None
+        step: dict[str, Any] = {"type": "manage_tab", "action": "open"}
+        if url:
+            step["url"] = url
+        return step
+    if _CLOSE_TAB_RE.match(line):
+        return {"type": "manage_tab", "action": "close"}
+    m = _SWITCH_TAB_RE.match(line)
+    if m:
+        raw = _strip_wrapping_quotes(m.group(1).strip())
+        try:
+            index = int(raw) - 1
+            return {"type": "manage_tab", "action": "switch", "index": max(0, index)}
+        except ValueError:
+            return {"type": "manage_tab", "action": "switch", "title": raw}
+    return None
+
+
+def _parse_explicit_window(line: str) -> dict[str, Any] | None:
+    m = _RESIZE_WINDOW_RE.match(line)
+    if m:
+        try:
+            w, h = int(m.group(1)), int(m.group(2))
+            return {"type": "manage_window", "action": "resize", "width": w, "height": h}
+        except (ValueError, IndexError):
+            pass
+    m = _MAXIMIZE_WINDOW_RE.match(line)
+    if m:
+        lower = line.lower()
+        action = "fullscreen" if "fullscreen" in lower else "maximize"
+        return {"type": "manage_window", "action": action}
+    return None
+
+
+def _parse_explicit_fill_prompt(line: str) -> dict[str, Any] | None:
+    for pattern in (_FILL_PROMPT_RE, _FILL_PROMPT_SIMPLE_RE):
+        m = pattern.match(line)
+        if m:
+            value = _strip_wrapping_quotes(m.group(1).strip())
+            if value:
+                return {"type": "fill_prompt", "value": value, "policy": "accept"}
+    return None

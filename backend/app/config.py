@@ -132,6 +132,10 @@ class Settings(BaseSettings):
         self.viewer_static_root = _resolve_project_path(self.viewer_static_root)
 
     @property
+    def uploads_dir(self) -> Path:
+        return self.run_store_db_path.parent / "uploads"
+
+    @property
     def cors_origin_list(self) -> list[str]:
         origins: list[str] = []
         for raw_origin in self.cors_origins.split(","):

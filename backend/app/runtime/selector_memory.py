@@ -133,6 +133,13 @@ class InMemorySelectorMemoryStore:
         values.sort(key=lambda item: item.score, reverse=True)
         return [item.signature for item in values[: max(limit, 1)]]
 
+    def clear_all(self) -> int:
+        with self._lock:
+            count = sum(len(v) for v in self._entries.values()) + sum(len(v) for v in self._signatures.values())
+            self._entries.clear()
+            self._signatures.clear()
+        return count
+
 
 class SqliteSelectorMemoryStore(InMemorySelectorMemoryStore):
     def __init__(self, db_path: Path) -> None:
@@ -244,6 +251,17 @@ class SqliteSelectorMemoryStore(InMemorySelectorMemoryStore):
             )
             conn.commit()
 
+    def clear_all(self) -> int:
+        count = super().clear_all()
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM selector_memory")
+                conn.execute("DELETE FROM selector_signatures")
+                conn.commit()
+        except Exception as exc:
+            LOGGER.exception("Selector memory: clear_all db delete failed: %s", exc)
+        return count
+
 
 class NoopSelectorMemoryStore:
     def remember_success(self, domain: str, step_type: str, key: str, selector: str) -> None:
@@ -257,6 +275,9 @@ class NoopSelectorMemoryStore:
 
     def get_signatures(self, domain: str, step_type: str, key: str, limit: int = 3) -> list[dict]:
         return []
+
+    def clear_all(self) -> int:
+        return 0
 
 
 def build_selector_memory_store(settings: Settings) -> SelectorMemoryStore:

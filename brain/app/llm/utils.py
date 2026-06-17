@@ -10,6 +10,8 @@ LOGGER = logging.getLogger("tekno.phantom.brain.utils")
 _VALID_STEP_TYPES = frozenset({
     "navigate", "click", "type", "select", "drag",
     "scroll", "wait", "handle_popup", "verify_text", "verify_image",
+    "hover", "double_click", "right_click", "press_key",
+    "upload", "manage_tab", "manage_window", "fill_prompt",
 })
 
 
@@ -47,7 +49,11 @@ def build_element_hint_clause(element_hint: dict[str, Any] | None) -> str:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    """Parse the first JSON object from a (potentially noisy) LLM response."""
+    """Parse the best JSON object from a (potentially noisy) LLM response.
+
+    When the LLM self-corrects and emits multiple code blocks, the last valid
+    block is used because it reflects the model's final answer.
+    """
     stripped = text.strip()
     try:
         parsed = json.loads(stripped)
@@ -55,11 +61,29 @@ def extract_json_object(text: str) -> dict[str, Any]:
             return parsed
     except Exception:
         pass
+
+    # Try each fenced code block; keep the last valid one (LLM correction wins).
+    last_valid: dict[str, Any] | None = None
+    for block in re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL):
+        try:
+            candidate = json.loads(block)
+            if isinstance(candidate, dict):
+                last_valid = candidate
+        except Exception:
+            pass
+    if last_valid is not None:
+        return last_valid
+
+    # Last resort: greedy match for a bare JSON object with no fences.
     match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
     if match:
-        parsed = json.loads(match.group(0))
-        if isinstance(parsed, dict):
-            return parsed
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
     raise ValueError("No valid JSON object found in plan response")
 
 
